@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "MXtreme"
+description = "Analysis toolkit for Maxwell Biosystems MaxOne/MaxTwo HD-MEA recordings."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.12"
+dynamic = ["version"]
+
+# Floors, not pins -- this is a library and hard pins make it uninstallable alongside
+# anything else. matplotlib/seaborn are required rather than optional: they're imported at
+# module level by burst.py, recording.py, utils.py, visualizations.py and every analysis
+# module, so an install without them can't import the package.
+dependencies = [
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "scipy>=1.10",
+    "h5py>=3.8",
+    "matplotlib>=3.7",
+    "seaborn>=0.12",
+]
+
+[dependency-groups]
+dev = ["ipykernel>=6", "pytest", "ruff"]
+# network = ["scikit-learn>=1.3"]   # for the planned analysis/network.py (PCA, functional connectivity)
+
+[project.urls]
+Repository = "https://github.com/Project-HAL/MXtreme"
+
+[tool.setuptools.dynamic]
+version = { attr = "mxtreme.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+# testing/ holds pytest suites only; notebooks and scratch scripts live in claude_testing/.
+testpaths = ["testing"]
+
+[tool.ruff]
+line-length = 110
