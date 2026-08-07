@@ -124,10 +124,11 @@ uv sync --upgrade-package pandas  # a single package
 
 ### A note on version floors
 
-Runtime dependencies are declared as lower bounds (e.g. `pandas>=2.0`, `numpy>=1.24`) so the library installs alongside whatever a consumer already has. A fresh resolve therefore pulls the newest compatible majors, which can differ from what earlier work was tested against — pandas 3.x in particular carries real breaking changes. The committed `uv.lock` pins exact versions for development and CI so this doesn't drift silently. When bumping a floor, run the smoke test against the new stack first:
+Runtime dependencies are declared as lower bounds (e.g. `pandas>=2.0`, `numpy>=1.24`) so the library installs alongside whatever a consumer already has. A fresh resolve therefore pulls the newest compatible majors, which can differ from what earlier work was tested against — pandas 3.x in particular carries real breaking changes. The committed `uv.lock` pins exact versions for development and CI so this doesn't drift silently. When bumping a floor, run the checks against the new stack before committing the bump:
 
 ```bash
-uv run python claude_testing/smoke_step0.py
+uv sync --upgrade-package <package>
+uv run pytest
 ```
 
 ### Continuous integration
@@ -148,7 +149,7 @@ Ideally the test matrix runs against both the oldest supported and the latest al
 MXtreme/
 ├── src/mxtreme/          # the package (this is what ships)
 ├── examples/             # demo scripts and notebooks (dev only)
-├── claude_testing/       # smoke tests and scratch verification
+├── testing/              # pytest suites
 ├── pyproject.toml        # package metadata + dependencies
 ├── uv.lock               # exact resolved versions (committed)
 ├── .python-version       # dev interpreter (3.12)
