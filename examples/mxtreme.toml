@@ -1,0 +1,11 @@
+# MXtreme configuration.
+#
+# `root` is the package-managed data store: where preprocessing writes its outputs
+# (cleaned .npz files, experimental-condition CSVs, the registry) and later reads them back.
+# Raw .h5 inputs are NOT resolved through here -- you point at those by explicit path.
+#
+# Edit `root` to a location you can write to. Raw example data lives (read-only) under
+# ../../mxtreme-claude/claude_data/raw ; outputs go under ../../mxtreme-claude/claude_output .
+
+[data]
+root = "../../mxtreme-claude/claude_output"

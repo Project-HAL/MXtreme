@@ -1,8 +1,8 @@
-"""Thin drivers that run the preprocessing pipeline: raw .h5 -> npz -> bursts -> burst features.
+"""Thin drivers for the burst stages of the pipeline: npz -> bursts -> burst features.
 
-These wrap `mxtreme.etl` and `mxtreme.recording` and are what establishes the on-disk layout that
-`mxtreme.paths` and `mxtreme.analysis` expect.
+These wrap `mxtreme.recording` and establish the on-disk layout that `mxtreme.paths` and
+`mxtreme.analysis` expect.
 
-Planned: collapse to a single `mxtreme/pipeline.py` with CLI entry points, alongside the config
-work (`claude_configs/structure_feedback.md` §1c).
+The raw `.h5` -> npz stage now lives in the composable `mxtreme.extract` / `mxtreme.clean` /
+`mxtreme.pipeline` modules (see `examples/preprocess_pipeline.ipynb`).
 """

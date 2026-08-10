@@ -1,0 +1,76 @@
+"""Project configuration for the preprocessing scope.
+
+`Config` decouples the package from any particular machine's directory layout. It holds a single
+``data_root`` -- the root of the *package-managed data store*, i.e. the directory the package writes
+its outputs to (cleaned ``.npz`` files, experimental-condition CSVs, the registry) and later reads
+those same outputs back from. Raw ``.h5`` inputs are *not* resolved through here; the user points at
+those by explicit path.
+
+The root is supplied by a small TOML file so it never has to be hard-coded in library code:
+
+    [data]
+    root = "/abs/path/to/managed/store"
+"""
+
+from __future__ import annotations
+
+import tomllib
+from dataclasses import dataclass
+from pathlib import Path
+
+
+@dataclass(frozen=True)
+class Config:
+    """Resolved locations of the package-managed data store.
+
+    :param data_root: Root directory of the managed store. Outputs are written beneath it and read
+        back from the same place. It is never silently defaulted to a lab-specific path -- callers
+        must provide it (typically via :meth:`from_toml`).
+    """
+
+    data_root: Path
+
+    @property
+    def preprocessed_dir(self) -> Path:
+        """Directory holding cleaned/transformed ``.npz`` files (one per well per recording)."""
+        return self.data_root / "preprocessed"
+
+    @property
+    def experimental_conditions_dir(self) -> Path:
+        """Directory holding per-culture experimental-condition CSVs."""
+        return self.data_root / "experimental_conditions"
+
+    @property
+    def registry_path(self) -> Path:
+        """Path to the CSV index of what has been processed."""
+        return self.data_root / "registry.csv"
+
+    @classmethod
+    def from_toml(cls, path: str | Path) -> "Config":
+        """Build a :class:`Config` from a TOML file.
+
+        The file must contain a ``[data]`` table with a ``root`` key pointing at the managed store::
+
+            [data]
+            root = "/abs/path/to/managed/store"
+
+        :param path: Path to the TOML configuration file.
+        :type path: str or Path
+        :raises FileNotFoundError: If ``path`` does not exist.
+        :raises KeyError: If the ``[data].root`` key is missing.
+        :returns: A populated configuration object.
+        :rtype: Config
+        """
+        path = Path(path)
+        if not path.is_file():
+            raise FileNotFoundError(f"Config file does not exist: {path}")
+
+        with path.open("rb") as f:
+            cfg = tomllib.load(f)
+
+        try:
+            root = cfg["data"]["root"]
+        except KeyError as exc:
+            raise KeyError("Config TOML must define [data].root (the managed-store directory).") from exc
+
+        return cls(data_root=Path(root).expanduser())

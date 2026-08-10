@@ -16,19 +16,21 @@ from pathlib import Path
 from mxtreme import constants
 
 def load_data(filepath):
-     """ Loads experimental data that has been extracted from an h5 file, preprocessed, and saved. 
+    """Loads preprocessed experimental data saved as an ``.npz``.
+
+    Thin backwards-compatible re-export of :func:`mxtreme.io.load_preprocessed`, kept so existing
+    imports (``from mxtreme.utils import load_data``) keep working.
 
     Args:
         filepath (string): path to cleaned data.
 
     Returns:
-        dictionary: data assoiciated with an experiment. Keys: ['spike_data', 'channelmap',
+        dictionary: data associated with an experiment. Keys: ['spike_data', 'channelmap',
                             'stim_elecs', 'rec_t_sec', 'samp_rate', 'lsb', 'eventtime', 'event_messages'.]
     """
-     
-     if not os.path.isfile(filepath):
-        raise FileNotFoundError(f"File does not exist: {filepath}")
-     return dict(np.load(filepath, allow_pickle=True))
+    from mxtreme.io import load_preprocessed
+
+    return load_preprocessed(filepath)
  
 def get_well_id_from_raw(path_to_raw, well_no=0, recording_no=0):
     with h5py.File(path_to_raw, 'r') as f:
