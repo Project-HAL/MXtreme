@@ -6,12 +6,13 @@ from pathlib import Path
 import ast
 
 from mxtreme import constants
+from mxtreme import device
 from mxtreme.analysis._paths import ANALYSIS_DIR, _summary_paths, load_population_summaries
 
 
 def compute_learning_score(df, target, metric='absolute'):
 
-    mid_point = (constants.CHIP_WIDTH / 2) * constants.ELEC_SIZE # This is the x mid point
+    mid_point = (device.CHIP_WIDTH / 2) * device.ELEC_SIZE # This is the x mid point
 
     if metric == 'absolute':
 

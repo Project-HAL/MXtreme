@@ -43,6 +43,23 @@ class Pipeline:
     def __init__(self, steps: list[Callable[[dict], dict]]):
         self.steps = list(steps)
 
+    def transform(self, data: dict[int, dict]) -> dict[int, dict]:
+        """Apply every step to every well, in place, and return the data. Performs no I/O.
+
+        Useful for inspecting/plotting the result of a (possibly partial) pipeline without writing files.
+
+        :param data: Mapping of well number to well data dict (from :func:`mxtreme.extract.extract`).
+        :type data: dict[int, dict]
+        :returns: The same ``data`` mapping, with each well transformed by the steps.
+        :rtype: dict[int, dict]
+        """
+        for well_no in list(data):
+            well = data[well_no]
+            for step in self.steps:
+                well = step(well)
+            data[well_no] = well
+        return data
+
     def run(
         self,
         data: dict[int, dict],
@@ -50,7 +67,7 @@ class Pipeline:
         datastore: str | Path,
         overwrite: bool = True,
     ) -> list[Path]:
-        """Run every step over every well and save the cleaned data.
+        """Transform every well (via :meth:`transform`) and save the cleaned data.
 
         Wells that end up with no spikes after the steps are skipped (with a warning) rather than saved.
 
@@ -64,15 +81,13 @@ class Pipeline:
         :returns: Paths of the ``.npz`` files written (one per saved well).
         :rtype: list[Path]
         """
+        self.transform(data)
+
         saved: list[Path] = []
         for well_no in list(data):
             well = data[well_no]
-            for step in self.steps:
-                well = step(well)
-
             if len(well["data"]) == 0:
                 print(f"Well {well_no} has 0 spikes after the pipeline. Skipping...")
                 continue
-
             saved.append(io.save_preprocessed(datastore, well, overwrite=overwrite))
         return saved

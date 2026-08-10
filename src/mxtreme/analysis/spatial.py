@@ -8,6 +8,7 @@ from scipy.spatial.distance import cdist
 
 from mxtreme.utils import load_data
 from mxtreme import constants
+from mxtreme import device
 from mxtreme import visualizations as viz
 from mxtreme.recording import Recording
 from mxtreme.analysis._paths import ANALYSIS_DIR, _summary_paths, load_population_summaries
@@ -44,7 +45,7 @@ def compute_spatial_metrics(channelmap):
     else:
         hull_area_um2 = np.nan
 
-    chip_area_um2 = (constants.CHIP_WIDTH * constants.ELEC_SIZE) * (constants.CHIP_HEIGHT * constants.ELEC_SIZE)
+    chip_area_um2 = (device.CHIP_WIDTH * device.ELEC_SIZE) * (device.CHIP_HEIGHT * device.ELEC_SIZE)
     pct_chip_covered = 100 * hull_area_um2 / chip_area_um2 if not np.isnan(hull_area_um2) else np.nan
     electrode_density = n_electrodes / hull_area_um2 if hull_area_um2 else np.nan
 

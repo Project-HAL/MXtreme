@@ -23,6 +23,7 @@ from mxtreme.burst import BurstDetector, Burst, ISIThreshBurst, RateThreshBurst
 from mxtreme import visualizations as viz
 from mxtreme import utils
 from mxtreme import constants
+from mxtreme import device
 
 class Recording:
     """
@@ -488,7 +489,7 @@ class Recording:
 
     def get_bursts_as_vectors(self, phase=None):
 
-        chip_ht_um = constants.CHIP_HEIGHT * constants.ELEC_SIZE
+        chip_ht_um = device.CHIP_HEIGHT * device.ELEC_SIZE
 
 
         hal_burst_df = self.burst_df[self.burst_df['type']=='HAL_like']
@@ -540,7 +541,7 @@ class Recording:
         # create own figure 
         fig, ax = plt.subplots(1, 1, figsize=(9,5))
 
-        chip_ht_um = constants.CHIP_HEIGHT * constants.ELEC_SIZE
+        chip_ht_um = device.CHIP_HEIGHT * device.ELEC_SIZE
 
         # Plot heatmap using the electrodes that are spiking at the onset of the burst
 
@@ -597,7 +598,7 @@ class Recording:
 
         ax.scatter(x_origin, chip_ht_um-np.array(y_origin), color=c, marker='x', s=100, linewidths=3)
 
-        ax.set_xlim([0, constants.CHIP_WIDTH*constants.ELEC_SIZE])
+        ax.set_xlim([0, device.CHIP_WIDTH*device.ELEC_SIZE])
         ax.set_ylim([0,chip_ht_um])
         ax.set_title(title)
 
@@ -635,7 +636,7 @@ class Recording:
             # create own figure 
             fig, ax = plt.subplots(1, 1, figsize=(9,5))
 
-        chip_width_um = constants.CHIP_WIDTH * constants.ELEC_SIZE
+        chip_width_um = device.CHIP_WIDTH * device.ELEC_SIZE
 
         # Plot histogram using the electrodes that are spiking at the onset of the burst
 
@@ -713,7 +714,7 @@ class Recording:
         if ax is None:
             fig, ax = plt.subplots(1, 1, figsize=(9,5))
 
-        chip_ht_um = constants.CHIP_HEIGHT * constants.ELEC_SIZE
+        chip_ht_um = device.CHIP_HEIGHT * device.ELEC_SIZE
 
         # Plot heatmap using the electrodes that are spiking at the onset of the burst
 
@@ -778,7 +779,7 @@ class Recording:
                     headaxislength=3,  # smaller head base)
                     alpha = 0.6)
 
-        ax.set_xlim([0, constants.CHIP_WIDTH*constants.ELEC_SIZE])
+        ax.set_xlim([0, device.CHIP_WIDTH*device.ELEC_SIZE])
         ax.set_ylim([0,chip_ht_um])
         ax.set_title(title)
 

@@ -22,10 +22,7 @@ OFFSET_THRESH_PCT = 0.05
 # Spike Features
 ISI_threshold = 200 # ms - MAxLab threshold
 
-# Channel Map
-CHIP_WIDTH = 220 # in electrodes
-CHIP_HEIGHT = 120 # in electrodes
-ELEC_SIZE = 17.5 # in µm
+# Channel Map / device geometry moved to mxtreme.device (CHIP_WIDTH, CHIP_HEIGHT, ELEC_SIZE).
 
 
 # Original Experiments
