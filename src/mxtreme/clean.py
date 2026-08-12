@@ -25,8 +25,12 @@ Default values mirror the historical ``constants.py`` hyperparameters:
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 
 def _stamp(well: dict, **params) -> None:
@@ -40,7 +44,7 @@ def normalize_time(well: dict) -> dict:
     Subtracts the raw recording's first frame (``well['raw_start']``) from every spike and event frame.
 
     :param well: A well data dict.
-    :returns: The same dict, with normalised ``data['frameno']`` and ``eventtime``.
+    :returns: The same dict, with normalized ``data['frameno']`` and ``eventtime``.
     :rtype: dict
     """
     well["data"]["frameno"] -= well["raw_start"]
@@ -80,7 +84,7 @@ def spike_filter(well: dict, amp_thresh: float = 2e-5) -> dict:
     :returns: The same dict, filtered by amplitude.
     :rtype: dict
     """
-    print(f"Applying amplitude filter with threshold of {amp_thresh * 1e6} µV...")
+    logger.info("Applying amplitude filter with threshold of %s µV...", amp_thresh * 1e6)
     mask = np.abs(well["data"]["amplitude"]) >= amp_thresh
     well["data"] = well["data"][mask]
     if len(well["data"]) == 0:
@@ -102,24 +106,34 @@ def remove_spurious_spikes(well: dict, refractory_period: float = 0.002) -> dict
     :rtype: dict
     """
     refractory_frames = refractory_period * well["samp_rate"]
+    data = well["data"]
+    n = len(data)
 
-    df = pd.DataFrame(well["data"])
-    groups = []
-    for _, group in df.groupby("channel"):
-        inds = np.where(np.diff(group["frameno"]) < refractory_frames)[0]
-        while len(inds) != 0:
-            mask = np.ones(shape=len(group["frameno"]), dtype=int)
-            for ind in inds:
-                if np.array(group["amplitude"])[ind] < np.array(group["amplitude"])[ind + 1]:
-                    mask[ind + 1] = 0  # keep the smaller-amplitude spike
-                else:
-                    mask[ind] = 0
-            group = group[mask.astype(bool)]
-            inds = np.where(np.diff(group["frameno"]) < refractory_frames)[0]
-        groups.append(group)
+    # Sort by (channel, frame) so refractory violations are adjacent within each channel. Work on a
+    # boolean "alive" mask over the sorted positions and resolve violations in vectorized passes: this
+    # reproduces the original per-channel greedy exactly (remove the weaker/less-negative of each adjacent
+    # violating pair, ties drop the earlier spike) but without pandas or a Python-per-spike loop.
+    order = np.lexsort((data["frameno"], data["channel"]))
+    ch = data["channel"][order]
+    fr = data["frameno"][order]
+    amp = data["amplitude"][order]
 
-    filtered = pd.concat(groups).sort_index()
-    well["data"] = filtered.to_records(index=False)
+    alive = np.ones(n, dtype=bool)
+    while True:
+        idx = np.flatnonzero(alive)
+        if idx.size < 2:
+            break
+        a, b = idx[:-1], idx[1:]                        # consecutive alive spikes
+        viol = (ch[a] == ch[b]) & ((fr[b] - fr[a]) < refractory_frames)
+        if not viol.any():
+            break
+        a, b = a[viol], b[viol]
+        # keep the more-negative (larger-magnitude) spike; on ties (amp[a] not < amp[b]) drop the earlier
+        alive[np.where(amp[a] < amp[b], b, a)] = False
+
+    keep = np.zeros(n, dtype=bool)
+    keep[order[alive]] = True                           # map back to original ordering
+    well["data"] = data[keep]
     _stamp(well, refractory_period=refractory_period)
     return well
 
@@ -135,7 +149,7 @@ def remove_spurious_channels(well: dict) -> dict:
     :rtype: dict
     """
     if len(well["mapping"]["channel"]) != len(np.unique(well["mapping"]["channel"])):
-        print("Duplicate channels found.")
+        logger.warning("Duplicate channels found.")
     mask = np.isin(well["data"]["channel"], well["mapping"]["channel"])
     well["data"] = well["data"][mask]
     return well
@@ -176,7 +190,7 @@ def remove_stim_frames(well: dict, post_stim_period: float = 0.0) -> dict:
     """
     post_stim_frames = post_stim_period * well["samp_rate"]
 
-    print("Removing stimulation frames from spike data...")
+    logger.info("Removing stimulation frames from spike data...")
     event_df = pd.DataFrame({"eventtime": well["eventtime"], "eventmessage": well["event_messages"]})
 
     if len(event_df) == 0:
@@ -224,11 +238,11 @@ def bin_spikes(well: dict, bin_size: float = 0.01) -> dict:
     num_bins = int(np.ceil(np.divide(rec_t_samp, bin_win)))
 
     num_chan = well["channelmap"].shape[0]
-    spike_bin = np.zeros((num_chan, num_bins))
+    spike_bin = np.zeros((num_chan, num_bins), dtype=np.uint8)  # binary matrix; uint8 keeps it 8x smaller
     which_bin = (well["data"]["frameno"] / bin_win).astype(int)
     which_bin = np.clip(which_bin, 0, num_bins - 1)
 
-    print("Binning Spikes...")
+    logger.info("Binning Spikes...")
     mapping = dict(zip(well["channelmap"][:, 1], well["channelmap"][:, 0]))
     channel_ids = pd.Series(well["data"]["channel"]).map(mapping).to_numpy(dtype=int)
     assert len(channel_ids) == len(which_bin)

@@ -4,15 +4,31 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from pathlib import Path
 
-from mxtreme.utils import load_data
+from mxtreme import io
 from mxtreme import constants
 from mxtreme.recording import Recording
-from mxtreme.analysis._paths import ANALYSIS_DIR, _summary_paths, load_population_summaries
+from mxtreme.utils import frame_to_sec
+from mxtreme.analysis._paths import _summary_paths, load_population_summaries
 from mxtreme.analysis._plotting import plot_metric_grid
 from mxtreme.analysis._stats import aggregate_by_div_phase
 
 
-def burst_activity_summary(cpath, analysis_dir: Path = ANALYSIS_DIR, use_existing=True, show_plot=True, save_plot=False):
+def _load_recording(npz, make_phases):
+    """Load a Recording, re-injecting phases via ``make_phases(rec)`` when supplied.
+
+    ``make_phases`` (e.g. a closure around :func:`mxtreme.phases.phases_from_event_tags`) lets callers
+    reconstruct the same phase structure used at burst-detection time; without it the recording has a
+    single ``"full"`` phase.
+    """
+    data = io.load_preprocessed(npz)
+    rec = Recording(0, data)
+    if make_phases is not None:
+        rec = Recording(0, data, phases=make_phases(rec))
+    return rec
+
+
+def burst_activity_summary(cpath, analysis_dir: Path, use_existing=True, show_plot=True, save_plot=False,
+                           make_phases=None):
 
     cid = cpath.culture_id
     rows = []
@@ -27,50 +43,46 @@ def burst_activity_summary(cpath, analysis_dir: Path = ANALYSIS_DIR, use_existin
         for div in cpath.recordings:
 
             npz = cpath.recordings[div].npz
-            rec = Recording(0,exp_data = load_data(npz))
-            rec_t_sec = rec.rec_t_sec
+            rec = _load_recording(npz, make_phases)
+            samp_rate = rec.samp_rate
 
-            pre_sec = post_sec = 20*60 # 20 minutes fixed
-            train_sec = rec_t_sec - pre_sec - post_sec
-            phase_time_dict = {'pre':pre_sec,
-                            'train':train_sec,
-                            'post':post_sec}
-
-            bin_size = rec.bin_size
+            # Phase windows come from the recording's injected phases (default: a single "full"
+            # phase over the whole recording), not a hardcoded pre/train/post split.
+            phase_time_dict = {
+                p.name: frame_to_sec(p.end_frame - p.start_frame, samp_rate) for p in rec.phases
+            }
 
             burst_stats = cpath.recordings[div].burst_stats
             burst_data = pd.read_csv(burst_stats)
 
-            # Filter burst dataframe
-            burst_data = burst_data[burst_data['type']=='HAL_like']
-
-            t_burst_sec = burst_data['t_peak_bin']*bin_size #TODO: replace with t_peak_sec when it gets fixed in the burst CSV
+            # Keep only network bursts (the analogue of the old "HAL_like" class).
+            burst_data = burst_data[burst_data['kind'] == 'network']
 
             for phase in burst_data['phase'].dropna().unique():
 
-                phase_bursts = burst_data[burst_data['phase']==phase]
+                phase_bursts = burst_data[burst_data['phase'] == phase].sort_values('peak_frame')
 
-                # Bursting rate
-                burst_rate = len(phase_bursts)/phase_time_dict[phase]
+                # Bursting rate (bursts / sec of that phase)
+                phase_sec = phase_time_dict.get(phase)
+                burst_rate = len(phase_bursts) / phase_sec if phase_sec else np.nan
 
-                # IBI
-                ibis = np.diff(phase_bursts['t_peak_bin'])*bin_size
+                # IBI (successive network-burst peaks, in seconds)
+                ibis = np.diff(frame_to_sec(phase_bursts['peak_frame'].to_numpy(), samp_rate))
                 mean_ibi = np.mean(ibis) if len(ibis) > 0 else np.nan
                 median_ibi = np.median(ibis) if len(ibis) > 0 else np.nan
                 std_ibi = np.std(ibis) if len(ibis) > 0 else np.nan
 
-
-                # burst size
-                burst_sizes = phase_bursts['size_pct_elec']
+                # burst size (fraction of electrodes -> percent, matching the old size_pct_elec column)
+                burst_sizes = phase_bursts['size_frac_elec'] * 100
                 mean_size   = burst_sizes.mean()
                 median_size = burst_sizes.median()
                 std_size    = burst_sizes.std()
 
-                # burst duration
-                durations = phase_bursts['duration']
-                mean_dur    = durations.mean()
-                median_dur  = durations.median()
-                std_dur     = durations.std()
+                # burst duration (frames -> seconds)
+                durations = frame_to_sec(phase_bursts['duration_frames'].to_numpy(), samp_rate)
+                mean_dur    = np.mean(durations) if len(durations) else np.nan
+                median_dur  = np.median(durations) if len(durations) else np.nan
+                std_dur     = np.std(durations) if len(durations) else np.nan
 
                 rows.append({
                     'culture_id':      cid,
@@ -133,7 +145,8 @@ def _plot_burst_activity_summary(df: pd.DataFrame, cid: str,
         dpi=150,
     )
 
-def channel_activity_summary(cpath, analysis_dir: Path = ANALYSIS_DIR, use_existing=True, show_plot=True, save_plot=False):
+def channel_activity_summary(cpath, analysis_dir: Path, use_existing=True, show_plot=True, save_plot=False,
+                             make_phases=None):
 
     cid = cpath.culture_id
     rows = []
@@ -148,12 +161,13 @@ def channel_activity_summary(cpath, analysis_dir: Path = ANALYSIS_DIR, use_exist
         for div in cpath.recordings:
 
             npz = cpath.recordings[div].npz
-            rec = Recording(0,exp_data = load_data(npz))
+            rec = _load_recording(npz, make_phases)
 
-            for phase in rec.epochs:
+            for p in rec.phases:
 
-                start = rec.epochs[phase][0]
-                stop = rec.epochs[phase][1]
+                phase = p.name
+                start = p.start_frame
+                stop = p.end_frame
 
                 phase_spike_data = rec.spike_data[(rec.spike_data["frameno"]>start)&(rec.spike_data["frameno"]<stop)]
 
@@ -284,8 +298,8 @@ def _plot_channel_activity_summary(
 
 def plot_population_burst_summary(
     sel_paths,
-    analysis_dir: Path = ANALYSIS_DIR,
-    phase: str = 'pre',
+    analysis_dir: Path,
+    phase: str = None,
     savename: str = None,
 ):
     """
@@ -343,8 +357,8 @@ def plot_population_burst_summary(
 
 
 def plot_population_channel_activity(sel_paths,
-                                    analysis_dir: Path = ANALYSIS_DIR,
-                                    phase: str = 'pre',
+                                    analysis_dir: Path,
+                                    phase: str = None,
                                     savename: str = None,
                                     ):
     """

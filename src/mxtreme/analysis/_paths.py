@@ -1,17 +1,14 @@
 """
 Shared per-culture/population path helpers for the analysis/ topic modules.
 
-ANALYSIS_DIR lives here for now (matches where it's always defaulted from); it should eventually
-move to a user-editable config rather than being sourced from core.constants.PARENT_DIR, once the
-package-level config work in claude_configs/PACKAGE_PLAN.md happens.
+The analysis output root is supplied by the caller as ``analysis_dir`` (typically
+``config.analysis_dir`` from :class:`mxtreme.config.Config`) -- nothing here is coupled to a
+lab-specific path.
 """
 
 
 from pathlib import Path
 import pandas as pd
-from mxtreme import constants
-
-ANALYSIS_DIR = Path(constants.PARENT_DIR) / "analysis"
 
 
 def _summary_paths(cpath, analysis_dir: Path, category: str, name: str) -> tuple[Path, Path]:

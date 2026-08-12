@@ -6,12 +6,11 @@ from pathlib import Path
 from scipy.spatial import ConvexHull
 from scipy.spatial.distance import cdist
 
-from mxtreme.utils import load_data
-from mxtreme import constants
+from mxtreme import io
 from mxtreme import device
 from mxtreme import visualizations as viz
 from mxtreme.recording import Recording
-from mxtreme.analysis._paths import ANALYSIS_DIR, _summary_paths, load_population_summaries
+from mxtreme.analysis._paths import _summary_paths, load_population_summaries
 from mxtreme.analysis._plotting import plot_metric_grid
 from mxtreme.analysis._stats import aggregate_by_div_phase
 
@@ -23,7 +22,7 @@ def _load_channelmaps(cpath):
     channelmaps = {}
     for div in cpath.recordings:
         npz = cpath.recordings[div].npz
-        rec = Recording(0, exp_data=load_data(npz))
+        rec = Recording(0, io.load_preprocessed(npz))
         channelmaps[div] = (rec.channelmap, rec.stim_elecs)
     return channelmaps
 
@@ -71,7 +70,7 @@ def compute_spatial_metrics(channelmap):
     }
 
 
-def mea_layout_summary(cpath, analysis_dir: Path = ANALYSIS_DIR, use_existing=True, show_plot=True, save_plot=False):
+def mea_layout_summary(cpath, analysis_dir: Path, use_existing=True, show_plot=True, save_plot=False):
     """
     Visualizes the MEA electrode configuration (core.visualizations.MEA) for a culture. Plots
     one panel per distinct electrode configuration found across the culture's DIVs -- a single
@@ -91,7 +90,7 @@ def mea_layout_summary(cpath, analysis_dir: Path = ANALYSIS_DIR, use_existing=Tr
         channelmaps = _load_channelmaps(cpath)
 
         summary_df = pd.DataFrame([
-            {'culture_id': cid, 'div': div, 'phase': 'full', 'n_electrodes': cmap.shape[0]}
+            {'culture_id': str(cid), 'div': div, 'phase': 'full', 'n_electrodes': cmap.shape[0]}
             for div, (cmap, _) in channelmaps.items()
         ])
 
@@ -153,7 +152,7 @@ def _plot_mea_layout_summary(channelmaps, cid, analysis_dir: Path, show_plot=Tru
         plt.close(fig)
 
 
-def spatial_summary(cpath, analysis_dir: Path = ANALYSIS_DIR, use_existing=True, show_plot=True, save_plot=False):
+def spatial_summary(cpath, analysis_dir: Path, use_existing=True, show_plot=True, save_plot=False):
     """Electrode spread metrics (compute_spatial_metrics) per DIV for a culture."""
 
     cid = cpath.culture_id
@@ -167,10 +166,10 @@ def spatial_summary(cpath, analysis_dir: Path = ANALYSIS_DIR, use_existing=True,
         rows = []
         for div in cpath.recordings:
             npz = cpath.recordings[div].npz
-            rec = Recording(0, exp_data=load_data(npz))
+            rec = Recording(0, io.load_preprocessed(npz))
 
             rows.append({
-                'culture_id': cid,
+                'culture_id': str(cid),
                 'div': div,
                 'phase': 'full',
                 **compute_spatial_metrics(rec.channelmap),
@@ -211,7 +210,7 @@ def _plot_spatial_summary(df: pd.DataFrame, cid, analysis_dir: Path, show_plot=T
     )
 
 
-def plot_population_spatial_summary(sel_paths, analysis_dir: Path = ANALYSIS_DIR, savename: str = None):
+def plot_population_spatial_summary(sel_paths, analysis_dir: Path, savename: str = None):
     """
     Aggregate per-culture spatial (electrode spread) summaries and plot population-level
     measures (mean ± SEM across cultures) vs DIV.

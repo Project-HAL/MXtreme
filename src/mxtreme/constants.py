@@ -7,17 +7,8 @@ REFRACTORY_PERIOD=0.002 # in seconds
 POST_STIM_PERIOD = 0 #500 # this is the number of frames after the end-stimulation event tag that we want to remove from the spike data due to artifacts
 NOISE_THRESH = 0.01 # what we consider noise
 
-# Burst Detection
-GAUSSIAN_SIGMA = 1 # sigma for the 1D Gaussian filter to smooth spike bin
-BURST_THRESH = 0.2
-K = 0.25 # dynamics burst detection (k std/mad from mean/median)
-DIST_BTW_BURSTS= 30 # in bins
-PROMINENCE_PERCENTILE = 25
-N=300 # ISI-N burst detection - min num spikes comprising a burst
-
-# Burst Features
-ONSET_THRESH_PCT = 0.1 #0.2
-OFFSET_THRESH_PCT = 0.05
+# Burst-detection / burst-feature hyperparameters now live in mxtreme.params
+# (BurstDetectParams, BurstFeatureParams).
 
 # Spike Features
 ISI_threshold = 200 # ms - MAxLab threshold

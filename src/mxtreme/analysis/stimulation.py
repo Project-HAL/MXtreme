@@ -4,9 +4,9 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from pathlib import Path
 
-from mxtreme.utils import load_data
+from mxtreme import io
 from mxtreme.recording import Recording
-from mxtreme.analysis._paths import ANALYSIS_DIR, _summary_paths, load_population_summaries
+from mxtreme.analysis._paths import _summary_paths, load_population_summaries
 from mxtreme.analysis._stats import aggregate_by_div_phase
 
 
@@ -20,7 +20,7 @@ def _get_stim_info(rec: Recording):
     return stim_rows
 
 
-def stim_summary(cpath, analysis_dir: Path = ANALYSIS_DIR, use_existing=True, show_plot=True, save_plot=False):
+def stim_summary(cpath, analysis_dir: Path, use_existing=True, show_plot=True, save_plot=False):
 
     divs = []
     total_stim_times = []
@@ -39,9 +39,8 @@ def stim_summary(cpath, analysis_dir: Path = ANALYSIS_DIR, use_existing=True, sh
         for div in cpath.recordings:
 
             npz = cpath.recordings[div].npz
-            burst_stats = cpath.recordings[div].burst_stats
 
-            rec = Recording(0, exp_data=load_data(npz), burst_csv=burst_stats)
+            rec = Recording(0, io.load_preprocessed(npz))
 
             stim_df = _get_stim_info(rec)
 
@@ -100,7 +99,7 @@ def _plot_stim_summary(df: pd.DataFrame, cid, analysis_dir, show_plot, save_plot
         plt.close()
 
 
-def plot_population_stim_summary(sel_paths, analysis_dir: Path=ANALYSIS_DIR, savename=None):
+def plot_population_stim_summary(sel_paths, analysis_dir: Path, savename=None):
     """Bar chart of mean ± SEM across cultures, one bar per DIV."""
 
     # TODO: update if sel_paths has more than one exp_id, decide whether to combine them or plot them separately

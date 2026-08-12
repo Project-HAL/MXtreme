@@ -8,11 +8,15 @@ Contents:
 - :func:`save_preprocessed` -- write one well's cleaned data to an ``.npz``.
 - :func:`write_experimental_conditions` -- append per-culture stimulation conditions to a CSV.
 - :func:`register` -- record processed recordings in the registry CSV.
+- :func:`save_burst_data` / :func:`load_burst_data` -- per-recording burst CSVs.
+- :func:`update_burst_log` -- per-experiment burst summary CSV.
 """
 
 from __future__ import annotations
 
+import json
 import os
+from dataclasses import asdict, is_dataclass
 from pathlib import Path
 
 import numpy as np
@@ -102,6 +106,7 @@ def save_preprocessed(datastore: str | Path, well: dict, *, overwrite: bool = Tr
         raw_start=well["raw_start"],
         path_to_h5=well["path_to_h5"],
         preprocessing_params=np.asarray(well.get("preprocessing_params", {})),
+        step_log=np.asarray(well.get("step_log", []), dtype=object),
     )
 
     print(f"Transformed data saved to: {out_path}")
@@ -168,15 +173,141 @@ def register(data: dict[int, dict], registry_path: str | Path) -> None:
             "timestamp": pd.Timestamp.now().isoformat(),
         }
         if not df.empty:
+            # Compare as strings: rows may have been written by another producer
+            # (e.g. utils.build_registry_from_disk) with a different dtype for `well`/`div`,
+            # which would otherwise leak a duplicate row on re-registration.
             mask = (
-                (df.exp_id == well["exp_id"])
-                & (df.chip == well["chip"])
-                & (df.well == well_no)
-                & (df.div == well["DIV"])
+                (df["exp_id"].astype(str) == str(well["exp_id"]))
+                & (df["chip"].astype(str) == str(well["chip"]))
+                & (df["well"].astype(str) == str(well_no))
+                & (df["div"].astype(str) == str(well["DIV"]))
             )
             df = df[~mask]
             df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
         else:
             df = pd.DataFrame([new_row])
 
+    # Defensive: collapse any pre-existing duplicates (mixed-dtype rows from older writes).
+    df = df.drop_duplicates(subset=["exp_id", "chip", "well", "div"], keep="last")
     df.to_csv(registry_path, index=False)
+
+
+# --- burst outputs ------------------------------------------------------------------------------
+
+
+def _burst_csv_path(datastore: Path, recording) -> Path:
+    """Return ``<datastore>/<exp>/<chip>/well<well>/DIV<div>_<plate_date>_<chip>_<exp>_well<well>_burst_data.csv``."""
+    out_dir = datastore / recording.exp_id / recording.chip / f"well{recording.well}"
+    return out_dir / (
+        f"DIV{recording.DIV}_{recording.plate_date}_{recording.chip}_"
+        f"{recording.exp_id}_well{recording.well}_burst_data.csv"
+    )
+
+
+def _params_json(params):
+    """Serialize a params dataclass (or dict) to a JSON string, or ``None`` if ``params`` is ``None``.
+
+    Returning ``None`` (rather than ``"{}"``) lets :func:`update_burst_log` *preserve* an existing
+    logged value instead of clobbering it when a later step doesn't carry those params.
+    """
+    if params is None:
+        return None
+    if is_dataclass(params):
+        params = asdict(params)
+    return json.dumps(params)
+
+
+def save_burst_data(burst_set, datastore, recording, *, overwrite: bool = True) -> Path:
+    """Write a recording's bursts to a CSV under the managed store.
+
+    Mirrors the preprocessed-npz layout so path resolution stays symmetric:
+    ``<datastore>/<exp_id>/<chip>/well<well>/DIV<DIV>_..._burst_data.csv``.
+
+    :param burst_set: The :class:`~mxtreme.bursting.detection.BurstSet` to write.
+    :param datastore: Directory under which to write (typically ``config.burst_data_dir``).
+    :param recording: The source :class:`~mxtreme.recording.Recording` (supplies the path fields).
+    :param overwrite: If ``False``, avoid clobbering an existing file by adding a numeric suffix.
+    :returns: The path written to.
+    :rtype: Path
+    """
+    datastore = Path(datastore)
+    out_path = _burst_csv_path(datastore, recording)
+    os.makedirs(out_path.parent, exist_ok=True)
+    if not overwrite:
+        out_path = _unique_path(out_path)
+
+    burst_set.to_dataframe().to_csv(out_path, index=False)
+    print(f"Burst data saved to: {out_path}")
+    return out_path
+
+
+def load_burst_data(path: str | Path):
+    """Load a burst CSV written by :func:`save_burst_data` into a ``BurstSet``.
+
+    :param path: Path to the burst CSV.
+    :returns: A :class:`~mxtreme.bursting.detection.BurstSet`.
+    """
+    from mxtreme.bursting.detection import BurstSet
+
+    return BurstSet.from_csv(path)
+
+
+def update_burst_log(datastore, recording, burst_set) -> Path:
+    """Upsert one summary row per recording into the per-experiment burst log.
+
+    The log lands at ``<datastore>/<exp_id>_burst_log.csv``; rows are keyed by
+    ``(exp_id, chip, well, DIV)``. Recorded per recording: burst counts, detection/feature parameters
+    (JSON), and per-step completion timestamps (``detection_completed_at`` / ``features_computed_at``).
+
+    Updates are **field-wise and None-preserving**: for an existing row, only columns whose new value
+    is not ``None`` are overwritten. So a detection-only write followed later by a features-only write
+    (whose ``BurstSet`` carries no detection timestamp or ``detect_params``) keeps the detection
+    timestamp and params intact -- and vice versa.
+
+    :param datastore: Directory under which to write (typically ``config.burst_data_dir``).
+    :param recording: The source :class:`~mxtreme.recording.Recording`.
+    :param burst_set: The detected/featurized :class:`~mxtreme.bursting.detection.BurstSet`.
+    :returns: The path to the burst log.
+    :rtype: Path
+    """
+    datastore = Path(datastore)
+    os.makedirs(datastore, exist_ok=True)
+    log_path = datastore / f"{recording.exp_id}_burst_log.csv"
+
+    df = burst_set.to_dataframe()
+    key = {
+        "exp_id": recording.exp_id,
+        "chip": recording.chip,
+        "well": recording.well,
+        "DIV": recording.DIV,
+    }
+    new_row = {
+        **key,
+        "plate_date": recording.plate_date,
+        "n_bursts": len(burst_set),
+        "n_network": int((df["kind"] == "network").sum()) if len(df) else 0,
+        "n_mini": int((df["kind"] == "mini").sum()) if len(df) else 0,
+        "n_ignored": int(burst_set.n_ignored),
+        "detect_params": _params_json(burst_set.detect_params),
+        "feature_params": _params_json(burst_set.feature_params),
+        "detection_completed_at": burst_set.detected_at,
+        "features_computed_at": burst_set.features_computed_at,
+    }
+
+    log = pd.read_csv(log_path) if log_path.exists() else pd.DataFrame()
+    rows = log.to_dict("records") if not log.empty else []
+
+    existing = next(
+        (i for i, r in enumerate(rows) if all(str(r.get(k)) == str(v) for k, v in key.items())),
+        None,
+    )
+    if existing is not None:
+        # Field-wise merge on a plain dict: overwrite only columns with a non-None new value.
+        merged = dict(rows[existing])
+        merged.update({col: val for col, val in new_row.items() if val is not None})
+        rows[existing] = merged
+    else:
+        rows.append(new_row)
+
+    pd.DataFrame(rows).to_csv(log_path, index=False)
+    return log_path

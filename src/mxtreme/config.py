@@ -41,6 +41,16 @@ class Config:
         return self.data_root / "experimental_conditions"
 
     @property
+    def burst_data_dir(self) -> Path:
+        """Directory holding per-recording burst CSVs and per-experiment burst logs."""
+        return self.data_root / "burst_data"
+
+    @property
+    def analysis_dir(self) -> Path:
+        """Directory holding analysis outputs (per-culture summary CSVs, plots, PDF reports)."""
+        return self.data_root / "analysis"
+
+    @property
     def registry_path(self) -> Path:
         """Path to the CSV index of what has been processed."""
         return self.data_root / "registry.csv"

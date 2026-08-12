@@ -1,9 +1,26 @@
+"""Resolve a selection (recording / culture / group) into concrete on-disk paths.
+
+Path resolution is driven entirely by a :class:`~mxtreme.config.Config`: the managed-store layout
+(``preprocessed/``, ``burst_data/``, ``experimental_conditions/``, ``registry.csv``) comes from the
+config, so nothing here is coupled to a particular machine or lab share.
+
+Entry point: :func:`resolve_paths`.
+
+    RecordingID      -> RecordingPaths
+    CultureID        -> CulturePaths  (all available DIVs)
+    CultureSelector  -> dict[exp_id, ExperimentPaths]
+"""
+
+from __future__ import annotations
+
 from dataclasses import dataclass
 from glob import glob
 from pathlib import Path
+
 import pandas as pd
-from mxtreme.identity import CultureID, RecordingID, CultureSelector
-from mxtreme.constants import PARENT_DIR
+
+from mxtreme.config import Config
+from mxtreme.identity import CultureID, CultureSelector, RecordingID
 
 
 @dataclass(frozen=True)
@@ -15,7 +32,7 @@ class RecordingPaths:
 @dataclass(frozen=True)
 class CulturePaths:
     culture_id: CultureID
-    experimental_conditions: Path           # culture-level preprocessing output
+    experimental_conditions: Path           # culture-level experimental-condition CSV
     recordings: dict[int, RecordingPaths]  # keyed by DIV
 
     def recording(self, div: int) -> RecordingPaths:
@@ -24,68 +41,87 @@ class CulturePaths:
 @dataclass(frozen=True)
 class ExperimentPaths:
     exp_id: str
-    burst_summary: Path        # experiment-level preprocessing output
+    burst_summary: Path        # per-experiment burst log
     cultures: dict[CultureID, CulturePaths]
 
     def culture(self, culture_id: CultureID) -> CulturePaths:
         return self.cultures[culture_id]
 
 
-def _recording_paths(rid: RecordingID, root: Path) -> RecordingPaths:
-    base = root / "data" 
+def _one(matches: list[str], what: str) -> Path:
+    """Return the single matching path, with a clear error if zero (or many) matched."""
+    if not matches:
+        raise FileNotFoundError(f"No {what} found (checked pattern had no matches).")
+    return Path(matches[0])
+
+
+def _recording_paths(rid: RecordingID, config: Config) -> RecordingPaths:
+    npz_glob = str(
+        config.preprocessed_dir / rid.exp_id / rid.chip / f"well{rid.well}" / f"DIV{rid.div}*exp_data.npz"
+    )
+    burst_glob = str(
+        config.burst_data_dir / rid.exp_id / rid.chip / f"well{rid.well}" / f"DIV{rid.div}*burst_data.csv"
+    )
     return RecordingPaths(
         recording_id=rid,
-        npz=glob(str(base / "preprocessed" / rid.exp_id / rid.chip / f"well{rid.well}" /f"DIV{rid.div}*exp_data.npz"))[0],
-        burst_stats=glob(str(base / "burst_data" / rid.exp_id / rid.chip / f"well{rid.well}" /f"DIV{rid.div}*burst_data.csv"))[0],
+        npz=_one(glob(npz_glob), f"preprocessed npz for {rid}"),
+        burst_stats=_one(glob(burst_glob), f"burst CSV for {rid}"),
     )
 
-def _culture_paths(cid: CultureID, divs: list[int]|int, root: Path) -> CulturePaths:
-    base = root / "data"
+def _culture_paths(cid: CultureID, divs: list[int] | int, config: Config) -> CulturePaths:
     if isinstance(divs, int):
-        divs=[divs]
+        divs = [divs]
     return CulturePaths(
         culture_id=cid,
-        experimental_conditions=base / "experimental_conditions" / cid.exp_id / f"{cid.chip}_well{cid.well}_exp_conditions.csv",
+        experimental_conditions=(
+            config.experimental_conditions_dir / cid.exp_id / f"{cid.chip}_well{cid.well}_exp_conditions.csv"
+        ),
         recordings={
-            div: _recording_paths(RecordingID(cid.exp_id, cid.chip, cid.well, div), root)
+            div: _recording_paths(RecordingID(cid.exp_id, cid.chip, cid.well, div), config)
             for div in divs
-        }
+        },
     )
 
-def _experiment_paths(exp_id: str, cultures: list[CulturePaths], root: Path) -> ExperimentPaths:
-    base = root / "data"
+def _experiment_paths(exp_id: str, cultures: list[CulturePaths], config: Config) -> ExperimentPaths:
     return ExperimentPaths(
         exp_id=exp_id,
-        burst_summary=base / "burst_data" / f"{exp_id}_burst_log.csv",
+        burst_summary=config.burst_data_dir / f"{exp_id}_burst_log.csv",
         cultures={c.culture_id: c for c in cultures},
     )
 
 
 def resolve_paths(
     target: CultureSelector | CultureID | RecordingID,
-    registry_path: Path = Path(PARENT_DIR) / "data" / "registry.csv",  # your registry/catalog that knows what DIVs exist per culture
-    root: Path = Path(PARENT_DIR),
+    config: Config,
 ) -> RecordingPaths | CulturePaths | dict[str, ExperimentPaths]:
+    """Resolve a selection into concrete paths using ``config``'s managed-store layout.
+
+    :param target: What to resolve -- a single :class:`~mxtreme.identity.RecordingID`, a
+        :class:`~mxtreme.identity.CultureID` (expands to all completed DIVs), or a
+        :class:`~mxtreme.identity.CultureSelector` (a group, possibly across experiments).
+    :param config: The :class:`~mxtreme.config.Config` describing the managed store.
+    :returns: ``RecordingPaths`` / ``CulturePaths`` / ``dict[exp_id, ExperimentPaths]`` per the
+        target type.
     """
-    RecordingID      -> RecordingPaths
-    CultureID        -> CulturePaths  (all available DIVs)
-    CultureSelector  -> dict[exp_id, ExperimentPaths]
-    """
-    df = pd.read_csv(registry_path)
+    df = pd.read_csv(config.registry_path)
     df = df[df.status == "complete"]
+    # Registry rows may be written by more than one producer (`io.register`,
+    # `utils.build_registry_from_disk`) with differing dtypes/duplicates; normalise + dedupe so a
+    # culture's DIVs aren't double-counted.
+    key = ["exp_id", "chip", "well", "div"]
+    df = df.drop_duplicates(subset=key)
 
     def get_divs(cid: CultureID, divs: list[int] | int | None = None) -> list[int]:
-
         mask = (
-            (df.exp_id == cid.exp_id) &
-            (df.chip == cid.chip) &
-            (df.well == cid.well)
+            (df.exp_id.astype(str) == str(cid.exp_id))
+            & (df.chip.astype(str) == str(cid.chip))
+            & (df.well.astype(str) == str(cid.well))
         )
-        available = df[mask]["div"].tolist()
+        available = sorted(int(d) for d in df[mask]["div"].tolist())
 
         if divs:
             if isinstance(divs, int):
-                return divs if divs in available else []
+                return [divs] if divs in available else []
             return [d for d in divs if d in available]
         return available
 
@@ -93,26 +129,29 @@ def resolve_paths(
         if sel.cultures:
             return sel.cultures
         if sel.exp_ids:
-            rows = df[df.exp_id.isin(sel.exp_ids)][["exp_id", "chip", "well"]].drop_duplicates()
+            rows = df[df.exp_id.astype(str).isin([str(e) for e in sel.exp_ids])]
         else:
-            rows = df[["exp_id", "chip", "well"]].drop_duplicates()
-        return [CultureID(r.exp_id, r.chip, r.well) for r in rows.itertuples()]
+            rows = df
+        rows = rows[["exp_id", "chip", "well"]].drop_duplicates()
+        return [CultureID(str(r.exp_id), str(r.chip), str(r.well)) for r in rows.itertuples()]
 
     if isinstance(target, RecordingID):
-        return _recording_paths(target, root)
+        return _recording_paths(target, config)
 
     if isinstance(target, CultureID):
         divs = get_divs(target)
-        return _culture_paths(target, divs, root)
+        return _culture_paths(target, divs, config)
 
     if isinstance(target, CultureSelector):
         culture_ids = get_culture_ids(target)
         by_exp: dict[str, list[CulturePaths]] = {}
         for cid in culture_ids:
             divs = get_divs(cid, divs=target.divs)
-            cpaths = _culture_paths(cid, divs, root)
+            cpaths = _culture_paths(cid, divs, config)
             by_exp.setdefault(cid.exp_id, []).append(cpaths)
         return {
-            exp_id: _experiment_paths(exp_id, cultures, root)
+            exp_id: _experiment_paths(exp_id, cultures, config)
             for exp_id, cultures in by_exp.items()
         }
+
+    raise TypeError(f"Unsupported target type: {type(target).__name__}")

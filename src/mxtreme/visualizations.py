@@ -1,17 +1,26 @@
 """Basic, data-level visualizations of a preprocessed recording (no analysis).
 
-Three views of the cleaned/binned data:
+Views of the cleaned/binned data:
 - :func:`MEA` -- spatial map of the electrodes on the array.
 - :func:`plot_asdr` -- array-wide spike detection rate (ASDR) time series.
 - :func:`raster` -- raster of the binned spikes.
+
+Burst overlays (consume a burst DataFrame from :meth:`BurstSet.to_dataframe
+<mxtreme.bursting.detection.BurstSet.to_dataframe>`):
+- :func:`plot_bursts_on_asdr` -- ASDR with burst peaks marked.
+- :func:`plot_origin_heatmap` -- burst-origin density over the MEA.
+- :func:`plot_burst_vectors` -- origin->peak arrows over the MEA.
 
 Each accepts an optional ``ax`` so panels can be composed (e.g. a shared-x ASDR-over-raster figure); when
 ``ax`` is ``None`` the function makes its own figure and shows it.
 """
 
+import ast
+
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patheffects as path_effects
+import seaborn as sns
 
 from mxtreme import device
 
@@ -48,9 +57,10 @@ def MEA(ax, channelmap, stim_elecs, title="MEA Channel Layout"):
         txt.set_path_effects([path_effects.Stroke(linewidth=1, foreground="black"), path_effects.Normal()])
 
 
-def plot_asdr(spike_bin, title=None, zoom=None, ax=None, save_path=None, savefilename=None,
-              annotate_bursts=False, bursts=None, burst_threshold=None):
+def plot_asdr(spike_bin, title=None, zoom=None, ax=None, save_path=None, savefilename=None):
     """Plot the array-wide spike detection rate (ASDR): mean binned activity across channels over time.
+
+    To overlay detected bursts, use :func:`plot_bursts_on_asdr`.
 
     :param spike_bin: ``(n_channels, n_bins)`` binary spike matrix.
     :param title: Axes title.
@@ -58,9 +68,6 @@ def plot_asdr(spike_bin, title=None, zoom=None, ax=None, save_path=None, savefil
     :param ax: Axes to draw on. If ``None``, a new figure is created and shown/saved.
     :param save_path: If given (and ``ax`` is ``None``), directory to save into.
     :param savefilename: Filename used with ``save_path``.
-    :param annotate_bursts: If ``True`` and ``bursts`` is given, mark burst peaks.
-    :param bursts: DataFrame with ``t_peak_bin`` and ``peak_bin_amp`` columns.
-    :param burst_threshold: If given, draw a horizontal threshold line.
     """
     asdr = spike_bin.mean(axis=0)
 
@@ -72,12 +79,6 @@ def plot_asdr(spike_bin, title=None, zoom=None, ax=None, save_path=None, savefil
     ax.set_ylabel("ASDR", fontsize=10)
     ax.set_xlabel("Time (bins)", fontsize=10)
     ax.set_title(title, fontsize=15)
-
-    if annotate_bursts and bursts is not None:
-        ax.scatter(bursts["t_peak_bin"], bursts["peak_bin_amp"] + 0.02, marker="v", color="red", s=10)
-
-    if burst_threshold is not None:
-        ax.hlines(burst_threshold, 0, len(asdr), colors="g", linestyles="dashed")
 
     if zoom:
         ax.set_xlim(zoom)
@@ -110,6 +111,140 @@ def raster(spike_bin, zoom=None, ax=None, title=None):
 
     if zoom:
         ax.set_xlim(zoom)
+
+    if owns_fig:
+        plt.show()
+    return ax
+
+
+# --- burst overlays -----------------------------------------------------------------------------
+
+
+def _as_dict(value):
+    """Parse a channel-counts cell that may be a dict (in-memory) or a str (loaded from CSV)."""
+    if isinstance(value, dict):
+        return value
+    try:
+        return dict(ast.literal_eval(value))
+    except (ValueError, SyntaxError, TypeError):
+        return {}
+
+
+def _select(burst_df, kind, phase):
+    """Return the burst rows matching ``kind`` (and ``phase`` if given)."""
+    df = burst_df
+    if kind is not None:
+        df = df[df["kind"] == kind]
+    if phase is not None:
+        df = df[df["phase"] == phase]
+    return df
+
+
+def plot_bursts_on_asdr(recording, burst_df, ax=None, zoom=None, kind="network", title=None):
+    """Plot a recording's ASDR with detected burst peaks marked.
+
+    :param recording: The :class:`~mxtreme.recording.Recording` (for ``asdr``, ``samp_rate``, ``bin_size``).
+    :param burst_df: Burst DataFrame (new-schema columns ``peak_frame`` / ``peak_amp`` / ``kind``).
+    :param ax: Axes to draw on. If ``None``, a new figure is created and shown.
+    :param zoom: Optional ``(start_bin, end_bin)`` x-limits.
+    :param kind: Burst kind to mark (``"network"``, ``"mini"``, or ``None`` for all).
+    :param title: Axes title.
+    """
+    owns_fig = ax is None
+    if owns_fig:
+        _, ax = plt.subplots(1, 1, figsize=(12, 3))
+
+    asdr = recording.asdr
+    ax.plot(asdr)
+    ax.set_ylabel("ASDR", fontsize=10)
+    ax.set_xlabel("Time (bins)", fontsize=10)
+    ax.set_title(title, fontsize=15)
+
+    df = _select(burst_df, kind, None)
+    if len(df):
+        peak_bins = (df["peak_frame"] / (recording.samp_rate * recording.bin_size)).astype(int)
+        ax.scatter(peak_bins, df["peak_amp"] + 0.02, marker="v", color="red", s=12)
+
+    if zoom:
+        ax.set_xlim(zoom)
+
+    if owns_fig:
+        plt.show()
+    return ax
+
+
+def plot_origin_heatmap(recording, burst_df, ax=None, phase=None, kind="network",
+                        color="r", kde_cmap="Blues", title=None):
+    """Plot burst-origin locations and their spiking-channel density over the MEA.
+
+    :param recording: The :class:`~mxtreme.recording.Recording` (for the channel map / stim electrodes).
+    :param burst_df: Burst DataFrame with ``origin_x`` / ``origin_y`` / ``origin_chan_counts`` / ``kind``.
+    :param ax: Axes to draw on. If ``None``, a new figure is created and shown.
+    :param phase: If given, restrict to bursts with this ``phase``.
+    :param kind: Burst kind to include (default ``"network"``; ``None`` for all).
+    :param color: Marker color for origin points.
+    :param kde_cmap: Colormap for the per-burst origin-channel KDE.
+    :param title: Axes title.
+    """
+    owns_fig = ax is None
+    if owns_fig:
+        _, ax = plt.subplots(1, 1, figsize=(9, 5))
+
+    chip_ht_um = device.CHIP_HEIGHT * device.ELEC_SIZE
+    channelmap = recording.channelmap
+
+    x_origin, y_origin = [], []
+    for _, burst in _select(burst_df, kind, phase).iterrows():
+        channels = list(_as_dict(burst["origin_chan_counts"]).keys())
+        if not channels:
+            continue
+        chanmap_slice = channelmap[np.isin(channelmap[:, 1], channels)]
+        xs = chanmap_slice[:, 3]
+        ys = chip_ht_um - np.array(chanmap_slice[:, 4])  # invert y
+        sns.kdeplot(x=xs, y=ys, fill=True, alpha=0.2, cmap=kde_cmap, warn_singular=False, ax=ax)
+        x_origin.append(burst["origin_x"])
+        y_origin.append(burst["origin_y"])
+
+    MEA(ax, channelmap, recording.stim_elecs, title="")
+    ax.scatter(x_origin, chip_ht_um - np.array(y_origin), color=color, marker="x", s=100, linewidths=3)
+    ax.set_xlim([0, device.CHIP_WIDTH * device.ELEC_SIZE])
+    ax.set_ylim([0, chip_ht_um])
+    ax.set_title(title if title is not None else "MEA electrode layout - burst origins")
+
+    if owns_fig:
+        plt.show()
+    return ax
+
+
+def plot_burst_vectors(recording, burst_df, ax=None, phase=None, kind="network", title=None):
+    """Plot origin->peak arrows for each burst over the MEA.
+
+    :param recording: The :class:`~mxtreme.recording.Recording` (for the channel map / stim electrodes).
+    :param burst_df: Burst DataFrame with ``origin_x/y`` / ``peak_x/y`` / ``kind``.
+    :param ax: Axes to draw on. If ``None``, a new figure is created and shown.
+    :param phase: If given, restrict to bursts with this ``phase``.
+    :param kind: Burst kind to include (default ``"network"``; ``None`` for all).
+    :param title: Axes title.
+    """
+    owns_fig = ax is None
+    if owns_fig:
+        _, ax = plt.subplots(1, 1, figsize=(9, 5))
+
+    chip_ht_um = device.CHIP_HEIGHT * device.ELEC_SIZE
+    df = _select(burst_df, kind, phase)
+
+    MEA(ax, recording.channelmap, recording.stim_elecs, title="")
+
+    x_origin = df["origin_x"].to_numpy()
+    y_origin = chip_ht_um - df["origin_y"].to_numpy()
+    dx = df["peak_x"].to_numpy() - df["origin_x"].to_numpy()
+    dy = (chip_ht_um - df["peak_y"].to_numpy()) - y_origin
+    ax.quiver(x_origin, y_origin, dx, dy, angles="xy", scale_units="xy", scale=1, color="black",
+              width=0.002, headwidth=3, headlength=4, headaxislength=3, alpha=0.6)
+
+    ax.set_xlim([0, device.CHIP_WIDTH * device.ELEC_SIZE])
+    ax.set_ylim([0, chip_ht_um])
+    ax.set_title(title if title is not None else "MEA electrode layout - burst vectors")
 
     if owns_fig:
         plt.show()

@@ -7,6 +7,7 @@ matplotlib/seaborn/h5py, so those stay behind explicit submodule imports to keep
     from mxtreme.recording import Recording
     from mxtreme import extract, clean            # raw .h5 -> cleaned npz
     from mxtreme.pipeline import Pipeline
+    from mxtreme.bursting import BurstDetector     # cleaned npz -> bursts
     from mxtreme.analysis import activity
 """
 

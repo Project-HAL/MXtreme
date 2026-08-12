@@ -26,10 +26,19 @@ Steps are ordinary callables, so users can drop them, reorder them, wrap them wi
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
+from time import perf_counter
 from typing import Callable
 
 from mxtreme import io
+
+logger = logging.getLogger(__name__)
+
+
+def _step_name(step: Callable) -> str:
+    """Human-readable name for a step, unwrapping :func:`functools.partial`."""
+    return getattr(getattr(step, "func", step), "__name__", repr(step))
 
 
 class Pipeline:
@@ -43,10 +52,46 @@ class Pipeline:
     def __init__(self, steps: list[Callable[[dict], dict]]):
         self.steps = list(steps)
 
+    def _apply_steps(self, well_no: int, well: dict) -> dict:
+        """Apply every step to one well, logging each step's spike attrition and timing.
+
+        Records a per-step log (step name, spikes before/after, removed, seconds) at INFO level and stashes
+        it in ``well['step_log']``, then logs which step removed the most spikes.
+
+        :param well_no: Well number (for log context).
+        :param well: The well data dict to transform (mutated in place).
+        :returns: The transformed well.
+        :rtype: dict
+        """
+        step_log = []
+        for step in self.steps:
+            name = _step_name(step)
+            n_before = len(well["data"])
+            t = perf_counter()
+            well = step(well)
+            seconds = perf_counter() - t
+            n_after = len(well["data"])
+            pct = (n_after - n_before) / n_before * 100 if n_before else 0.0
+            step_log.append(
+                {"step": name, "n_before": n_before, "n_after": n_after,
+                 "removed": n_before - n_after, "seconds": seconds}
+            )
+            logger.info("well %s | %-28s %s -> %s (%+.1f%%) %.2fs",
+                        well_no, name, f"{n_before:,}", f"{n_after:,}", pct, seconds)
+
+        well["step_log"] = step_log
+        reducers = [r for r in step_log if r["removed"] > 0]
+        if reducers:
+            top = max(reducers, key=lambda r: r["removed"])
+            logger.info("well %s | biggest reducer: %s removed %s spikes",
+                        well_no, top["step"], f"{top['removed']:,}")
+        return well
+
     def transform(self, data: dict[int, dict]) -> dict[int, dict]:
         """Apply every step to every well, in place, and return the data. Performs no I/O.
 
         Useful for inspecting/plotting the result of a (possibly partial) pipeline without writing files.
+        All wells are retained in ``data``.
 
         :param data: Mapping of well number to well data dict (from :func:`mxtreme.extract.extract`).
         :type data: dict[int, dict]
@@ -54,10 +99,7 @@ class Pipeline:
         :rtype: dict[int, dict]
         """
         for well_no in list(data):
-            well = data[well_no]
-            for step in self.steps:
-                well = step(well)
-            data[well_no] = well
+            data[well_no] = self._apply_steps(well_no, data[well_no])
         return data
 
     def run(
@@ -66,10 +108,12 @@ class Pipeline:
         *,
         datastore: str | Path,
         overwrite: bool = True,
+        free: bool = True,
     ) -> list[Path]:
-        """Transform every well (via :meth:`transform`) and save the cleaned data.
+        """Transform each well and save the cleaned data, one well at a time.
 
-        Wells that end up with no spikes after the steps are skipped (with a warning) rather than saved.
+        Unlike :meth:`transform`, wells are transformed and saved individually so at most one well's
+        ``spike_bin`` is held in memory at once. Wells left with no spikes are skipped rather than saved.
 
         :param data: Mapping of well number to well data dict (from :func:`mxtreme.extract.extract`).
         :type data: dict[int, dict]
@@ -78,16 +122,21 @@ class Pipeline:
         :param overwrite: Passed through to :func:`mxtreme.io.save_preprocessed`; if ``False``, existing
             files are suffixed instead of overwritten.
         :type overwrite: bool
+        :param free: If ``True`` (default), drop each well from ``data`` once saved to release its memory
+            (notably ``spike_bin``) before processing the next. Set ``False`` to keep transformed wells.
+        :type free: bool
         :returns: Paths of the ``.npz`` files written (one per saved well).
         :rtype: list[Path]
         """
-        self.transform(data)
-
         saved: list[Path] = []
         for well_no in list(data):
-            well = data[well_no]
+            well = self._apply_steps(well_no, data[well_no])
             if len(well["data"]) == 0:
-                print(f"Well {well_no} has 0 spikes after the pipeline. Skipping...")
-                continue
-            saved.append(io.save_preprocessed(datastore, well, overwrite=overwrite))
+                logger.info("Well %s has 0 spikes after the pipeline. Skipping...", well_no)
+            else:
+                saved.append(io.save_preprocessed(datastore, well, overwrite=overwrite))
+            if free:
+                del data[well_no]
+            else:
+                data[well_no] = well
         return saved
