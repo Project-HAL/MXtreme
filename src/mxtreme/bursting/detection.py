@@ -19,6 +19,7 @@ Methods: ``"isi_n"`` runs the grouping stage alone (one burst per group); ``"isi
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
@@ -36,6 +37,26 @@ from mxtreme.phases import Phases
 # Fitting gaussian_kde on every inter-spike interval of a long recording is the dominant detection
 # cost; a large seeded subsample locates the same log10(ISI_N) valley far faster and reproducibly.
 KDE_MAX_SAMPLES = 100_000
+
+
+def _rec_label(recording) -> str:
+    """Compact ``exp_id/chip/wellN/DIVd`` identity string for progress messages."""
+    return f"{recording.exp_id}/{recording.chip}/well{recording.well}/DIV{recording.DIV}"
+
+
+def _log_burst_set(burst_data_dir, recording, burst_set) -> None:
+    """Refresh the per-experiment burst log when ``burst_data_dir`` is given (else do nothing).
+
+    Kept as a small helper so both :meth:`BurstDetector.detect` and :meth:`BurstSet.extract_features`
+    write the log the same way. The import is local because :mod:`mxtreme.io` lazily imports this
+    module, so importing it at module load would risk a circular import.
+    """
+    if burst_data_dir is None:
+        return
+    from mxtreme import io
+
+    log_path = io.update_burst_log(burst_data_dir, recording, burst_set)
+    print(f"Burst log updated -> {log_path}")
 
 
 @dataclass
@@ -84,7 +105,7 @@ class BurstSet:
     def from_csv(cls, path) -> "BurstSet":
         return cls.from_dataframe(pd.read_csv(path))
 
-    def extract_features(self, recording, params) -> "BurstSet":
+    def extract_features(self, recording, params, *, burst_data_dir=None) -> "BurstSet":
         """Compute per-burst features for every burst in place.
 
         Precomputes the array-wide rate once, then calls :meth:`Burst.compute_features` on each burst,
@@ -92,6 +113,9 @@ class BurstSet:
 
         :param recording: Source :class:`Recording <mxtreme.recording.Recording>`.
         :param params: :class:`~mxtreme.params.BurstFeatureParams`.
+        :param burst_data_dir: If given (typically ``config.burst_data_dir``), the per-experiment burst
+            log is refreshed automatically via :func:`mxtreme.io.update_burst_log`, stamping this
+            recording's ``features_computed_at`` (independently of detection). Pass ``None`` to skip I/O.
         :returns: ``self``.
         """
         self.feature_params = params
@@ -103,12 +127,17 @@ class BurstSet:
         if frameno.size > 1 and not np.all(frameno[:-1] <= frameno[1:]):
             raise ValueError("spike_data must be sorted by frameno for burst feature extraction.")
 
+        print(f"Extracting features for {len(self.bursts)} burst(s) | {_rec_label(recording)}")
+
         self.n_ignored = 0
         for burst in self.bursts:
             burst.compute_features(recording, params, asdr=asdr)
             if burst.ignore:
                 self.n_ignored += 1
         self.features_computed_at = datetime.now().isoformat(timespec="seconds")
+
+        print(f"Features computed | {self.n_ignored} burst(s) flagged ignore")
+        _log_burst_set(burst_data_dir, recording, self)
         return self
 
 
@@ -129,12 +158,15 @@ class BurstDetector:
             "isi_n": self._detect_isi_n,
         }
 
-    def detect(self, recording, phases: Optional[Phases] = None) -> BurstSet:
+    def detect(self, recording, phases: Optional[Phases] = None, *, burst_data_dir=None) -> BurstSet:
         """Detect bursts in ``recording`` and label each by phase.
 
         :param recording: Source :class:`Recording <mxtreme.recording.Recording>`.
         :param phases: Phase intervals for labelling; defaults to ``recording.phases`` (a single
             ``"full"`` phase unless the user injected event-tag phases).
+        :param burst_data_dir: If given (typically ``config.burst_data_dir``), the per-experiment burst
+            log is refreshed automatically via :func:`mxtreme.io.update_burst_log`, stamping this
+            recording's ``detection_completed_at``. Pass ``None`` to skip all I/O.
         :returns: The detected :class:`BurstSet` (features not yet computed).
         """
         handler = self._methods.get(self.method)
@@ -145,8 +177,19 @@ class BurstDetector:
             )
         if phases is None:
             phases = recording.phases
+
+        print("=" * 60)
+        print(f"Detecting bursts | {_rec_label(recording)} | method={self.method}")
+        print("-" * 60)
+
         bursts = handler(recording, phases)
         bursts.detected_at = datetime.now().isoformat(timespec="seconds")
+
+        kinds = Counter(b.kind for b in bursts)
+        breakdown = ", ".join(f"{n} {kind}" for kind, n in kinds.items()) if kinds else "none"
+        print(f"Detected {len(bursts)} burst(s): {breakdown}")
+        _log_burst_set(burst_data_dir, recording, bursts)
+        print("=" * 60)
         return bursts
 
     # ------------------------------------------------------------------ methods
@@ -178,7 +221,6 @@ class BurstDetector:
                 )
             )
 
-        print(f"{len(bursts)} ISI-N bursts detected.")
         return BurstSet(bursts=bursts, method=self.method, detect_params=self.params)
 
     def _detect_isi_rate(self, recording, phases: Phases) -> BurstSet:
@@ -189,7 +231,6 @@ class BurstDetector:
         groups = self._isi_n_groups(recording.spike_data["frameno"], samp_rate, bin_size)
         bursts = self._rate_threshold_groups(recording.asdr, groups, phases, samp_rate, bin_size)
 
-        print(f"{len(bursts)} bursts detected.")
         return BurstSet(bursts=bursts, method=self.method, detect_params=self.params)
 
     # ------------------------------------------------------------------ stages

@@ -22,7 +22,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from mxtreme.phases import Phases
+from mxtreme.phases import Phases, TagSpec, phases_from_event_tags
 
 
 def _item(value):
@@ -41,8 +41,16 @@ class Recording:
 
     :param id: Caller-assigned recording id (kept for convenience; not interpreted).
     :param exp_data: Preprocessed data dict, as returned by :func:`mxtreme.io.load_preprocessed`.
-    :param phases: Optional :class:`~mxtreme.phases.Phases` labelling parts of the recording. When
-        omitted, a single ``"full"`` phase spans the whole recording.
+    :param phases: Optional pre-built :class:`~mxtreme.phases.Phases` labelling parts of the recording.
+    :param phase_tags: Optional event-tag spec (an ordered ``name -> tag`` mapping or ``(name, tag)``
+        sequence). When given, phases are resolved here from this recording's own ``event_df`` via
+        :func:`~mxtreme.phases.phases_from_event_tags`, so callers no longer need to build a
+        provisional ``Recording`` just to read its event tags. Mutually exclusive with ``phases``.
+    :param end_tag: Optional event tag marking the end of the final phase (used only with
+        ``phase_tags``); the last phase runs to this tag's frame if present, else to the last frame.
+
+    When neither ``phases`` nor ``phase_tags`` is supplied, a single ``"full"`` phase spans the whole
+    recording.
     """
 
     def __init__(
@@ -50,6 +58,9 @@ class Recording:
         id,
         exp_data: dict,
         phases: Optional[Phases] = None,
+        *,
+        phase_tags: Optional[TagSpec] = None,
+        end_tag: Optional[str] = None,
     ) -> None:
         self.id = id
 
@@ -81,8 +92,22 @@ class Recording:
         self.asdr = self.spike_bin.mean(axis=0)  # array-wide spike detection rate (per bin)
         self.event_df = pd.DataFrame({"eventtime": self.eventtime, "eventmessage": self.event_messages})
 
-        # --- phases (injected; default single "full" phase over the recording) ---
+        # --- phases ---
+        # Resolved here (not before construction) so a tag spec can be turned into Phases using this
+        # recording's own event_df. Priority: an explicit ``phases`` object, else a ``phase_tags`` spec
+        # resolved against the events, else a single ``"full"`` phase spanning the recording.
         frames = self.spike_data["frameno"]
         start_frame = int(np.min(frames)) if len(frames) else 0
         end_frame = int(np.max(frames)) if len(frames) else 0
-        self.phases = phases if phases is not None else Phases.full(start_frame, end_frame)
+
+        if phases is not None and phase_tags is not None:
+            raise ValueError("Pass either `phases` or `phase_tags`, not both.")
+
+        if phases is not None:
+            self.phases = phases
+        elif phase_tags is not None:
+            self.phases = phases_from_event_tags(
+                self.event_df, phase_tags, end_frame=end_frame, end_tag=end_tag
+            )
+        else:
+            self.phases = Phases.full(start_frame, end_frame)

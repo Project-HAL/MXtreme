@@ -64,6 +64,29 @@ def test_phases_from_event_tags_missing_tags_fall_back_to_full():
     assert phases.names == ("full",)
 
 
+def test_recording_resolves_phases_from_tag_spec(make_recording_data):
+    # A tag spec passed straight to Recording is resolved internally against the recording's own
+    # events -- no provisional Recording needed to read event_df / end_frame first.
+    data = make_recording_data(
+        eventtime=np.array([10, 100], dtype="<i8"),
+        event_messages=[{"pre_recording_start": "5"}, {"closed_loop_start": "5"}],
+    )
+    rec = Recording(
+        0, data,
+        phase_tags=[("pre", "pre_recording_start"), ("train", "closed_loop_start")],
+        end_tag="end_experiment",  # absent from events -> final phase runs to the last frame
+    )
+    assert rec.phases.names == ("pre", "train")
+    assert rec.phases.label_for(50) == "pre"
+    assert rec.phases.label_for(int(rec.spike_data["frameno"].max()) - 1) == "train"
+
+
+def test_recording_phases_and_tags_are_mutually_exclusive(make_recording_data):
+    with pytest.raises(ValueError):
+        Recording(0, make_recording_data(), phases=Phases.full(0, 10),
+                   phase_tags=[("pre", "pre_recording_start")])
+
+
 # --- Burst record ---------------------------------------------------------------------------------
 
 
@@ -240,3 +263,34 @@ def test_update_burst_log_preserves_step_fields(make_recording_data, tmp_path):
     assert log2.loc[0, "detect_params"] == detect_params_logged        # preserved
     assert isinstance(log2.loc[0, "features_computed_at"], str)        # now set
     assert "onset_thresh_pct" in log2.loc[0, "feature_params"]
+
+
+def test_detect_auto_updates_burst_log(make_recording_data, tmp_path):
+    rec = Recording(0, make_recording_data())
+
+    # Detection alone, with burst_data_dir given, writes the log automatically (no manual call).
+    det = BurstDetector(DETECT).detect(rec, burst_data_dir=tmp_path)
+
+    log = pd.read_csv(tmp_path / f"{rec.exp_id}_burst_log.csv")
+    assert len(log) == 1
+    assert log.loc[0, "detection_completed_at"] == det.detected_at
+    assert pd.isna(log.loc[0, "features_computed_at"])         # features haven't run yet
+
+
+def test_extract_features_auto_updates_log_independently(make_recording_data, tmp_path):
+    rec = Recording(0, make_recording_data())
+
+    # Stage A: detection auto-logs its timestamp.
+    det = BurstDetector(DETECT).detect(rec, burst_data_dir=tmp_path)
+    detected_at = det.detected_at
+
+    # Stage B: features run apart from detection (reloaded set has no detection timestamp/params) and
+    # auto-log -- features_computed_at is set while the earlier detection stamp is preserved.
+    reloaded = BurstSet.from_dataframe(det.to_dataframe())
+    assert reloaded.detected_at is None
+    reloaded.extract_features(rec, BurstFeatureParams(), burst_data_dir=tmp_path)
+
+    log = pd.read_csv(tmp_path / f"{rec.exp_id}_burst_log.csv")
+    assert len(log) == 1                                       # same row updated in place
+    assert log.loc[0, "detection_completed_at"] == detected_at  # preserved across the features-only write
+    assert isinstance(log.loc[0, "features_computed_at"], str)  # now set
