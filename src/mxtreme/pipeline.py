@@ -83,7 +83,7 @@ class Pipeline:
         reducers = [r for r in step_log if r["removed"] > 0]
         if reducers:
             top = max(reducers, key=lambda r: r["removed"])
-            logger.info("well %s | biggest reducer: %s removed %s spikes",
+            logger.info("well %s | biggest reducer: %s removed %s spikes \n",
                         well_no, top["step"], f"{top['removed']:,}")
         return well
 

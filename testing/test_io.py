@@ -55,6 +55,43 @@ def test_no_overwrite_suffixes(make_well, tmp_path):
     assert first.exists() and second.exists()
 
 
+def test_save_preprocessed_registers_recording(make_well, tmp_path):
+    import pandas as pd
+
+    well = _clean_well(make_well)
+    well["experimental_condition"] = [1, 0]
+    registry = tmp_path / "registry.csv"
+
+    io.save_preprocessed(tmp_path, well, registry_path=registry)
+
+    df = pd.read_csv(registry)
+    assert len(df) == 1
+    row = df.iloc[0]
+    assert str(row["exp_id"]) == well["exp_id"]
+    assert int(row["well"]) == well["well"]
+    assert int(row["div"]) == well["DIV"]
+    # Conditions are pasted through; the legacy status column is gone; timestamp is populated.
+    assert row["conditions"] == "[1, 0]"
+    assert "status" not in df.columns
+    assert isinstance(row["timestamp"], str) and row["timestamp"]
+
+
+def test_register_drops_legacy_status_column(make_well, tmp_path):
+    import pandas as pd
+
+    well = make_well()
+    registry = tmp_path / "registry.csv"
+    # Simulate an older registry that still carries a `status` column.
+    pd.DataFrame(
+        [{"exp_id": "old", "chip": "C9", "well": 3, "div": 1, "status": "complete",
+          "timestamp": "2020-01-01T00:00:00"}]
+    ).to_csv(registry, index=False)
+
+    io.register({well["well"]: well}, registry)
+    df = pd.read_csv(registry)
+    assert "status" not in df.columns
+
+
 def test_register_upserts_without_duplicates(make_well, tmp_path):
     import pandas as pd
 

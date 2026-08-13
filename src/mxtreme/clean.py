@@ -84,7 +84,6 @@ def spike_filter(well: dict, amp_thresh: float = 2e-5) -> dict:
     :returns: The same dict, filtered by amplitude.
     :rtype: dict
     """
-    logger.info("Applying amplitude filter with threshold of %s µV...", amp_thresh * 1e6)
     mask = np.abs(well["data"]["amplitude"]) >= amp_thresh
     well["data"] = well["data"][mask]
     if len(well["data"]) == 0:
@@ -190,7 +189,6 @@ def remove_stim_frames(well: dict, post_stim_period: float = 0.0) -> dict:
     """
     post_stim_frames = post_stim_period * well["samp_rate"]
 
-    logger.info("Removing stimulation frames from spike data...")
     event_df = pd.DataFrame({"eventtime": well["eventtime"], "eventmessage": well["event_messages"]})
 
     if len(event_df) == 0:
@@ -242,7 +240,6 @@ def bin_spikes(well: dict, bin_size: float = 0.01) -> dict:
     which_bin = (well["data"]["frameno"] / bin_win).astype(int)
     which_bin = np.clip(which_bin, 0, num_bins - 1)
 
-    logger.info("Binning Spikes...")
     mapping = dict(zip(well["channelmap"][:, 1], well["channelmap"][:, 0]))
     channel_ids = pd.Series(well["data"]["channel"]).map(mapping).to_numpy(dtype=int)
     assert len(channel_ids) == len(which_bin)

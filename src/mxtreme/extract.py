@@ -7,12 +7,13 @@ dict that flows through the composable cleaning steps in :mod:`mxtreme.clean` an
 :func:`mxtreme.io.save_preprocessed`.
 
 The newer file format carries an embedded ``/assay/metadata`` blob that is read automatically. Older
-files (e.g. ``May2025_Wave``) lack it, so the caller must pass a ``metadata`` dict for those.
+files (e.g. ``May2025_Wave``) lack it, so the caller must pass a ``metadata`` dict for those. A
+caller-supplied ``metadata`` dict is merged *over* the embedded blob (per-key), so it can override or
+fill in individual fields -- including an optional ``Conditions`` list of per-well conditions.
 """
 
 from __future__ import annotations
 
-import ast
 import json
 import os
 
@@ -24,11 +25,15 @@ def extract(filepath: str, metadata: dict | None = None, wells: list | int | Non
 
     :param filepath: Path to the raw ``.raw.h5`` file.
     :type filepath: str
-    :param metadata: Fallback metadata for older files that lack an embedded ``/assay/metadata``
-        blob. Ignored when the file carries its own metadata. Must be shaped as::
+    :param metadata: Metadata supplied by the caller. It is *merged over* any ``/assay/metadata``
+        blob embedded in the file: fields present in both are taken from ``metadata``, and fields
+        missing from the embedded blob are filled from ``metadata``. Older files that lack an
+        embedded blob rely on ``metadata`` entirely. Typically shaped as::
 
             {'Exp ID': exp_id, 'Chip ID': chip_id, 'Plate date': plate_date, 'DIV': div}
 
+        An optional ``'Conditions'`` key (a list with one ``[left, right]`` entry per well) supplies
+        the per-well experimental condition; it is entirely optional and its absence is not an error.
     :type metadata: dict, optional
     :param wells: Well number(s) to extract. ``None`` extracts every well present in the file.
     :type wells: list or int, optional
@@ -50,23 +55,44 @@ def extract(filepath: str, metadata: dict | None = None, wells: list | int | Non
     data: dict[int, dict] = {}
 
     with h5py.File(filepath, "r") as f:
-        # Prefer the metadata embedded in the file; fall back to the caller-supplied dict for older
-        # files that predate the embedded-metadata format.
+        # Read the metadata embedded in the file, then merge the caller-supplied dict *over* it so
+        # caller values win per-key and any fields the embedded blob is missing get filled in. Older
+        # files predate the embedded-metadata format, so they rely on ``metadata`` entirely.
         try:
             raw_metadata = f["/assay/metadata"][:][0]
             decoded_metadata = raw_metadata.decode("utf-8").strip().replace("'", '"')
-            h5_metadata = json.loads(decoded_metadata)
+            embedded = json.loads(decoded_metadata)
         except Exception:
-            if metadata is None:
-                raise ValueError(
-                    "No metadata in h5 file. Metadata must be supplied in the format\n"
-                    "metadata = {'Exp ID': exp_id, 'Chip ID': chip_id, 'Plate date': plate_date, 'DIV': DIV}."
-                )
-            h5_metadata = metadata
+            embedded = None
+
+        if embedded is None and metadata is None:
+            raise ValueError(
+                "No metadata in h5 file. Metadata must be supplied in the format\n"
+                "metadata = {'Exp ID': exp_id, 'Chip ID': chip_id, 'Plate date': plate_date, 'DIV': DIV}."
+            )
+
+        h5_metadata = {**(embedded or {}), **(metadata or {})}
+
+        if embedded is not None and metadata is not None:
+            meta_source = "embedded /assay/metadata + caller override"
+        elif embedded is not None:
+            meta_source = "embedded /assay/metadata"
+        else:
+            meta_source = "caller-supplied"
+
+        conditions = h5_metadata.get("Conditions")
+        well_ids = h5_metadata.get("Well IDs")
 
         h5_metadata["wells"] = []  # track which wells actually carry data in this file
 
-        for i, well_long in enumerate(list(f["/wells/"].keys())):
+        print("=" * 60)
+        print(f"Extracting: {os.path.basename(filepath)}")
+        print(f"  Metadata source : {meta_source}")
+        print(f"  Conditions      : {'present' if conditions is not None else 'none provided'}")
+        print(f"  Wells requested : {'all' if wells_to_process is None else wells_to_process}")
+        print("-" * 60)
+
+        for well_long in list(f["/wells/"].keys()):
             well = int(well_long[-1])  # well values range from 0-5
 
             if wells_to_process is not None and well not in wells_to_process:
@@ -128,49 +154,21 @@ def extract(filepath: str, metadata: dict | None = None, wells: list | int | Non
 
             well_data["eventtime"] = events["frameno"] if events is not None else np.array([], dtype=np.int64)
 
-            # Experimental conditions (left/right stimulation types)
-            well_data["experimental_condition"] = _extract_experimental_condition(f, i, well_data["exp_id"], well)
+            # Experimental condition for this well: the matching entry from the metadata ``Conditions``
+            # list (one ``[left, right]`` per well). Optional -- a missing/short list yields ``None``.
+            well_condition = None
+            if conditions is not None:
+                try:
+                    idx = well_ids.index(well) if well_ids is not None else well
+                    well_condition = conditions[idx]
+                except (ValueError, IndexError, TypeError, KeyError):
+                    well_condition = None
+            well_data["experimental_condition"] = well_condition
+
+            print(f"  well {well} | {len(well_data['data']):>9,} spikes | condition {well_condition}")
+
+    print("-" * 60)
+    print(f"Done: extracted {len(data)} well(s) from {os.path.basename(filepath)}")
+    print("=" * 60)
 
     return data
-
-
-def _extract_experimental_condition(f, i: int, exp_id: str, well: int) -> np.ndarray:
-    """Derive the ``{left_stim, right_stim}`` condition for one well.
-
-    Parses ``/assay/closed_loop_args`` when present, honouring the ``stimRemoval`` special case.
-
-    :param f: Open :class:`h5py.File` handle.
-    :param i: Enumeration index of the well within the file (indexes into per-well arg lists).
-    :type i: int
-    :param exp_id: Experiment identifier for this well.
-    :type exp_id: str
-    :param well: Well number (used only for logging).
-    :type well: int
-    :returns: A 0-d object array wrapping ``{'left_stim': int, 'right_stim': int}``.
-    :rtype: numpy.ndarray
-    """
-    if "closed_loop_args" in f["/assay"]:
-        closed_loop_args = f["/assay/closed_loop_args"][:][0].decode("utf-8").strip()
-
-        if "--left-type" in closed_loop_args and "--right-type" in closed_loop_args:
-            left_stim_list = ast.literal_eval(closed_loop_args.split("--left-type")[-1].split("--")[0])
-            right_stim_list = ast.literal_eval(closed_loop_args.split("--right-type")[-1].split("--")[0])
-            try:
-                left_stim = int(left_stim_list[i])
-                right_stim = int(right_stim_list[i])
-            except Exception:  # a single-well experiment may not store conditions in a list
-                left_stim = int(left_stim_list)
-                right_stim = int(right_stim_list)
-            condition = {"left_stim": left_stim, "right_stim": right_stim}
-        else:
-            condition = {"left_stim": 0, "right_stim": 0}  # controls, network scans
-
-        print("well", well, ":", condition)
-
-        if exp_id == "stimRemoval":
-            condition = {"left_stim": 0, "right_stim": 2}
-        return np.asarray(condition)
-
-    if exp_id == "stimRemoval":
-        return np.asarray({"left_stim": 0, "right_stim": 2})
-    return np.asarray({"left_stim": 0, "right_stim": 0})  # no stimulation

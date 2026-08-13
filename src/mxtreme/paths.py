@@ -97,14 +97,13 @@ def resolve_paths(
     """Resolve a selection into concrete paths using ``config``'s managed-store layout.
 
     :param target: What to resolve -- a single :class:`~mxtreme.identity.RecordingID`, a
-        :class:`~mxtreme.identity.CultureID` (expands to all completed DIVs), or a
+        :class:`~mxtreme.identity.CultureID` (expands to all DIVs on record), or a
         :class:`~mxtreme.identity.CultureSelector` (a group, possibly across experiments).
     :param config: The :class:`~mxtreme.config.Config` describing the managed store.
     :returns: ``RecordingPaths`` / ``CulturePaths`` / ``dict[exp_id, ExperimentPaths]`` per the
         target type.
     """
     df = pd.read_csv(config.registry_path)
-    df = df[df.status == "complete"]
     # Registry rows may be written by more than one producer (`io.register`,
     # `utils.build_registry_from_disk`) with differing dtypes/duplicates; normalise + dedupe so a
     # culture's DIVs aren't double-counted.

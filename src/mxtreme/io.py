@@ -5,8 +5,7 @@ workflow the directories come from a :class:`mxtreme.config.Config` (e.g. ``conf
 
 Contents:
 - :func:`load_preprocessed` -- read a cleaned ``.npz`` back into a dict.
-- :func:`save_preprocessed` -- write one well's cleaned data to an ``.npz``.
-- :func:`write_experimental_conditions` -- append per-culture stimulation conditions to a CSV.
+- :func:`save_preprocessed` -- write one well's cleaned data to an ``.npz`` (and register it).
 - :func:`register` -- record processed recordings in the registry CSV.
 - :func:`save_burst_data` / :func:`load_burst_data` -- per-recording burst CSVs.
 - :func:`update_burst_log` -- per-experiment burst summary CSV.
@@ -56,7 +55,13 @@ def _unique_path(path: Path) -> Path:
         counter += 1
 
 
-def save_preprocessed(datastore: str | Path, well: dict, *, overwrite: bool = True) -> Path:
+def save_preprocessed(
+    datastore: str | Path,
+    well: dict,
+    *,
+    overwrite: bool = True,
+    registry_path: str | Path | None = None,
+) -> Path:
     """Write one well's cleaned data to a compressed ``.npz`` under the managed store.
 
     The file lands at ``<datastore>/<exp_id>/<chip>/well<well>/DIV<DIV>_<plate_date>_<chip>_<exp_id>_well<well>_exp_data.npz``.
@@ -64,12 +69,19 @@ def save_preprocessed(datastore: str | Path, well: dict, *, overwrite: bool = Tr
     when present and defaulted otherwise, so the pipeline still saves if a user omits a step. The
     provenance dict ``well['preprocessing_params']`` is saved alongside the data.
 
+    The recording is also upserted into the registry CSV (via :func:`register`) so the registry is
+    always refreshed whenever an ``.npz`` is written -- keeping its timestamps current without a
+    separate manual step.
+
     :param datastore: Directory under which to write (typically ``config.preprocessed_dir``).
     :type datastore: str or Path
     :param well: A well data dict after running the pipeline.
     :type well: dict
     :param overwrite: If ``False``, avoid clobbering an existing file by adding a numeric suffix.
     :type overwrite: bool
+    :param registry_path: Path to the registry CSV. Defaults to ``<datastore>/../registry.csv``,
+        matching the managed-store layout (``data_root/preprocessed`` + ``data_root/registry.csv``).
+    :type registry_path: str or Path, optional
     :returns: The path the data was written to.
     :rtype: Path
     """
@@ -109,49 +121,21 @@ def save_preprocessed(datastore: str | Path, well: dict, *, overwrite: bool = Tr
         step_log=np.asarray(well.get("step_log", []), dtype=object),
     )
 
-    print(f"Transformed data saved to: {out_path}")
+    # print(f"Transformed data saved to: {out_path}")
+
+    if registry_path is None:
+        registry_path = datastore.parent / "registry.csv"
+    register({well_no: well}, registry_path)
+
     return out_path
-
-
-def write_experimental_conditions(data: dict[int, dict], datastore: str | Path) -> None:
-    """Append each well's stimulation condition to a per-culture CSV (deduplicated by row).
-
-    :param data: Mapping of well number to well data dict (from :func:`mxtreme.extract.extract`).
-    :type data: dict[int, dict]
-    :param datastore: Directory under which to write (typically ``config.experimental_conditions_dir``).
-    :type datastore: str or Path
-    """
-    datastore = Path(datastore)
-
-    for well_no, well in data.items():
-        new_row = {
-            "chip": well["chip"],
-            "well": well_no,
-            "DIV": well["DIV"],
-            "experimental condition": well["experimental_condition"],
-        }
-        savepath = datastore / well["exp_id"] / f'{well["chip"]}_well{well_no}_exp_conditions.csv'
-
-        if savepath.exists():
-            df = pd.read_csv(savepath)
-            new_row_df = pd.DataFrame([new_row])
-            row_exists = df.apply(
-                lambda row: all(str(row[col]) == str(new_row[col]) for col in new_row), axis=1
-            ).any()
-            if not row_exists:
-                df = pd.concat([df, new_row_df], ignore_index=True)
-                df.to_csv(savepath, index=False)
-        else:
-            os.makedirs(savepath.parent, exist_ok=True)
-            df = pd.DataFrame([new_row], columns=["chip", "well", "DIV", "experimental condition"])
-            df.to_csv(savepath, mode="w", header=True, index=False)
 
 
 def register(data: dict[int, dict], registry_path: str | Path) -> None:
     """Upsert one row per processed recording into the registry CSV.
 
-    Rows are keyed by ``(exp_id, chip, well, div)``; an existing row for the same key is replaced. Each
-    row is marked ``status="complete"`` so downstream path resolution can filter on completed recordings.
+    Rows are keyed by ``(exp_id, chip, well, div)``; an existing row for the same key is replaced.
+    Each row records a fresh ``timestamp`` and the well's ``conditions`` (whatever the well's
+    ``experimental_condition`` holds, or blank when absent).
 
     :param data: Mapping of well number to well data dict.
     :type data: dict[int, dict]
@@ -162,14 +146,18 @@ def register(data: dict[int, dict], registry_path: str | Path) -> None:
     os.makedirs(registry_path.parent, exist_ok=True)
 
     df = pd.read_csv(registry_path) if registry_path.exists() else pd.DataFrame()
+    # Drop the legacy `status` column if an older registry still carries it, so it disappears on the
+    # next write.
+    df = df.drop(columns=["status"], errors="ignore")
 
     for well_no, well in data.items():
+        condition = well.get("experimental_condition")
         new_row = {
             "exp_id": well["exp_id"],
             "chip": well["chip"],
             "well": well_no,
             "div": well["DIV"],
-            "status": "complete",
+            "conditions": "" if condition is None else condition,
             "timestamp": pd.Timestamp.now().isoformat(),
         }
         if not df.empty:

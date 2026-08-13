@@ -213,7 +213,6 @@ def get_DIVs(path_to_preprocessed_data):
 def build_registry_from_disk(preprocessed_root: Path = Path(constants.PARENT_DIR) / "data" / "preprocessed", registry_path: Path = Path(constants.PARENT_DIR)/"data"/"registry.csv") -> None:
     '''
     It uses st_mtime (file modification time) as the timestamp since there's no processing timestamp available retroactively — it's a reasonable proxy for when the file was written
-    It marks everything found on disk as "complete" since a partially failed recording presumably wouldn't have produced an npz
     The drop_duplicates guard handles the case where multiple npz files exist for the same recording (e.g. different suffixes) so you don't get duplicate registry rows
     You'll want to double-check the div_str.split("_")[0] logic matches your actual filename format — if your files are named something like DIV14_cleaned.npz that works as written, but adjust if the format differs
     '''
@@ -239,7 +238,6 @@ def build_registry_from_disk(preprocessed_root: Path = Path(constants.PARENT_DIR
             "chip": chip,
             "well": well.split('well')[-1],
             "div": div,
-            "status": "complete",
             "timestamp": pd.Timestamp.fromtimestamp(npz_path.stat().st_mtime).isoformat(),
         })
 
