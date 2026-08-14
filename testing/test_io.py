@@ -39,6 +39,23 @@ def test_step_log_roundtrips(make_well, tmp_path):
     assert log[0]["removed"] == 2
 
 
+def test_phase_spec_roundtrips(make_well, tmp_path):
+    spec = {"starts": {"pre": 0, "train": 20, "post": 40}, "end": 60}
+    well = _clean_well(make_well)
+    well["phase_spec"] = spec
+    path = io.save_preprocessed(tmp_path, well)
+    loaded = io.load_preprocessed(path)
+    assert loaded["phase_spec"].item() == spec
+
+
+def test_phase_spec_absent_roundtrips_as_none(make_well, tmp_path):
+    # A well with no phase spec (the common, unphased case) stores None and loads back as None.
+    well = _clean_well(make_well)
+    path = io.save_preprocessed(tmp_path, well)
+    loaded = io.load_preprocessed(path)
+    assert loaded["phase_spec"].item() is None
+
+
 def test_save_path_layout(make_well, tmp_path):
     well = _clean_well(make_well)
     path = io.save_preprocessed(tmp_path, well)

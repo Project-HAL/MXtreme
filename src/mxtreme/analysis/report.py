@@ -143,15 +143,13 @@ def _section_overview(pdf, cultures, single, analysis_dir):
         plt.close(fig)
 
 
-def _section_activity(pdf, cultures, single, sel_paths, analysis_dir, make_phases):
+def _section_activity(pdf, cultures, single, sel_paths, analysis_dir):
     # Compute (and cache) each culture's channel-activity summary.
     for cpath in cultures:
-        activity.channel_activity_summary(cpath, analysis_dir, show_plot=False, save_plot=False,
-                                          make_phases=make_phases)
+        activity.channel_activity_summary(cpath, analysis_dir, show_plot=False, save_plot=False)
 
     if single:
-        df = activity.channel_activity_summary(cultures[0], analysis_dir, show_plot=False,
-                                               make_phases=make_phases)
+        df = activity.channel_activity_summary(cultures[0], analysis_dir, show_plot=False)
         _grid_page(pdf, df, _CHANNEL_METRICS, f"Channel Activity — {cultures[0].culture_id}")
     else:
         pop_df = activity.load_population_summaries(
@@ -165,7 +163,7 @@ def _section_activity(pdf, cultures, single, sel_paths, analysis_dir, make_phase
         _grid_page(pdf, stats, metrics, f"Population Channel Activity — {len(cultures)} cultures")
 
 
-def _section_bursting(pdf, cultures, single, sel_paths, analysis_dir, make_phases):
+def _section_bursting(pdf, cultures, single, sel_paths, analysis_dir):
     # Detection diagnostics: one page per culture (representative DIV).
     for cpath in cultures:
         divs = sorted(cpath.recordings)
@@ -184,12 +182,10 @@ def _section_bursting(pdf, cultures, single, sel_paths, analysis_dir, make_phase
 
     # Burst stats.
     for cpath in cultures:
-        activity.burst_activity_summary(cpath, analysis_dir, show_plot=False, save_plot=False,
-                                        make_phases=make_phases)
+        activity.burst_activity_summary(cpath, analysis_dir, show_plot=False, save_plot=False)
 
     if single:
-        df = activity.burst_activity_summary(cultures[0], analysis_dir, show_plot=False,
-                                             make_phases=make_phases)
+        df = activity.burst_activity_summary(cultures[0], analysis_dir, show_plot=False)
         _grid_page(pdf, df, _BURST_METRICS, f"Burst Activity — {cultures[0].culture_id}")
     else:
         pop_df = activity.load_population_summaries(
@@ -259,7 +255,6 @@ def generate_report(
     sections=DEFAULT_SECTIONS,
     output_path: str | Path | None = None,
     objective_fn=None,
-    make_phases=None,
     title: str | None = None,
 ) -> Path:
     """Generate a multi-section PDF report for ``target`` and return the written path.
@@ -272,11 +267,11 @@ def generate_report(
     :param output_path: Destination PDF. Defaults to
         ``config.analysis_dir/reports/<slug>_report.pdf``.
     :param objective_fn: Optional objective for the performance section (``callable(burst_df)->float``).
-    :param make_phases: Optional ``callable(recording) -> Phases`` used to re-inject the phase
-        structure (e.g. a closure over :func:`mxtreme.phases.phases_from_event_tags`) so per-phase
-        activity/burst windows match the phases used at detection time. When ``None``, each recording
-        has a single ``"full"`` phase.
     :param title: Optional report title (defaults to a description of the selection).
+
+    Per-phase activity/burst windows are reconstructed automatically from the phase spec embedded in
+    each recording's preprocessed data (written at preprocessing time from the ``Phases`` metadata
+    key). A recording with no embedded spec has a single ``"full"`` phase.
     :returns: The path to the written PDF.
     """
     resolved = resolve_paths(target, config)
@@ -318,9 +313,9 @@ def generate_report(
         if "overview" in sections:
             _section_overview(pdf, cultures, single, analysis_dir)
         if "activity" in sections:
-            _section_activity(pdf, cultures, single, sel_paths, analysis_dir, make_phases)
+            _section_activity(pdf, cultures, single, sel_paths, analysis_dir)
         if "bursting" in sections:
-            _section_bursting(pdf, cultures, single, sel_paths, analysis_dir, make_phases)
+            _section_bursting(pdf, cultures, single, sel_paths, analysis_dir)
         if "stimulation" in sections:
             _section_stimulation(pdf, cultures, analysis_dir)
         if "performance" in sections:

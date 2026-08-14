@@ -13,22 +13,17 @@ from mxtreme.analysis._plotting import plot_metric_grid
 from mxtreme.analysis._stats import aggregate_by_div_phase
 
 
-def _load_recording(npz, make_phases):
-    """Load a Recording, re-injecting phases via ``make_phases(rec)`` when supplied.
+def _load_recording(npz):
+    """Load a Recording from ``npz``.
 
-    ``make_phases`` (e.g. a closure around :func:`mxtreme.phases.phases_from_event_tags`) lets callers
-    reconstruct the same phase structure used at burst-detection time; without it the recording has a
-    single ``"full"`` phase.
+    Phases are reconstructed automatically from the spec embedded in the preprocessed data (written at
+    preprocessing time from the ``Phases`` metadata key); a recording with no embedded spec has a
+    single ``"full"`` phase. See :class:`mxtreme.recording.Recording`.
     """
-    data = io.load_preprocessed(npz)
-    rec = Recording(0, data)
-    if make_phases is not None:
-        rec = Recording(0, data, phases=make_phases(rec))
-    return rec
+    return Recording(0, io.load_preprocessed(npz))
 
 
-def burst_activity_summary(cpath, analysis_dir: Path, use_existing=True, show_plot=True, save_plot=False,
-                           make_phases=None):
+def burst_activity_summary(cpath, analysis_dir: Path, use_existing=True, show_plot=True, save_plot=False):
 
     cid = cpath.culture_id
     rows = []
@@ -43,7 +38,7 @@ def burst_activity_summary(cpath, analysis_dir: Path, use_existing=True, show_pl
         for div in cpath.recordings:
 
             npz = cpath.recordings[div].npz
-            rec = _load_recording(npz, make_phases)
+            rec = _load_recording(npz)
             samp_rate = rec.samp_rate
 
             # Phase windows come from the recording's injected phases (default: a single "full"
@@ -145,8 +140,7 @@ def _plot_burst_activity_summary(df: pd.DataFrame, cid: str,
         dpi=150,
     )
 
-def channel_activity_summary(cpath, analysis_dir: Path, use_existing=True, show_plot=True, save_plot=False,
-                             make_phases=None):
+def channel_activity_summary(cpath, analysis_dir: Path, use_existing=True, show_plot=True, save_plot=False):
 
     cid = cpath.culture_id
     rows = []
@@ -161,7 +155,7 @@ def channel_activity_summary(cpath, analysis_dir: Path, use_existing=True, show_
         for div in cpath.recordings:
 
             npz = cpath.recordings[div].npz
-            rec = _load_recording(npz, make_phases)
+            rec = _load_recording(npz)
 
             for p in rec.phases:
 

@@ -30,6 +30,20 @@ def test_extract_reads_embedded_metadata():
     assert well["data"].shape[0] > 0
 
 
+def test_extract_propagates_phases_metadata():
+    spec = {
+        "starts": {"pre": "pre_recording_start", "train": "closed_loop_start"},
+        "end": "end_experiment",
+    }
+    data = extract.extract(str(_P004722), metadata={"Phases": spec})
+    assert data[0]["phase_spec"] == spec
+
+
+def test_extract_without_phases_metadata_yields_none():
+    data = extract.extract(str(_P004722))
+    assert data[0]["phase_spec"] is None
+
+
 def test_extract_missing_metadata_requires_manual_dict():
     # A file with embedded metadata still works; the manual-dict path is exercised by the old-file case,
     # here we just assert extract raises clearly when asked for a nonexistent file.

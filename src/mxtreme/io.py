@@ -119,6 +119,7 @@ def save_preprocessed(
         path_to_h5=well["path_to_h5"],
         preprocessing_params=np.asarray(well.get("preprocessing_params", {})),
         step_log=np.asarray(well.get("step_log", []), dtype=object),
+        phase_spec=np.asarray(well.get("phase_spec"), dtype=object),
     )
 
     # print(f"Transformed data saved to: {out_path}")

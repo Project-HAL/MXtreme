@@ -34,6 +34,12 @@ def extract(filepath: str, metadata: dict | None = None, wells: list | int | Non
 
         An optional ``'Conditions'`` key (a list with one ``[left, right]`` entry per well) supplies
         the per-well experimental condition; it is entirely optional and its absence is not an error.
+
+        An optional ``'Phases'`` key supplies an experiment-level phase spec that is embedded in every
+        preprocessed ``.npz`` and reconstructed automatically by :class:`~mxtreme.recording.Recording`
+        (see :func:`mxtreme.phases.phases_from_spec`). It is shaped as
+        ``{'starts': {name: tag_or_minutes, ...}, 'end': tag_or_minutes}`` where each boundary is
+        either a maxlab event tag (``str``) or a number of minutes from the recording's first frame.
     :type metadata: dict, optional
     :param wells: Well number(s) to extract. ``None`` extracts every well present in the file.
     :type wells: list or int, optional
@@ -82,6 +88,9 @@ def extract(filepath: str, metadata: dict | None = None, wells: list | int | Non
 
         conditions = h5_metadata.get("Conditions")
         well_ids = h5_metadata.get("Well IDs")
+        # Optional phase spec (experiment-level: applies to every well). Same shape as accepted by
+        # ``mxtreme.phases.phases_from_spec`` -- {"starts": {name: tag|minutes}, "end": tag|minutes}.
+        phase_spec = h5_metadata.get("Phases")
 
         h5_metadata["wells"] = []  # track which wells actually carry data in this file
 
@@ -164,6 +173,10 @@ def extract(filepath: str, metadata: dict | None = None, wells: list | int | Non
                 except (ValueError, IndexError, TypeError, KeyError):
                     well_condition = None
             well_data["experimental_condition"] = well_condition
+
+            # Phase spec travels with every well so it is embedded in each preprocessed ``.npz`` and
+            # picked up automatically by ``Recording`` at detection/analysis time. Optional (``None``).
+            well_data["phase_spec"] = phase_spec
 
             print(f"  well {well} | {len(well_data['data']):>9,} spikes | condition {well_condition}")
 

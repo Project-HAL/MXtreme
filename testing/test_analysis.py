@@ -102,6 +102,28 @@ def test_burst_activity_summary_columns(store):
     assert (df["burst_rate_hz"].dropna() >= 0).all()
 
 
+def test_summaries_honor_embedded_phase_spec(tmp_path, make_recording_data):
+    # A recording whose npz carries a phase spec is split into those phases by the analysis with no
+    # make_phases / phase_tags anywhere. The fixture has dense bursts near frames 100k and 300k
+    # (10 kHz), so a split at ~0.333 min (200k frames) puts a burst in each phase.
+    config = Config(data_root=tmp_path)
+    spec = {"starts": {"early": 0.0, "late": 0.333}, "end": 0.833}
+    data = make_recording_data(
+        seed=1, exp_id="expP", chip="C0009", well=0, DIV=7,
+        phase_spec=np.asarray(spec, dtype=object),
+    )
+    _add_recording(config, data, well_no=0)
+
+    cpath = resolve_paths(CultureID("expP", "C0009", "0"), config)
+
+    ch = activity.channel_activity_summary(cpath, config.analysis_dir, show_plot=False)
+    assert set(ch["phase"]) == {"early", "late"}
+
+    bu = activity.burst_activity_summary(cpath, config.analysis_dir, show_plot=False)
+    assert set(bu["phase"].dropna()) <= {"early", "late"}
+    assert (bu["burst_rate_hz"].dropna() >= 0).all()
+
+
 def test_performance_summary_default_objective(store):
     config, cid_a, _ = store
     cpath = resolve_paths(cid_a, config)

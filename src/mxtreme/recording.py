@@ -17,12 +17,12 @@ consume.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Mapping, Optional
 
 import numpy as np
 import pandas as pd
 
-from mxtreme.phases import Phases, TagSpec, phases_from_event_tags
+from mxtreme.phases import Phases, TagSpec, phases_from_event_tags, phases_from_spec
 
 
 def _item(value):
@@ -49,8 +49,11 @@ class Recording:
     :param end_tag: Optional event tag marking the end of the final phase (used only with
         ``phase_tags``); the last phase runs to this tag's frame if present, else to the last frame.
 
-    When neither ``phases`` nor ``phase_tags`` is supplied, a single ``"full"`` phase spans the whole
-    recording.
+    When neither ``phases`` nor ``phase_tags`` is supplied, phases default to a spec embedded in
+    ``exp_data`` under ``"phase_spec"`` (written at preprocessing time from the ``Phases`` metadata key
+    and resolved here via :func:`~mxtreme.phases.phases_from_spec`). When no embedded spec is present
+    either, a single ``"full"`` phase spans the whole recording. An explicit ``phases`` / ``phase_tags``
+    argument overrides the embedded spec.
     """
 
     def __init__(
@@ -93,12 +96,16 @@ class Recording:
         self.event_df = pd.DataFrame({"eventtime": self.eventtime, "eventmessage": self.event_messages})
 
         # --- phases ---
-        # Resolved here (not before construction) so a tag spec can be turned into Phases using this
-        # recording's own event_df. Priority: an explicit ``phases`` object, else a ``phase_tags`` spec
-        # resolved against the events, else a single ``"full"`` phase spanning the recording.
+        # Resolved here (not before construction) so a spec can be turned into Phases using this
+        # recording's own event_df. Priority: an explicit ``phases`` object, else an explicit
+        # ``phase_tags`` spec, else a phase spec embedded in the preprocessed data (the default source,
+        # written at preprocessing time), else a single ``"full"`` phase spanning the recording.
         frames = self.spike_data["frameno"]
         start_frame = int(np.min(frames)) if len(frames) else 0
         end_frame = int(np.max(frames)) if len(frames) else 0
+
+        # Phase spec embedded in the npz metadata (absent in older stores / synthetic fixtures).
+        embedded_spec = _item(exp_data["phase_spec"]) if "phase_spec" in exp_data else None
 
         if phases is not None and phase_tags is not None:
             raise ValueError("Pass either `phases` or `phase_tags`, not both.")
@@ -108,6 +115,11 @@ class Recording:
         elif phase_tags is not None:
             self.phases = phases_from_event_tags(
                 self.event_df, phase_tags, end_frame=end_frame, end_tag=end_tag
+            )
+        elif isinstance(embedded_spec, Mapping) and embedded_spec.get("starts"):
+            self.phases = phases_from_spec(
+                embedded_spec, self.event_df,
+                start_frame=start_frame, end_frame=end_frame, samp_rate=self.samp_rate,
             )
         else:
             self.phases = Phases.full(start_frame, end_frame)

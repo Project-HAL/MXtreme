@@ -9,7 +9,7 @@ from mxtreme.recording import Recording
 from mxtreme.bursting import Burst, BurstDetector, BurstSet
 from mxtreme.bursting.burst import _COLUMNS
 from mxtreme.params import BurstDetectParams, BurstFeatureParams
-from mxtreme.phases import Phase, Phases, phases_from_event_tags
+from mxtreme.phases import Phase, Phases, phases_from_event_tags, phases_from_spec
 
 
 # Detection params tuned for the small synthetic fixture (N=300 needs millions of spikes).
@@ -85,6 +85,85 @@ def test_recording_phases_and_tags_are_mutually_exclusive(make_recording_data):
     with pytest.raises(ValueError):
         Recording(0, make_recording_data(), phases=Phases.full(0, 10),
                    phase_tags=[("pre", "pre_recording_start")])
+
+
+# --- phases_from_spec (the npz-embedded, polymorphic spec) ----------------------------------------
+
+_EMPTY_EVENTS = pd.DataFrame({"eventtime": [], "eventmessage": []})
+
+
+def test_phases_from_spec_minutes_anchored_to_first_frame():
+    # boundary (minutes) -> start_frame + minutes*60*samp_rate. 20 min @ 100 Hz = 120000 frames.
+    spec = {"starts": {"pre": 0, "train": 20, "post": 40}, "end": 60}
+    phases = phases_from_spec(spec, _EMPTY_EVENTS, start_frame=0, end_frame=999999, samp_rate=100.0)
+    assert phases.names == ("pre", "train", "post")
+    assert [(p.start_frame, p.end_frame) for p in phases] == [
+        (0, 120000), (120000, 240000), (240000, 360000)
+    ]
+
+
+def test_phases_from_spec_minutes_offset_by_first_frame():
+    spec = {"starts": {"pre": 0, "train": 10}, "end": 20}
+    phases = phases_from_spec(spec, _EMPTY_EVENTS, start_frame=3000, end_frame=999999, samp_rate=100.0)
+    # 10 min @ 100 Hz = 60000, anchored at first frame 3000.
+    assert [(p.start_frame, p.end_frame) for p in phases] == [(3000, 63000), (63000, 123000)]
+
+
+def test_phases_from_spec_tags():
+    events = pd.DataFrame({
+        "eventtime": [10, 100, 1000],
+        "eventmessage": [
+            {"pre_recording_start": "5"}, {"closed_loop_start": "5"}, {"post_recording_start": "5"},
+        ],
+    })
+    spec = {
+        "starts": {"pre": "pre_recording_start", "train": "closed_loop_start", "post": "post_recording_start"},
+        "end": "end_experiment",  # absent -> last phase runs to end_frame
+    }
+    phases = phases_from_spec(spec, events, start_frame=0, end_frame=2000, samp_rate=100.0)
+    assert [(p.name, p.start_frame, p.end_frame) for p in phases] == [
+        ("pre", 10, 100), ("train", 100, 1000), ("post", 1000, 2000)
+    ]
+
+
+def test_phases_from_spec_mixed_boundaries():
+    events = pd.DataFrame({"eventtime": [50000], "eventmessage": [{"closed_loop_start": "5"}]})
+    spec = {"starts": {"pre": 0, "train": "closed_loop_start"}, "end": 10}
+    phases = phases_from_spec(spec, events, start_frame=0, end_frame=999999, samp_rate=100.0)
+    # pre at minute 0 -> frame 0; train at the tag frame 50000; end at 10 min -> 60000.
+    assert [(p.name, p.start_frame, p.end_frame) for p in phases] == [
+        ("pre", 0, 50000), ("train", 50000, 60000)
+    ]
+
+
+def test_phases_from_spec_empty_falls_back_to_full():
+    phases = phases_from_spec({"starts": {}}, _EMPTY_EVENTS, start_frame=0, end_frame=500, samp_rate=100.0)
+    assert phases.names == ("full",)
+    # A tag-only spec whose tags are all absent also collapses to a single full phase.
+    phases2 = phases_from_spec(
+        {"starts": {"pre": "never_seen"}}, _EMPTY_EVENTS, start_frame=0, end_frame=500, samp_rate=100.0
+    )
+    assert phases2.names == ("full",)
+
+
+def test_recording_resolves_phases_from_embedded_spec(make_recording_data):
+    # samp_rate defaults to 10000 Hz in the fixture; recording spans ~[0, 500000). Minutes must be small.
+    spec = {"starts": {"pre": 0.0, "train": 0.1, "post": 0.2}, "end": 0.5}
+    rec = Recording(0, make_recording_data(phase_spec=np.asarray(spec, dtype=object)))
+    assert rec.phases.names == ("pre", "train", "post")
+
+
+def test_explicit_phases_override_embedded_spec(make_recording_data):
+    spec = {"starts": {"pre": 0.0, "train": 0.1}, "end": 0.5}
+    data = make_recording_data(phase_spec=np.asarray(spec, dtype=object))
+    rec = Recording(0, data, phases=Phases.full(0, 10))
+    assert rec.phases.names == ("full",)
+
+
+def test_absent_embedded_spec_defaults_to_full(make_recording_data):
+    # The fixture carries no phase_spec key at all -> single "full" phase (backward compatible).
+    rec = Recording(0, make_recording_data())
+    assert rec.phases.names == ("full",)
 
 
 # --- Burst record ---------------------------------------------------------------------------------

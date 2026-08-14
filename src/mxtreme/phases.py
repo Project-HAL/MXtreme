@@ -140,3 +140,82 @@ def phases_from_event_tags(
         phases.append(Phase(name, int(start), int(end)))
 
     return Phases(tuple(phases))
+
+
+def _is_number(value) -> bool:
+    """Return whether ``value`` is a real number (JSON int/float) and not a bool."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _boundary_frame(boundary, event_df, *, start_frame: int, samp_rate: float) -> Optional[int]:
+    """Resolve a polymorphic phase boundary to a frame.
+
+    A **number** is minutes from the recording's first frame:
+    ``start_frame + round(boundary * 60 * samp_rate)``. A **string** is a maxlab event tag, resolved to
+    its first event frame (``None`` when the tag is absent from ``event_df``).
+    """
+    if _is_number(boundary):
+        return int(start_frame + round(float(boundary) * 60.0 * samp_rate))
+    return _first_frame_for_tag(event_df, str(boundary))
+
+
+def phases_from_spec(
+    spec: Mapping,
+    event_df,
+    *,
+    start_frame: int,
+    end_frame: int,
+    samp_rate: float,
+) -> Phases:
+    """Build :class:`Phases` from a polymorphic phase ``spec`` (the value embedded in npz metadata).
+
+    ``spec`` is a mapping with:
+
+    - ``"starts"``: an ordered ``name -> boundary`` mapping. Each ``boundary`` is either a maxlab event
+      **tag** (a ``str``, resolved from ``event_df``) or a number of **minutes** from the recording's
+      first frame (see :func:`_boundary_frame`). Boundaries may mix within one spec.
+    - ``"end"`` (optional): the terminal boundary of the last phase, resolved the same way. When
+      omitted, absent (tag not found), the last phase runs to ``end_frame``.
+
+    Boundaries that don't resolve (a tag absent from ``event_df``) are skipped, so the same spec can be
+    applied across a batch of recordings that don't all carry every tag. If no start resolves, a single
+    ``"full"`` phase spanning ``[start_frame, end_frame)`` is returned.
+
+    :param spec: The phase spec (``{"starts": {...}, "end": ...}``).
+    :param event_df: ``Recording.event_df`` (columns ``eventtime`` / ``eventmessage``).
+    :param start_frame: The recording's first frame (anchor for minute-based boundaries).
+    :param end_frame: Frame at which the last phase ends when no ``end`` boundary resolves.
+    :param samp_rate: Sampling rate (Hz), used to convert minutes to frames.
+    :returns: The resolved phases.
+    :rtype: Phases
+    """
+    starts = spec.get("starts") or {}
+
+    found: list[tuple[str, int]] = []
+    for name, boundary in starts.items():
+        frame = _boundary_frame(boundary, event_df, start_frame=start_frame, samp_rate=samp_rate)
+        if frame is not None:
+            found.append((str(name), frame))
+
+    if not found:
+        return Phases.full(start_frame, end_frame)
+
+    # Order phases by start frame so contiguous intervals are well-formed even if the spec order and
+    # the resolved frames disagree.
+    found.sort(key=lambda nf: nf[1])
+
+    last_end = end_frame
+    end_boundary = spec.get("end")
+    if end_boundary is not None:
+        resolved_end = _boundary_frame(
+            end_boundary, event_df, start_frame=start_frame, samp_rate=samp_rate
+        )
+        if resolved_end is not None:
+            last_end = resolved_end
+
+    phases: list[Phase] = []
+    for i, (name, start) in enumerate(found):
+        end = found[i + 1][1] if i + 1 < len(found) else last_end
+        phases.append(Phase(name, int(start), int(end)))
+
+    return Phases(tuple(phases))
