@@ -87,7 +87,7 @@ def extract(filepath: str, metadata: dict | None = None, wells: list | int | Non
             meta_source = "caller-supplied"
 
         conditions = h5_metadata.get("Conditions")
-        well_ids = h5_metadata.get("Well IDs")
+        
         # Optional phase spec (experiment-level: applies to every well). Same shape as accepted by
         # ``mxtreme.phases.phases_from_spec`` -- {"starts": {name: tag|minutes}, "end": tag|minutes}.
         phase_spec = h5_metadata.get("Phases")
@@ -101,8 +101,10 @@ def extract(filepath: str, metadata: dict | None = None, wells: list | int | Non
         print(f"  Wells requested : {'all' if wells_to_process is None else wells_to_process}")
         print("-" * 60)
 
+        well_ids = [int(well_long.split('well')[-1]) for well_long in list(f["/wells/"].keys())]
+
         for well_long in list(f["/wells/"].keys()):
-            well = int(well_long[-1])  # well values range from 0-5
+            well = int(well_long.split('well')[-1])  # well values range from 0-5
 
             if wells_to_process is not None and well not in wells_to_process:
                 continue
