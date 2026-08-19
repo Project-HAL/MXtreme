@@ -11,17 +11,54 @@ from mxtreme.analysis._stats import aggregate_by_div_phase
 
 
 def _get_stim_info(rec: Recording):
+    """Return the recording's stimulation events, with the pulse phase in a ``stim_phase`` column.
 
-    # unique_messages = rec.event_df['eventmessage'].astype(str).unique()
+    Event messages are dicts (see :attr:`Recording.event_df <mxtreme.recording.Recording.event_df>`);
+    a stimulation event is one carrying both a ``start_stimulation`` and a ``phase_us`` key. Messages
+    that aren't dicts (older stores hold plain strings) are skipped rather than raising.
 
-    stim_rows = rec.event_df[rec.event_df['eventmessage'].map(lambda d: ('phase_us' in d)&('start_stimulation' in d) )].copy()
-    stim_rows['stim_phase'] = rec.event_df['eventmessage'].map(lambda d: d.get('phase_us', float('nan'))).astype(float)
+    .. note:: The ``start_stimulation`` / ``phase_us`` key names are maxlab closed-loop-stim specific.
+    """
+    is_stim = rec.event_df['eventmessage'].map(
+        lambda d: isinstance(d, dict) and ('phase_us' in d) and ('start_stimulation' in d)
+    )
+    stim_rows = rec.event_df[is_stim].copy()
+    stim_rows['stim_phase'] = stim_rows['eventmessage'].map(
+        lambda d: d.get('phase_us', float('nan'))
+    ).astype(float)
 
     return stim_rows
 
 
-def stim_summary(cpath, analysis_dir: Path, use_existing=True, show_plot=True, save_plot=False):
+def _phase_duration_min(rec: Recording, name: str) -> float | None:
+    """Return the duration (minutes) of ``rec``'s phase called ``name``, or ``None`` if absent."""
+    for phase in rec.phases:
+        if phase.name == name:
+            return (phase.end_frame - phase.start_frame) / rec.samp_rate / 60
 
+    return None
+
+
+def stim_summary(cpath, analysis_dir: Path, use_existing=True, show_plot=True, save_plot=False,
+                 train_phase: str = "train"):
+    """Summarise stimulation delivered to one culture, one row per DIV.
+
+    For each DIV: ``total_stim_ms`` is the summed pulse phase of the recording's stimulation events
+    (maxlab reports these in **microseconds** as ``phase_us``, so they are divided by 1000 to give
+    milliseconds), and ``total_train_min`` is the duration of the ``train_phase`` window taken from
+    the recording's own phases.
+
+    :param cpath: The culture's :class:`~mxtreme.paths.CulturePaths`.
+    :param analysis_dir: Analysis output root (typically ``config.analysis_dir``).
+    :param use_existing: Reuse the cached summary CSV when one already exists.
+    :param train_phase: Name of the phase whose span counts as training time. When the recording has
+        no such phase, the whole recording is used instead (and a notice is printed).
+    :param show_plot: Show the per-culture summary figure.
+    :param save_plot: Save that figure next to the summary CSV.
+    :returns: One row per DIV with columns ``div``, ``total_stim_ms``, ``total_train_min``,
+        ``culture_id``.
+    :rtype: pandas.DataFrame
+    """
     divs = []
     total_stim_times = []
     total_train_times = []
@@ -44,8 +81,15 @@ def stim_summary(cpath, analysis_dir: Path, use_existing=True, show_plot=True, s
 
             stim_df = _get_stim_info(rec)
 
-            total_stim_time = stim_df['stim_phase'].sum() / 1000  # in ms
-            total_train_time = (rec.rec_t_sec - (40 * 60)) / 60  # in min
+            total_stim_time = stim_df['stim_phase'].sum() / 1000  # phase_us (µs) -> ms
+
+            # Training time is the span of the recording's own `train_phase` window. Recordings with
+            # no such phase (e.g. the default single "full" phase) fall back to the whole recording.
+            total_train_time = _phase_duration_min(rec, train_phase)
+            if total_train_time is None:
+                print(f"  DIV{div}: no '{train_phase}' phase (found: {', '.join(rec.phases.names)}); "
+                      f"using the full recording as train time")
+                total_train_time = rec.rec_t_sec / 60
 
             divs.append(div)
             total_stim_times.append(total_stim_time)

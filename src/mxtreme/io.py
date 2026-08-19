@@ -7,6 +7,7 @@ Contents:
 - :func:`load_preprocessed` -- read a cleaned ``.npz`` back into a dict.
 - :func:`save_preprocessed` -- write one well's cleaned data to an ``.npz`` (and register it).
 - :func:`register` -- record processed recordings in the registry CSV.
+- :func:`rebuild_registry` -- rebuild that registry by scanning the store (recovery path).
 - :func:`save_burst_data` / :func:`load_burst_data` -- per-recording burst CSVs.
 - :func:`update_burst_log` -- per-experiment burst summary CSV.
 """
@@ -131,20 +132,24 @@ def save_preprocessed(
     return out_path
 
 
-def register(data: dict[int, dict], registry_path: str | Path) -> None:
+def register(data: dict[int, dict], registry_path: str | Path, *, timestamp=None) -> None:
     """Upsert one row per processed recording into the registry CSV.
 
     Rows are keyed by ``(exp_id, chip, well, div)``; an existing row for the same key is replaced.
-    Each row records a fresh ``timestamp`` and the well's ``conditions`` (whatever the well's
+    Each row records a ``timestamp`` and the well's ``conditions`` (whatever the well's
     ``experimental_condition`` holds, or blank when absent).
 
     :param data: Mapping of well number to well data dict.
     :type data: dict[int, dict]
     :param registry_path: Path to the registry CSV (typically ``config.registry_path``).
     :type registry_path: str or Path
+    :param timestamp: Value for the rows' ``timestamp`` column. Defaults to now, which is what a live
+        write wants; :func:`rebuild_registry` passes each ``.npz``'s modification time instead, so a
+        retroactively rebuilt row reflects when the file was actually written.
     """
     registry_path = Path(registry_path)
     os.makedirs(registry_path.parent, exist_ok=True)
+    stamp = (pd.Timestamp.now() if timestamp is None else pd.Timestamp(timestamp)).isoformat()
 
     df = pd.read_csv(registry_path) if registry_path.exists() else pd.DataFrame()
     # Drop the legacy `status` column if an older registry still carries it, so it disappears on the
@@ -159,12 +164,11 @@ def register(data: dict[int, dict], registry_path: str | Path) -> None:
             "well": well_no,
             "div": well["DIV"],
             "conditions": "" if condition is None else condition,
-            "timestamp": pd.Timestamp.now().isoformat(),
+            "timestamp": stamp,
         }
         if not df.empty:
-            # Compare as strings: rows may have been written by another producer
-            # (e.g. utils.build_registry_from_disk) with a different dtype for `well`/`div`,
-            # which would otherwise leak a duplicate row on re-registration.
+            # Compare as strings: an older registry on disk may hold a different dtype for
+            # `well`/`div`, which would otherwise leak a duplicate row on re-registration.
             mask = (
                 (df["exp_id"].astype(str) == str(well["exp_id"]))
                 & (df["chip"].astype(str) == str(well["chip"]))
@@ -179,6 +183,57 @@ def register(data: dict[int, dict], registry_path: str | Path) -> None:
     # Defensive: collapse any pre-existing duplicates (mixed-dtype rows from older writes).
     df = df.drop_duplicates(subset=["exp_id", "chip", "well", "div"], keep="last")
     df.to_csv(registry_path, index=False)
+
+
+def rebuild_registry(config, *, registry_path: str | Path | None = None) -> int:
+    """Rebuild the registry by scanning every preprocessed ``.npz`` in the managed store.
+
+    :func:`save_preprocessed` keeps the registry current as data is written, so this is a recovery
+    path: use it when the registry has been lost or has drifted from what is actually on disk.
+
+    Each recording's identity and conditions are read from *inside* its ``.npz`` rather than inferred
+    from the directory names, and each row is upserted through :func:`register`, so a rebuilt registry
+    is schema-identical to a live-written one. Rows carry the ``.npz``'s modification time as their
+    ``timestamp``. Existing rows are updated in place rather than dropped, so recordings whose ``.npz``
+    is no longer on disk survive a rebuild.
+
+    :param config: The :class:`~mxtreme.config.Config` describing the managed store.
+    :param registry_path: Override the destination; defaults to ``config.registry_path``.
+    :type registry_path: str or Path or None
+    :returns: The number of recordings registered.
+    :rtype: int
+    """
+    if registry_path is None:
+        registry_path = config.registry_path
+
+    def _value(npz, key):
+        """Return a saved field as the plain Python object it went in as.
+
+        ``tolist()`` (unlike ``item()``) handles both the 0-d arrays identity fields are stored in and
+        the multi-element ones -- experimental conditions are a ``[left, right]`` pair, and must come
+        back out as that list so a rebuilt row's ``conditions`` renders exactly as a live-written one.
+        """
+        return np.asarray(npz[key]).tolist() if key in npz else None
+
+    n = 0
+    for npz_path in sorted(config.preprocessed_dir.glob("*/*/*/DIV*.npz")):
+        # np.load is lazy, so reading these few keys never decompresses the spike arrays.
+        with np.load(npz_path, allow_pickle=True) as npz:
+            well_no = _value(npz, "well")
+            register(
+                {well_no: {
+                    "exp_id": _value(npz, "exp_id"),
+                    "chip": _value(npz, "chip"),
+                    "DIV": _value(npz, "DIV"),
+                    "experimental_condition": _value(npz, "exp_condition"),
+                }},
+                registry_path,
+                timestamp=pd.Timestamp.fromtimestamp(npz_path.stat().st_mtime),
+            )
+        n += 1
+
+    print(f"Registry rebuilt from {n} recordings -> {registry_path}")
+    return n
 
 
 # --- burst outputs ------------------------------------------------------------------------------

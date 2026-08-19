@@ -8,7 +8,7 @@ Views of the cleaned/binned data:
 Burst overlays (consume a burst DataFrame from :meth:`BurstSet.to_dataframe
 <mxtreme.bursting.detection.BurstSet.to_dataframe>`):
 - :func:`plot_bursts_on_asdr` -- ASDR with burst peaks marked.
-- :func:`plot_origin_heatmap` -- burst-origin density over the MEA.
+- :func:`plot_origin_heatmap` -- burst-origin density over the MEA (``method="hist"``/``"kde"``).
 - :func:`plot_burst_vectors` -- origin->peak arrows over the MEA.
 
 Each accepts an optional ``ax`` so panels can be composed (e.g. a shared-x ASDR-over-raster figure); when
@@ -21,6 +21,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patheffects as path_effects
 import seaborn as sns
+from scipy.ndimage import gaussian_filter
+from scipy.spatial.distance import cdist
 
 from mxtreme import device
 
@@ -173,9 +175,78 @@ def plot_bursts_on_asdr(recording, burst_df, ax=None, zoom=None, kind="network",
     return ax
 
 
+def _origin_channel_density(channelmap, burst_df, chip_ht_um):
+    """Pool every burst's origin channels into flat ``(xs, ys, weights)`` arrays.
+
+    Each burst contributes one point per channel in its ``origin_chan_counts``, weighted by that
+    channel's spike count, so a channel that fires heavily at burst onset counts for more than one
+    that barely participates. ``ys`` are already inverted to plot coordinates.
+    """
+    xs, ys, weights = [], [], []
+    for counts in burst_df["origin_chan_counts"]:
+        counts = _as_dict(counts)
+        if not counts:
+            continue
+        chanmap_slice = channelmap[np.isin(channelmap[:, 1], list(counts.keys()))]
+        if not len(chanmap_slice):
+            continue
+        xs.append(chanmap_slice[:, 3])
+        ys.append(chip_ht_um - chanmap_slice[:, 4])  # invert y
+        weights.append([counts.get(c, 0) for c in chanmap_slice[:, 1]])
+
+    if not xs:
+        return np.array([]), np.array([]), np.array([])
+    return np.concatenate(xs), np.concatenate(ys), np.concatenate(weights).astype(float)
+
+
+def _is_degenerate(xs, ys) -> bool:
+    """Whether a 2-D KDE cannot be fitted: fewer than three points, or all of them collinear."""
+    if len(xs) < 3:
+        return True
+    centered = np.column_stack([xs - xs.mean(), ys - ys.mean()])
+    return bool(np.linalg.matrix_rank(centered, tol=1e-8) < 2)
+
+
+def _median_nn_distance(channelmap) -> float:
+    """Median nearest-neighbour distance (µm) between the recording's routed electrodes.
+
+    This is the array's *effective* electrode spacing: MaxOne/MaxTwo route ~1k channels out of a much
+    denser grid, so neighbouring routed electrodes sit far further apart than ``device.ELEC_SIZE``.
+    Matches ``median_nn_distance_um`` from :func:`mxtreme.analysis.spatial.compute_spatial_metrics`.
+    """
+    xy = np.asarray(channelmap)[:, 3:5]
+    if len(xy) < 2:
+        return float(device.ELEC_SIZE)
+    dists = cdist(xy, xy)
+    np.fill_diagonal(dists, np.inf)
+    return float(np.median(dists.min(axis=1)))
+
+
+def _smoothed_density(xs, ys, weights, *, bandwidth_um, chip_wd_um, chip_ht_um):
+    """Bin the pooled origin channels onto the electrode grid and smooth with a **fixed** kernel.
+
+    The bandwidth is an absolute distance in µm, so it does not shift with sample size or spatial
+    spread the way Scott's / Silverman's rules do. That is what makes two of these plots comparable:
+    the only thing that varies between them is the data.
+    """
+    density, x_edges, y_edges = np.histogram2d(
+        xs, ys, bins=(device.CHIP_WIDTH, device.CHIP_HEIGHT),
+        range=((0, chip_wd_um), (0, chip_ht_um)), weights=weights,
+    )
+    # Bins are one electrode pitch wide, so µm -> bins is a division by the pitch.
+    return gaussian_filter(density, sigma=bandwidth_um / device.ELEC_SIZE), x_edges, y_edges
+
+
 def plot_origin_heatmap(recording, burst_df, ax=None, phase=None, kind="network",
-                        color="r", kde_cmap="Blues", title=None):
+                        color="r", kde_cmap="Blues", title=None, method="hist",
+                        bandwidth_um=None, vmax=None, colorbar=True):
     """Plot burst-origin locations and their spiking-channel density over the MEA.
+
+    The density layer pools every burst's ``origin_chan_counts``, weighting each electrode by its
+    spike count, and is reported as **spikes per burst per electrode bin** -- normalising by burst
+    count so that cultures with different numbers of bursts sit on the same scale. Pin ``vmax`` to
+    fix the color scale across a set of plots; otherwise each plot scales to its own peak and colors
+    are not comparable between figures.
 
     :param recording: The :class:`~mxtreme.recording.Recording` (for the channel map / stim electrodes).
     :param burst_df: Burst DataFrame with ``origin_x`` / ``origin_y`` / ``origin_chan_counts`` / ``kind``.
@@ -183,33 +254,86 @@ def plot_origin_heatmap(recording, burst_df, ax=None, phase=None, kind="network"
     :param phase: If given, restrict to bursts with this ``phase``.
     :param kind: Burst kind to include (default ``"network"``; ``None`` for all).
     :param color: Marker color for origin points.
-    :param kde_cmap: Colormap for the per-burst origin-channel KDE.
-    :param title: Axes title.
+    :param kde_cmap: Colormap for the origin-channel density.
+    :param title: Axes title. The burst and electrode counts are appended to it either way, since the
+        density is a mean over those bursts and is not interpretable without them.
+    :param method: How to render the density layer:
+
+        - ``"hist"`` (default) -- count-weighted 2-D histogram on the electrode grid, smoothed with a
+          fixed-width Gaussian. The only method with a data-independent bandwidth and a pinnable
+          color scale, and by far the cheapest.
+        - ``"kde"`` -- one count-weighted :func:`seaborn.kdeplot` over the pooled channels.
+        - ``"per_burst"`` -- one KDE per burst, overlaid translucently (the original behaviour).
+
+        .. warning:: Both KDE methods pick their bandwidth by Scott's rule, which scales with each
+           sample's size and spread. Differences between two such plots may therefore be a bandwidth
+           artifact rather than a real difference in spatial distribution, and their filled contours
+           are normalised per plot so ``vmax`` cannot pin them. Use ``"hist"`` to compare plots.
+    :param bandwidth_um: Smoothing bandwidth in µm for ``method="hist"``. Defaults to the recording's
+        median nearest-neighbour electrode distance -- i.e. tied to the array's routed geometry, not
+        to the burst sample, which is what makes two plots comparable. (Note this is *not*
+        ``device.ELEC_SIZE``: only ~1k of the array's electrodes are routed, so their effective
+        spacing is several times the physical pitch.) Pass an explicit value to pin the bandwidth
+        across recordings whose channel maps differ.
+    :param vmax: Upper limit of the density color scale (``"hist"`` only). ``None`` scales each plot
+        to its own peak; pass the same value across plots to preserve relative magnitude between them.
+    :param colorbar: Draw a colorbar for the density (``"hist"`` only), so the scale is readable.
     """
+    if method not in ("kde", "hist", "per_burst"):
+        raise ValueError(f"Unknown method {method!r}; expected 'hist', 'kde' or 'per_burst'.")
+    if bandwidth_um is None:
+        bandwidth_um = _median_nn_distance(recording.channelmap)
+
     owns_fig = ax is None
     if owns_fig:
         _, ax = plt.subplots(1, 1, figsize=(9, 5))
 
+    chip_wd_um = device.CHIP_WIDTH * device.ELEC_SIZE
     chip_ht_um = device.CHIP_HEIGHT * device.ELEC_SIZE
     channelmap = recording.channelmap
+    bursts = _select(burst_df, kind, phase)
 
-    x_origin, y_origin = [], []
-    for _, burst in _select(burst_df, kind, phase).iterrows():
-        channels = list(_as_dict(burst["origin_chan_counts"]).keys())
-        if not channels:
-            continue
-        chanmap_slice = channelmap[np.isin(channelmap[:, 1], channels)]
-        xs = chanmap_slice[:, 3]
-        ys = chip_ht_um - np.array(chanmap_slice[:, 4])  # invert y
-        sns.kdeplot(x=xs, y=ys, fill=True, alpha=0.2, cmap=kde_cmap, warn_singular=False, ax=ax)
-        x_origin.append(burst["origin_x"])
-        y_origin.append(burst["origin_y"])
+    xs, ys, weights = _origin_channel_density(channelmap, bursts, chip_ht_um)
+    n_bursts = len(bursts)
+    n_elec = len(np.unique(np.column_stack([xs, ys]), axis=0)) if len(xs) else 0
+
+    if method == "per_burst":
+        for _, burst in bursts.iterrows():
+            channels = list(_as_dict(burst["origin_chan_counts"]).keys())
+            if not channels:
+                continue
+            chanmap_slice = channelmap[np.isin(channelmap[:, 1], channels)]
+            burst_xs = chanmap_slice[:, 3]
+            burst_ys = chip_ht_um - np.array(chanmap_slice[:, 4])  # invert y
+            sns.kdeplot(x=burst_xs, y=burst_ys, fill=True, alpha=0.2, cmap=kde_cmap,
+                        warn_singular=False, ax=ax)
+    # A 2-D KDE can't be fitted to a degenerate cloud (all origin channels on one row/column of the
+    # array); fall back to the fixed-bandwidth histogram there rather than failing.
+    elif len(xs) and method == "kde" and not _is_degenerate(xs, ys):
+        sns.kdeplot(x=xs, y=ys, weights=weights, fill=True, alpha=0.6, cmap=kde_cmap,
+                    warn_singular=False, ax=ax)
+    elif len(xs):
+        density, x_edges, y_edges = _smoothed_density(
+            xs, ys, weights / max(n_bursts, 1),
+            bandwidth_um=bandwidth_um, chip_wd_um=chip_wd_um, chip_ht_um=chip_ht_um,
+        )
+        mesh = ax.pcolormesh(x_edges, y_edges, density.T, cmap=kde_cmap, alpha=0.6,
+                             shading="auto", vmin=0, vmax=vmax)
+        if colorbar:
+            ax.figure.colorbar(mesh, ax=ax, label="spikes per burst per electrode")
+
+    x_origin = bursts["origin_x"].to_numpy()
+    y_origin = bursts["origin_y"].to_numpy()
 
     MEA(ax, channelmap, recording.stim_elecs, title="")
-    ax.scatter(x_origin, chip_ht_um - np.array(y_origin), color=color, marker="x", s=100, linewidths=3)
-    ax.set_xlim([0, device.CHIP_WIDTH * device.ELEC_SIZE])
+    # Semi-transparent: with a few hundred bursts these markers otherwise merge into a solid blob and
+    # hide both the density layer and their own concentration.
+    ax.scatter(x_origin, chip_ht_um - y_origin, color=color, marker="x", s=100, linewidths=3,
+               alpha=0.5)
+    ax.set_xlim([0, chip_wd_um])
     ax.set_ylim([0, chip_ht_um])
-    ax.set_title(title if title is not None else "MEA electrode layout - burst origins")
+    base = title if title is not None else "MEA electrode layout - burst origins"
+    ax.set_title(f"{base}\n{n_bursts} bursts, {n_elec} electrodes")
 
     if owns_fig:
         plt.show()

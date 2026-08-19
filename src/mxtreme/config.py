@@ -2,7 +2,7 @@
 
 `Config` decouples the package from any particular machine's directory layout. It holds a single
 ``data_root`` -- the root of the *package-managed data store*, i.e. the directory the package writes
-its outputs to (cleaned ``.npz`` files, experimental-condition CSVs, the registry) and later reads
+its outputs to (cleaned ``.npz`` files, burst CSVs, analysis outputs, the registry) and later reads
 those same outputs back from. Raw ``.h5`` inputs are *not* resolved through here; the user points at
 those by explicit path.
 
@@ -34,11 +34,6 @@ class Config:
     def preprocessed_dir(self) -> Path:
         """Directory holding cleaned/transformed ``.npz`` files (one per well per recording)."""
         return self.data_root / "preprocessed"
-
-    @property
-    def experimental_conditions_dir(self) -> Path:
-        """Directory holding per-culture experimental-condition CSVs."""
-        return self.data_root / "experimental_conditions"
 
     @property
     def burst_data_dir(self) -> Path:

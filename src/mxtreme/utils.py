@@ -9,11 +9,8 @@ import time
 from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 from datetime import datetime, timedelta
 from glob import glob
-import ast
-import pandas as pd
 from pathlib import Path
 
-from mxtreme import constants
 
 def load_data(filepath):
     """Loads preprocessed experimental data saved as an ``.npz``.
@@ -172,31 +169,6 @@ def get_yymmdd_platedate_from_DIV(date_str, DIV):
     return dt.strftime("%y%m%d")
 
 
-def load_experimental_conditions(experiment_id, path_to_experimental_conditions=None):
-
-    data = {}
-
-    if path_to_experimental_conditions is None:
-
-        path_to_experimental_conditions = Path(constants.PARENT_DIR) / "data" / "experimental_conditions" / f"{experiment_id}"
-
-    for filepath in Path(path_to_experimental_conditions).glob("*.csv"):
-        
-        chip = filepath.name.split('_')[0]
-        well = filepath.name.split('well')[-1].split('_')[0]
-
-        df = pd.read_csv(filepath)
-
-        exp_cond = ast.literal_eval(df.iloc[0]['experimental condition'])
-
-        try:
-            data[chip][well] = (exp_cond['left_stim'], exp_cond['right_stim'])
-        except:
-            data[chip] = {}
-            data[chip][well] = (exp_cond['left_stim'], exp_cond['right_stim'])
-
-    return data
-
 def get_DIVs(path_to_preprocessed_data):
 
     filepaths = glob(str(Path(path_to_preprocessed_data)/"*"))
@@ -209,42 +181,3 @@ def get_DIVs(path_to_preprocessed_data):
         DIVS.append(DIV)
 
     return sorted(DIVS)
-
-def build_registry_from_disk(preprocessed_root: Path = Path(constants.PARENT_DIR) / "data" / "preprocessed", registry_path: Path = Path(constants.PARENT_DIR)/"data"/"registry.csv") -> None:
-    '''
-    It uses st_mtime (file modification time) as the timestamp since there's no processing timestamp available retroactively — it's a reasonable proxy for when the file was written
-    The drop_duplicates guard handles the case where multiple npz files exist for the same recording (e.g. different suffixes) so you don't get duplicate registry rows
-    You'll want to double-check the div_str.split("_")[0] logic matches your actual filename format — if your files are named something like DIV14_cleaned.npz that works as written, but adjust if the format differs
-    '''
-
-    rows = []
-    pattern = "*/*/*/DIV*.npz"
-    
-    for npz_path in preprocessed_root.glob(pattern):
-        # preprocessed/exp_id/chip/well/DIV{div}*.npz
-        parts = npz_path.relative_to(preprocessed_root).parts
-        exp_id, chip, well = parts[0], parts[1], parts[2]
-        
-        # extract DIV number from filename e.g. DIV14_something.npz
-        div_str = npz_path.stem.split("_")[0]  # "DIV14"
-        try:
-            div = int(div_str.replace("DIV", ""))
-        except ValueError:
-            print(f"Could not parse DIV from {npz_path.name}, skipping")
-            continue
-
-        rows.append({
-            "exp_id": exp_id,
-            "chip": chip,
-            "well": well.split('well')[-1],
-            "div": div,
-            "timestamp": pd.Timestamp.fromtimestamp(npz_path.stat().st_mtime).isoformat(),
-        })
-
-    if not rows:
-        print(f"No .npz files found under {preprocessed_root}")
-        return
-
-    df = pd.DataFrame(rows).drop_duplicates(subset=["exp_id", "chip", "well", "div"])
-    df.to_csv(registry_path, index=False)
-    print(f"Registry built with {len(df)} recordings -> {registry_path}")

@@ -1,8 +1,8 @@
 """Resolve a selection (recording / culture / group) into concrete on-disk paths.
 
 Path resolution is driven entirely by a :class:`~mxtreme.config.Config`: the managed-store layout
-(``preprocessed/``, ``burst_data/``, ``experimental_conditions/``, ``registry.csv``) comes from the
-config, so nothing here is coupled to a particular machine or lab share.
+(``preprocessed/``, ``burst_data/``, ``registry.csv``) comes from the config, so nothing here is
+coupled to a particular machine or lab share.
 
 Entry point: :func:`resolve_paths`.
 
@@ -32,7 +32,6 @@ class RecordingPaths:
 @dataclass(frozen=True)
 class CulturePaths:
     culture_id: CultureID
-    experimental_conditions: Path           # culture-level experimental-condition CSV
     recordings: dict[int, RecordingPaths]  # keyed by DIV
 
     def recording(self, div: int) -> RecordingPaths:
@@ -73,9 +72,6 @@ def _culture_paths(cid: CultureID, divs: list[int] | int, config: Config) -> Cul
         divs = [divs]
     return CulturePaths(
         culture_id=cid,
-        experimental_conditions=(
-            config.experimental_conditions_dir / cid.exp_id / f"{cid.chip}_well{cid.well}_exp_conditions.csv"
-        ),
         recordings={
             div: _recording_paths(RecordingID(cid.exp_id, cid.chip, cid.well, div), config)
             for div in divs
@@ -104,9 +100,8 @@ def resolve_paths(
         target type.
     """
     df = pd.read_csv(config.registry_path)
-    # Registry rows may be written by more than one producer (`io.register`,
-    # `utils.build_registry_from_disk`) with differing dtypes/duplicates; normalise + dedupe so a
-    # culture's DIVs aren't double-counted.
+    # An older registry on disk may carry duplicate rows for a recording (written before `io.register`
+    # deduped on write); dedupe so a culture's DIVs aren't double-counted.
     key = ["exp_id", "chip", "well", "div"]
     df = df.drop_duplicates(subset=key)
 

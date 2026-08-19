@@ -5,8 +5,8 @@ import numpy as np
 from mxtreme import clean, io
 
 
-def _clean_well(make_well):
-    well = make_well()
+def _clean_well(make_well, **overrides):
+    well = make_well(**overrides)
     clean.remove_positive_deflections(well)
     clean.remove_spurious_channels(well)
     clean.build_channel_map(well)
@@ -122,10 +122,63 @@ def test_register_upserts_without_duplicates(make_well, tmp_path):
     assert len(df) == 1
 
     # Even when a prior row was written with a different `well` dtype (e.g. a string "0"
-    # from build_registry_from_disk), the upsert should still collapse to one row.
+    # in an older registry), the upsert should still collapse to one row.
     df_str = df.copy()
     df_str["well"] = df_str["well"].astype(str)
     df_str.to_csv(registry, index=False)
     io.register({well["well"]: well}, registry)
     df2 = pd.read_csv(registry)
     assert len(df2) == 1
+
+
+def test_rebuild_registry_matches_live_registration(make_well, tmp_path):
+    """A rebuilt registry is schema-identical to the one save_preprocessed wrote as it went."""
+    import pandas as pd
+    from mxtreme.config import Config
+
+    config = Config(data_root=tmp_path)
+    for div in (7, 8):
+        well = _clean_well(make_well, DIV=div)
+        io.save_preprocessed(config.preprocessed_dir, well, registry_path=config.registry_path)
+
+    live = pd.read_csv(config.registry_path).sort_values("div").reset_index(drop=True)
+    assert len(live) == 2
+
+    config.registry_path.unlink()
+    assert io.rebuild_registry(config) == 2
+
+    rebuilt = pd.read_csv(config.registry_path).sort_values("div").reset_index(drop=True)
+    assert list(rebuilt.columns) == list(live.columns)
+    # Everything but the timestamp (which becomes the npz's mtime) should round-trip.
+    cols = [c for c in live.columns if c != "timestamp"]
+    pd.testing.assert_frame_equal(rebuilt[cols], live[cols])
+    assert (rebuilt["conditions"] == live["conditions"]).all()
+
+
+def test_rebuild_registry_is_idempotent(make_well, tmp_path):
+    import pandas as pd
+    from mxtreme.config import Config
+
+    config = Config(data_root=tmp_path)
+    well = _clean_well(make_well)
+    io.save_preprocessed(config.preprocessed_dir, well, registry_path=config.registry_path)
+
+    # Rebuilding on top of an existing registry upserts rather than duplicating.
+    io.rebuild_registry(config)
+    io.rebuild_registry(config)
+    assert len(pd.read_csv(config.registry_path)) == 1
+
+
+def test_rebuild_registry_preserves_rows_without_npz(make_well, tmp_path):
+    """Recordings whose npz is gone stay in the registry -- a rebuild upserts, it doesn't truncate."""
+    import pandas as pd
+    from mxtreme.config import Config
+
+    config = Config(data_root=tmp_path)
+    well = _clean_well(make_well)
+    io.save_preprocessed(config.preprocessed_dir, well, registry_path=config.registry_path)
+    io.register({0: {"exp_id": "gone", "chip": "C9", "DIV": 99}}, config.registry_path)
+
+    io.rebuild_registry(config)
+    df = pd.read_csv(config.registry_path)
+    assert set(df["exp_id"]) == {"testExp", "gone"}

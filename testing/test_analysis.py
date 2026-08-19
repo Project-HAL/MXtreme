@@ -15,7 +15,7 @@ from mxtreme.recording import Recording
 from mxtreme.bursting import BurstDetector
 from mxtreme.params import BurstDetectParams, BurstFeatureParams
 from mxtreme.paths import CulturePaths, resolve_paths
-from mxtreme.analysis import activity, performance, generate_report
+from mxtreme.analysis import activity, performance, stimulation, generate_report
 
 # Detection params tuned for the small synthetic fixture (see test_bursting.py).
 DETECT = BurstDetectParams(n=50, noise_thresh=0.02, burst_thresh=0.15, min_dist_bins=10)
@@ -154,5 +154,81 @@ def test_generate_report_group_across_experiments(store):
         CultureSelector(cultures=[cid_a, cid_b]),
         config,
         sections=("overview", "activity", "bursting"),
+    )
+    assert out.exists() and out.stat().st_size > 0
+
+
+# --- stimulation ---------------------------------------------------------------------------------
+
+
+def _stim_events(n=5, phase_us=200.0):
+    """Maxlab-shaped stimulation events: one dict per pulse carrying start_stimulation + phase_us."""
+    eventtime = np.array([50000 * (i + 1) for i in range(n)], dtype="<i8")
+    messages = np.array(
+        [{"start_stimulation": "1", "phase_us": phase_us} for _ in range(n)], dtype=object
+    )
+    return eventtime, messages
+
+
+def _stim_store(tmp_path, make_recording_data, *, chip, phase_spec=None, messages=None, eventtime=None):
+    """A one-culture store whose single recording carries stimulation events."""
+    config = Config(data_root=tmp_path)
+    if eventtime is None or messages is None:
+        eventtime, messages = _stim_events()
+    extra = {} if phase_spec is None else {"phase_spec": np.asarray(phase_spec, dtype=object)}
+    data = make_recording_data(
+        seed=1, exp_id="expS", chip=chip, well=0, DIV=7,
+        eventtime=eventtime, event_messages=messages, **extra,
+    )
+    _add_recording(config, data, well_no=0)
+    return config, resolve_paths(CultureID("expS", chip, "0"), config)
+
+
+def test_stim_summary_uses_train_phase_window(tmp_path, make_recording_data):
+    # The fixture is 500k frames @ 10 kHz = 50 s. A train phase from 1/6 min to 0.5 min spans
+    # 1/3 min; the old hardcoded (rec_t_sec - 40*60)/60 would have returned -39.2.
+    spec = {"starts": {"pre": 0.0, "train": 1 / 6, "post": 0.5}, "end": 0.833}
+    config, cpath = _stim_store(tmp_path, make_recording_data, chip="C0010", phase_spec=spec)
+
+    df = stimulation.stim_summary(cpath, config.analysis_dir, show_plot=False)
+
+    assert len(df) == 1
+    row = df.iloc[0]
+    assert row["total_stim_ms"] == pytest.approx(5 * 200.0 / 1000)
+    assert row["total_train_min"] == pytest.approx(1 / 3, abs=1e-3)
+
+
+def test_stim_summary_falls_back_to_full_recording_without_train_phase(tmp_path, make_recording_data):
+    # No phase spec -> a single "full" phase, so train time is the whole recording (50 s), not a
+    # negative number left over from the 20-min pre/post assumption.
+    config, cpath = _stim_store(tmp_path, make_recording_data, chip="C0011")
+
+    df = stimulation.stim_summary(cpath, config.analysis_dir, show_plot=False)
+
+    assert df.iloc[0]["total_train_min"] == pytest.approx(50 / 60, abs=1e-3)
+
+
+def test_stim_summary_tolerates_non_dict_event_messages(tmp_path, make_recording_data):
+    # Older stores hold plain strings alongside the dict messages; those must be skipped, not raise.
+    eventtime = np.array([1000, 50000, 90000], dtype="<i8")
+    messages = np.array(
+        ["legacy string", {"start_stimulation": "1", "phase_us": 100.0}, {"other_event": "1"}],
+        dtype=object,
+    )
+    config, cpath = _stim_store(
+        tmp_path, make_recording_data, chip="C0012", eventtime=eventtime, messages=messages,
+    )
+
+    df = stimulation.stim_summary(cpath, config.analysis_dir, show_plot=False)
+
+    assert df.iloc[0]["total_stim_ms"] == pytest.approx(0.1)
+
+
+def test_generate_report_with_stimulation_section(tmp_path, make_recording_data):
+    spec = {"starts": {"pre": 0.0, "train": 1 / 6, "post": 0.5}, "end": 0.833}
+    config, _ = _stim_store(tmp_path, make_recording_data, chip="C0013", phase_spec=spec)
+
+    out = generate_report(
+        CultureID("expS", "C0013", "0"), config, sections=("activity", "stimulation")
     )
     assert out.exists() and out.stat().st_size > 0
