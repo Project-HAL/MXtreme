@@ -1,0 +1,10 @@
+# MXtreme configuration.
+#
+# `root` is the package-managed data store: where preprocessing writes its outputs
+# (cleaned .npz files) and later reads them back.
+# Raw .h5 inputs are NOT resolved through here -- you point at those by explicit path.
+#
+# Edit `root` to a location you can write to. 
+
+[data]
+root = "../../../mxt_cait_test_out/"

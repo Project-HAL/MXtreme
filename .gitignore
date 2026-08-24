@@ -220,5 +220,5 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-
-cait_test/
+# mac
+.DS_Store

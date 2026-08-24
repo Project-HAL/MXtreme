@@ -268,6 +268,21 @@ def test_extract_features_populates_frame_columns(make_recording_data):
     assert (clean["size_frac_elec"] > 0).all()
 
 
+def test_extract_features_rejects_unsorted_spike_data(make_recording_data):
+    """Feature windows are found by binary search, which returns a wrong index rather than raising on
+    unsorted input -- so the guard must fire before any burst is featurized."""
+    data = make_recording_data()
+    bursts = BurstDetector(DETECT).detect(Recording(0, data))
+
+    unsorted = make_recording_data(spike_data=data["spike_data"][::-1])
+    with pytest.raises(ValueError, match="sorted by frameno"):
+        bursts.extract_features(Recording(0, unsorted), BurstFeatureParams())
+
+    # ...and sorting it is all that's needed to get through.
+    repaired = make_recording_data(spike_data=utils.sort_spike_data(data["spike_data"][::-1]))
+    bursts.extract_features(Recording(0, repaired), BurstFeatureParams())
+
+
 # --- recording data-access ------------------------------------------------------------------------
 
 

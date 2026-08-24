@@ -125,7 +125,10 @@ class BurstSet:
         # already assumes this; verify once here rather than per burst.
         frameno = recording.spike_data["frameno"]
         if frameno.size > 1 and not np.all(frameno[:-1] <= frameno[1:]):
-            raise ValueError("spike_data must be sorted by frameno for burst feature extraction.")
+            raise ValueError(
+                "spike_data must be sorted by frameno for burst feature extraction. "
+                "Call utils.sort_spike_data on it, or io.repair_spike_order to fix the stored .npz."
+            )
 
         print(f"Extracting features for {len(self.bursts)} burst(s) | {_rec_label(recording)}")
 

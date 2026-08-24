@@ -1,6 +1,7 @@
 '''
 Helper functions.
 '''
+import logging
 import os
 import numpy as np
 import matplotlib.pyplot as plt
@@ -10,6 +11,8 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 from datetime import datetime, timedelta
 from glob import glob
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 def load_data(filepath):
@@ -28,7 +31,47 @@ def load_data(filepath):
     from mxtreme.io import load_preprocessed
 
     return load_preprocessed(filepath)
- 
+
+
+def sort_spike_data(spike_data, warn_threshold=10):
+    """Returns spike data ordered ascending by ``frameno``.
+
+    Downstream burst code locates feature windows with ``np.searchsorted``, which assumes an ascending
+    ``frameno`` and returns a plausible-looking (but wrong) index when that does not hold. Raw MaxWell
+    ``.h5`` spike tables can end with an out-of-order spike from the final buffer flush, so the order is
+    restored rather than trusted.
+
+    The number of *descents* (positions where a spike is followed by an earlier one) tells the two
+    failure modes apart: a handful means an isolated write-order artefact, while a large count means the
+    table is structurally misordered and its bursts deserve a look before being trusted. Small counts are
+    logged at INFO, larger ones at WARNING.
+
+    Args:
+        spike_data (numpy.ndarray): structured spike array with a ``frameno`` field.
+        warn_threshold (int): descent count above which the repair is logged at WARNING. Defaults to 10.
+
+    Returns:
+        numpy.ndarray: the spikes sorted ascending by ``frameno``, or ``spike_data`` itself when it is
+                       already ordered. Spikes sharing a frame keep their recorded order.
+    """
+    frameno = spike_data["frameno"]
+    if frameno.size < 2:
+        return spike_data
+
+    # Counting descents costs no more than testing for any, and is what grades the severity below.
+    n_descents = int(np.count_nonzero(frameno[:-1] > frameno[1:]))
+    if n_descents == 0:
+        return spike_data
+
+    log = logger.warning if n_descents > warn_threshold else logger.info
+    log("spike_data out of order: %s descent(s) in %s spikes; sorting by frameno",
+        f"{n_descents:,}", f"{frameno.size:,}")
+
+    # argsort on the field, not np.sort(order="frameno"): the latter breaks frameno ties using the
+    # remaining dtype fields (channel, amplitude), reshuffling spikes recorded in the same frame.
+    return spike_data[np.argsort(frameno, kind="stable")]
+
+
 def get_well_id_from_raw(path_to_raw, well_no=0, recording_no=0):
     with h5py.File(path_to_raw, 'r') as f:
         h5_object = f['wells']['well{0:0>3}'.format(well_no)]['rec{0:0>4}'.format(recording_no)]

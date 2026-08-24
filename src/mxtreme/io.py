@@ -236,6 +236,52 @@ def rebuild_registry(config, *, registry_path: str | Path | None = None) -> int:
     return n
 
 
+def repair_spike_order(config, *, dry_run: bool = False) -> list[Path]:
+    """Re-save any stored ``.npz`` whose ``spike_data`` is not ascending by ``frameno``.
+
+    A one-time migration for recordings preprocessed before :func:`mxtreme.extract.extract` began
+    sorting the raw spike table (see :func:`mxtreme.utils.sort_spike_data` for why the order matters).
+    Files already in order are left untouched, so re-running this is cheap in writes -- though never in
+    reads, since each spike array must be decompressed to check it. Expect minutes on a large store.
+
+    Only ``spike_data`` is reordered; every other saved field is written back verbatim, and the registry
+    is deliberately left alone (this changes the order of rows, not the recording's provenance). Each
+    file is rewritten via a temporary file in the same directory and then moved into place, so an
+    interrupted run cannot leave a truncated recording behind.
+
+    :param config: The :class:`~mxtreme.config.Config` describing the managed store.
+    :param dry_run: If ``True``, report the files that need repair without writing anything.
+    :type dry_run: bool
+    :returns: Paths of the recordings repaired (or, under ``dry_run``, that would be).
+    :rtype: list[Path]
+    """
+    from mxtreme.utils import sort_spike_data  # local: utils pulls matplotlib at import
+
+    repaired: list[Path] = []
+    n_scanned = 0
+    for npz_path in sorted(config.preprocessed_dir.glob("*/*/*/DIV*.npz")):
+        n_scanned += 1
+        contents = dict(np.load(npz_path, allow_pickle=True))
+        spike_data = contents["spike_data"]
+        ordered = sort_spike_data(spike_data)
+        if ordered is spike_data:  # already ascending -- sort_spike_data returns the input unchanged
+            continue
+
+        repaired.append(npz_path)
+        if dry_run:
+            continue
+
+        contents["spike_data"] = ordered
+        tmp_path = npz_path.with_name(npz_path.name + ".tmp")
+        with open(tmp_path, "wb") as fh:  # a file object, so savez does not re-append ".npz"
+            np.savez_compressed(fh, **contents)
+        os.replace(tmp_path, npz_path)
+
+    verb = "would repair" if dry_run else "repaired"
+    print(f"Spike order: scanned {n_scanned} recording(s), {verb} {len(repaired)}")
+    return repaired
+
+
 # --- burst outputs ------------------------------------------------------------------------------
 
 

@@ -14,8 +14,9 @@ from mxtreme.identity import CultureID, CultureSelector
 from mxtreme.recording import Recording
 from mxtreme.bursting import BurstDetector
 from mxtreme.params import BurstDetectParams, BurstFeatureParams
-from mxtreme.paths import CulturePaths, resolve_paths
+from mxtreme.paths import CulturePaths, resolve_paths, resolve_recordings
 from mxtreme.analysis import activity, performance, stimulation, generate_report
+from mxtreme.analysis._paths import _summary_paths
 
 # Detection params tuned for the small synthetic fixture (see test_bursting.py).
 DETECT = BurstDetectParams(n=50, noise_thresh=0.02, burst_thresh=0.15, min_dist_bins=10)
@@ -43,14 +44,18 @@ def _add_recording(config: Config, data: dict, well_no: int) -> None:
 
 @pytest.fixture
 def store(tmp_path, make_recording_data):
-    """A managed store with two cultures: A (exp 'expA', 2 DIVs) and B (exp 'expB', 1 DIV)."""
+    """A managed store with two cultures: A (exp 'expA', 2 DIVs) and B (exp 'expB', 1 DIV).
+
+    Culture A is right-trained ([2, 0]); culture B carries no condition pair, so it has no trained side.
+    """
     config = Config(data_root=tmp_path)
 
     # Culture A: same chip/well across two DIVs.
     for seed, div in ((1, 7), (2, 8)):
         _add_recording(
             config,
-            make_recording_data(seed=seed, exp_id="expA", chip="C0001", well=0, DIV=div),
+            make_recording_data(seed=seed, exp_id="expA", chip="C0001", well=0, DIV=div,
+                                exp_condition=np.array([2, 0])),
             well_no=0,
         )
     # Culture B: a different experiment/chip (cross-experiment group case).
@@ -72,6 +77,43 @@ def test_resolve_single_culture_all_divs(store):
     assert sorted(cpath.recordings) == [7, 8]
     assert cpath.recordings[7].npz.exists()
     assert cpath.recordings[7].burst_stats.exists()
+
+
+def test_resolve_recordings_flattens_a_selection(store):
+    config, cid_a, cid_b = store
+    recs = resolve_recordings(CultureSelector(cultures=[cid_a, cid_b]), config)
+
+    # Culture A has 2 DIVs, culture B has 1; ordered by exp_id, chip, well, then DIV.
+    assert len(recs) == 3
+    assert [r.recording_id.div for r in recs] == [7, 8, 7]
+    assert [r.recording_id.exp_id for r in recs] == ["expA", "expA", "expB"]
+    assert recs.npz == [r.npz for r in recs]
+    assert all(p.exists() for p in recs.npz)
+    assert all(p.exists() for p in recs.burst_stats)
+    assert recs[0] is recs.recordings[0]
+
+
+def test_resolve_recordings_accepts_any_target(store):
+    config, cid_a, _ = store
+    assert len(resolve_recordings(cid_a, config)) == 2          # CultureID -> all DIVs
+    rid = resolve_recordings(cid_a, config).ids[0]
+    assert len(resolve_recordings(rid, config)) == 1            # RecordingID -> just that one
+
+
+def test_resolve_recordings_to_frame(store):
+    config, cid_a, cid_b = store
+    df = resolve_recordings(CultureSelector(cultures=[cid_a, cid_b]), config).to_frame()
+
+    assert list(df.columns) == ["exp_id", "chip", "well", "div", "npz", "burst_stats"]
+    assert len(df) == 3
+    assert df["div"].tolist() == [7, 8, 7]
+    assert set(df["exp_id"]) == {"expA", "expB"}
+
+
+def test_resolve_recordings_respects_div_filter(store):
+    config, cid_a, cid_b = store
+    recs = resolve_recordings(CultureSelector(cultures=[cid_a, cid_b], divs=[8]), config)
+    assert [r.recording_id.div for r in recs] == [8]
 
 
 def test_resolve_group_across_experiments(store):
@@ -128,9 +170,76 @@ def test_performance_summary_default_objective(store):
     config, cid_a, _ = store
     cpath = resolve_paths(cid_a, config)
     df = performance.performance_summary(cpath, config.analysis_dir, show_plot=False)
-    assert list(df.columns) == ["chip", "well", "div", "phase", "score"]
+    assert list(df.columns) == ["chip", "well", "div", "phase", "condition", "trained_side", "score"]
     scores = df["score"].dropna()
     assert ((scores >= 0) & (scores <= 1)).all()
+    # Culture A is [2, 0]: every row is scored against the right-hand target.
+    assert set(df["trained_side"]) == {"right"}
+    assert df["condition"].tolist() == [[2, 0]] * len(df)
+
+
+@pytest.mark.parametrize("condition, expected", [
+    ([0, 2], "left"),                              # lower number on the left
+    ([1, 2], "left"),
+    ([2, 0], "right"),                             # lower number on the right
+    ([1, 0], "right"),
+    ([2, 1], "right"),
+    ([0, 0], None),                                # no lower number -> untrained control
+    ([2, 2], None),
+    (None, None),                                  # recording predating conditions
+    ({"left_stim": 0, "right_stim": 0}, None),     # legacy dict-shaped condition
+    ([0, 1, 2], None),                             # not a pair
+])
+def test_trained_side_mapping(condition, expected):
+    stored = np.asarray(condition) if condition is not None else None
+    assert performance.trained_side(stored) is expected
+
+
+def _directional_bursts(n_rightward, n_leftward):
+    """Bursts that propagate left-to-right (origin_x < peak_x) and right-to-left, respectively."""
+    rows = [{"origin_x": 0.0, "peak_x": 100.0}] * n_rightward
+    rows += [{"origin_x": 100.0, "peak_x": 0.0}] * n_leftward
+    return pd.DataFrame(rows)
+
+
+def test_default_objective_scores_toward_the_trained_side():
+    """The same bursts score oppositely for a left- and a right-trained culture."""
+    bursts = _directional_bursts(n_rightward=3, n_leftward=1)
+
+    left = performance.default_direction_objective(bursts.assign(trained_side="left"))
+    right = performance.default_direction_objective(bursts.assign(trained_side="right"))
+
+    assert left == 0.75      # 3 of 4 originate left of their peak
+    assert right == 0.25
+
+
+def test_default_objective_without_trained_side_column_is_paradigm_free():
+    # Column absent means the condition is unknown -- keep the historical left-to-right fraction.
+    bursts = _directional_bursts(n_rightward=3, n_leftward=1)
+    assert performance.default_direction_objective(bursts) == 0.75
+
+
+def test_default_objective_with_no_trained_side_is_nan():
+    # Column present and None means the culture is known to have no target: nothing to score.
+    bursts = _directional_bursts(n_rightward=3, n_leftward=1)
+    assert np.isnan(performance.default_direction_objective(bursts.assign(trained_side=None)))
+
+
+def test_performance_summary_recomputes_pre_condition_cache(store):
+    """A cached summary without `trained_side` holds wrong-signed scores and must not be reused."""
+    config, cid_a, _ = store
+    cpath = resolve_paths(cid_a, config)
+    fresh = performance.performance_summary(cpath, config.analysis_dir, show_plot=False)
+
+    # Overwrite the cache with an old-schema one carrying an obviously bogus score.
+    _, csv_path = _summary_paths(cpath, config.analysis_dir, "performance", "performance_summary")
+    stale = fresh[["chip", "well", "div", "phase"]].copy()
+    stale["score"] = -1.0
+    stale.to_csv(csv_path, index=False)
+
+    df = performance.performance_summary(cpath, config.analysis_dir, show_plot=False, use_existing=True)
+    assert "trained_side" in df.columns
+    assert (df["score"] != -1.0).all()
 
 
 def test_performance_summary_custom_objective(store):

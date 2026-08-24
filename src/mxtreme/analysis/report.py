@@ -227,7 +227,8 @@ def _section_stimulation(pdf, cultures, analysis_dir):
 
 
 def _section_performance(pdf, cultures, analysis_dir, objective_fn):
-    kwargs = {} if objective_fn is None else {"objective_fn": objective_fn}
+    kwargs = {} if objective_fn is None else {"objective_fn": objective_fn}    
+
     for cpath in cultures:
         df = performance.performance_summary(
             cpath, analysis_dir, show_plot=False, save_plot=False, **kwargs

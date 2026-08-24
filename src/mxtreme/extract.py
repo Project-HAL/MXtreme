@@ -50,6 +50,8 @@ def extract(filepath: str, metadata: dict | None = None, wells: list | int | Non
     """
     import h5py  # local import keeps `import mxtreme.extract` cheap for callers that only need types
 
+    from mxtreme.utils import sort_spike_data  # local for the same reason (utils pulls matplotlib)
+
     if not os.path.isfile(filepath):
         raise FileNotFoundError(f"File does not exist: {filepath}")
 
@@ -121,8 +123,12 @@ def extract(filepath: str, metadata: dict | None = None, wells: list | int | Non
             well_data["DIV"] = h5_metadata["DIV"]
             well_data["path_to_h5"] = filepath
 
-            # Spiking data, sample rate, channel mapping, least significant bit
-            well_data["data"] = f[f"/recordings/rec0000/well00{well}/spikes"][:]  # [frameno, channel, amplitude]
+            # Spiking data, sample rate, channel mapping, least significant bit.
+            # The spike table can end with an out-of-order spike from the recording's final buffer
+            # flush; burst feature windows are found by binary search, so order is restored at the
+            # source. Every cleaning step downstream is order-preserving, so this holds to the .npz.
+            spikes = f[f"/recordings/rec0000/well00{well}/spikes"][:]  # [frameno, channel, amplitude]
+            well_data["data"] = sort_spike_data(spikes)
 
             samp_rate = np.array([f[f"/recordings/rec0000/well00{well}/settings/sampling"][:][0]])
             if isinstance(samp_rate, (list, np.ndarray)):

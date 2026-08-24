@@ -182,3 +182,67 @@ def test_rebuild_registry_preserves_rows_without_npz(make_well, tmp_path):
     io.rebuild_registry(config)
     df = pd.read_csv(config.registry_path)
     assert set(df["exp_id"]) == {"testExp", "gone"}
+
+
+# --- spike-order repair -------------------------------------------------------------------------
+
+
+def _saved_store(make_well, tmp_path):
+    """Save one fully-featured well into a managed store and return ``(config, path)``."""
+    from mxtreme.config import Config
+
+    config = Config(data_root=tmp_path)
+    well = _clean_well(make_well)
+    well["phase_spec"] = {"starts": {"pre": 0, "post": 20}, "end": 40}
+    well["step_log"] = [{"step": "bin_spikes", "n_before": 4, "n_after": 4, "removed": 0, "seconds": 0.0}]
+    path = io.save_preprocessed(config.preprocessed_dir, well, registry_path=config.registry_path)
+    return config, path
+
+
+def _scramble_stored_spikes(path):
+    """Rewrite a saved npz with its spike rows reversed (all other fields untouched)."""
+    contents = dict(np.load(path, allow_pickle=True))
+    contents["spike_data"] = contents["spike_data"][::-1]
+    with open(path, "wb") as fh:
+        np.savez_compressed(fh, **contents)
+
+
+def test_repair_spike_order_sorts_and_preserves_other_fields(make_well, tmp_path):
+    config, path = _saved_store(make_well, tmp_path)
+    before = io.load_preprocessed(path)
+    _scramble_stored_spikes(path)
+
+    assert io.repair_spike_order(config) == [path]
+
+    after = io.load_preprocessed(path)
+    frameno = after["spike_data"]["frameno"]
+    assert np.all(frameno[:-1] <= frameno[1:])
+    np.testing.assert_array_equal(np.sort(after["spike_data"]["channel"]),
+                                  np.sort(before["spike_data"]["channel"]))
+    # Everything except the row order must survive the rewrite untouched.
+    np.testing.assert_array_equal(after["channelmap"], before["channelmap"])
+    np.testing.assert_array_equal(after["spike_bin"], before["spike_bin"])
+    assert after["preprocessing_params"].item() == before["preprocessing_params"].item()
+    assert after["phase_spec"].item() == before["phase_spec"].item()
+    assert list(after["step_log"]) == list(before["step_log"])
+    assert str(after["exp_id"]) == str(before["exp_id"])
+
+
+def test_repair_spike_order_is_idempotent(make_well, tmp_path):
+    config, path = _saved_store(make_well, tmp_path)
+    _scramble_stored_spikes(path)
+
+    io.repair_spike_order(config)
+    assert io.repair_spike_order(config) == []
+
+
+def test_repair_spike_order_dry_run_writes_nothing(make_well, tmp_path):
+    config, path = _saved_store(make_well, tmp_path)
+    _scramble_stored_spikes(path)
+    mtime = path.stat().st_mtime_ns
+
+    assert io.repair_spike_order(config, dry_run=True) == [path]
+    assert path.stat().st_mtime_ns == mtime
+
+    frameno = io.load_preprocessed(path)["spike_data"]["frameno"]
+    assert not np.all(frameno[:-1] <= frameno[1:])  # still unsorted -- nothing was written
