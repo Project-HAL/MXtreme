@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 
 from mxtreme import io
-from mxtreme import constants
+from mxtreme.params import ActivityParams
 from mxtreme.recording import Recording
 from mxtreme.utils import frame_to_sec
 from mxtreme.analysis._paths import _summary_paths, load_population_summaries
@@ -140,8 +140,10 @@ def _plot_burst_activity_summary(df: pd.DataFrame, cid: str,
         dpi=150,
     )
 
-def channel_activity_summary(cpath, analysis_dir: Path, use_existing=True, show_plot=True, save_plot=False):
+def channel_activity_summary(cpath, analysis_dir: Path, use_existing=True, show_plot=True, save_plot=False,
+                             params: ActivityParams | None = None):
 
+    params = params or ActivityParams()
     cid = cpath.culture_id
     rows = []
 
@@ -167,7 +169,7 @@ def channel_activity_summary(cpath, analysis_dir: Path, use_existing=True, show_
 
                 # --- Per-channel metrics: {channel: value} dicts ---------- #
                 channel_firing_rates = firing_rate_chan(phase_spike_data, rec.samp_rate)
-                median_channel_isis  = ISI_chan(phase_spike_data, rec.samp_rate)
+                median_channel_isis  = ISI_chan(phase_spike_data, rec.samp_rate, params)
                 mean_spike_amps      = mean_spike_amplitude_chan(phase_spike_data, rec.samp_rate)
 
                 # --- Aggregate over channels -------------------------------- #
@@ -232,16 +234,24 @@ def firing_rate_chan(spike_data, samp_rate):
 
     return chan_fr
 
-def ISI_chan(spike_data, samp_rate):
+def ISI_chan(spike_data, samp_rate, params: ActivityParams | None = None):
+    """Median inter-spike interval per channel, in milliseconds.
+
+    :param spike_data: Structured spike array with ``channel`` and ``frameno`` fields.
+    :param samp_rate: Sampling rate in Hz.
+    :param params: Activity settings; defaults to :class:`~mxtreme.params.ActivityParams`.
+    :returns: ``{channel: median_isi_ms}``, omitting channels with no interval below the threshold.
+    """
+    params = params or ActivityParams()
 
     spike_df = pd.DataFrame(spike_data)
     grouped_by_chan = spike_df.groupby('channel')
 
-    # filtering out ISIs > 200 ms - replicating MaxLab ISI analysis
+    # filtering out long ISIs - replicating MaxLab ISI analysis
     median_chan_isi = {}
     for channel, group_df in grouped_by_chan:
         ISI_ms = np.diff(group_df['frameno'])/samp_rate*1000
-        ISI_filtered = ISI_ms[ISI_ms<constants.ISI_threshold]
+        ISI_filtered = ISI_ms[ISI_ms<params.isi_threshold_ms]
         if len(ISI_filtered) > 0:
             median_chan_isi[channel]=np.median(ISI_filtered)
 
@@ -296,24 +306,21 @@ def plot_population_burst_summary(
     phase: str = None,
     savename: str = None,
 ):
-    """
-    Aggregate per-culture burst-activity CSVs and plot population-level
-    measures (mean ± SEM across cultures) vs DIV, with one line per phase.
+    """Aggregate per-culture burst-activity CSVs into a population-level plot.
 
-    Parameters
-    ----------
-    sel_paths   : dict  {exp_id: ExperimentPath}  — same structure used elsewhere
-    analysis_dir : Path  — root summary directory; CSVs are expected under
-                          <analysis_dir>/activity/<exp_id>/<chip>/well<well>/
-    savename    : str | None — filename for the saved figure (saved into
-                          <analysis_dir>/activity/).  If None the figure is
-                          shown but not saved.
+    Plots mean ± SEM across cultures vs DIV, one line per phase.
 
-    Notes
-    -----
-    * If sel_paths contains more than one exp_id the cultures are pooled and
-      a note is added to the figure title.  If you later want per-experiment
-      panels, split sel_paths before calling this function.
+    :param sel_paths: ``{exp_id: ExperimentPaths}``, as returned by
+        :func:`mxtreme.paths.resolve_paths` for a :class:`~mxtreme.identity.CultureSelector`.
+    :param analysis_dir: Root summary directory (typically ``config.analysis_dir``); CSVs are read
+        from ``<analysis_dir>/activity/<exp_id>/<chip>/well<well>/``.
+    :param phase: If given, filter to this phase only; ``None`` plots all phases as separate lines.
+    :param savename: Filename for the saved figure, written into ``<analysis_dir>/activity/``. If
+        ``None`` the figure is shown but not saved.
+
+    .. note::
+       If ``sel_paths`` spans more than one ``exp_id`` the cultures are pooled and a note is added to
+       the figure title. For per-experiment panels, split ``sel_paths`` before calling.
     """
 
     pop_df = load_population_summaries(
@@ -355,26 +362,21 @@ def plot_population_channel_activity(sel_paths,
                                     phase: str = None,
                                     savename: str = None,
                                     ):
-    """
-    Aggregate per-culture electrode-activity CSVs and plot population-level
-    measures (mean ± SEM across cultures) vs DIV, with one line per phase.
+    """Aggregate per-culture electrode-activity CSVs into a population-level plot.
 
-    Parameters
-    ----------
-    sel_paths   : dict  {exp_id: ExperimentPath}
-    analysis_dir : Path  — root summary directory; CSVs are expected under
-                          <analysis_dir>/activity/<exp_id>/<chip>/well<well>/
-    phase       : str | None — if provided, filter to this phase only;
-                          pass None to plot all phases as separate lines.
-    savename    : str | None — filename for the saved figure (saved into
-                          <analysis_dir>/activity/).  If None the figure is
-                          shown but not saved.
+    Plots mean ± SEM across cultures vs DIV, one line per phase.
 
-    Notes
-    -----
-    * If sel_paths contains more than one exp_id the cultures are pooled and
-      a note is added to the figure title.  If you later want per-experiment
-      panels, split sel_paths before calling this function.
+    :param sel_paths: ``{exp_id: ExperimentPaths}``, as returned by
+        :func:`mxtreme.paths.resolve_paths` for a :class:`~mxtreme.identity.CultureSelector`.
+    :param analysis_dir: Root summary directory (typically ``config.analysis_dir``); CSVs are read
+        from ``<analysis_dir>/activity/<exp_id>/<chip>/well<well>/``.
+    :param phase: If given, filter to this phase only; ``None`` plots all phases as separate lines.
+    :param savename: Filename for the saved figure, written into ``<analysis_dir>/activity/``. If
+        ``None`` the figure is shown but not saved.
+
+    .. note::
+       If ``sel_paths`` spans more than one ``exp_id`` the cultures are pooled and a note is added to
+       the figure title. For per-experiment panels, split ``sel_paths`` before calling.
     """
 
     pop_df = load_population_summaries(
