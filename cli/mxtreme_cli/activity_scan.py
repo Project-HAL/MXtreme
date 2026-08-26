@@ -190,7 +190,15 @@ def _run_scan(params: ActivityScanParams, seed: int | None) -> scan.ActivityScan
         # the interrupt is already on disk and readable.
         ui.error("\nInterrupted. The file was finalized; recordings completed so far are saved.")
         return None
-    except (RuntimeError, ValueError, OSError) as exc:
+    except RuntimeError as exc:
+        # The device check fails this way; it is a plain message, not a defect worth a type name.
+        if str(exc).startswith("No MaxWell device"):
+            ui.error(str(exc))
+            ui.hint("Nothing was recorded. Fix that and start the scan again.")
+        else:
+            ui.error(f"Scan failed: RuntimeError: {exc}")
+        return None
+    except (ValueError, OSError) as exc:
         ui.error(f"Scan failed: {type(exc).__name__}: {exc}")
         return None
 

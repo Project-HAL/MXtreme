@@ -47,6 +47,11 @@ MAX_WELLS = 6
 #: What the MaxLab server's ``wellplate_query_version`` reply means.
 SYSTEM_TYPES = {0: "MaxOne", 1: "MaxTwo"}
 
+#: Shared opening for every "there is nothing to scan with" failure.
+_NO_DEVICE = (
+    "No MaxWell device detected. Check that the chip is plugged in and MaxLab Live is running"
+)
+
 ProgressFn = Callable[[str], None]
 
 
@@ -309,14 +314,23 @@ def _connected_device(mx) -> str:
     :raises RuntimeError: If the server cannot be reached or does not name a system.
     :returns: The device name, e.g. ``"MaxOne"``.
     """
+    reply = None
     try:
         with mx.comm.api_context() as api:
-            system_type = int(api.send("wellplate_query_version"))
+            reply = api.send("wellplate_query_version")
     except Exception as exc:
-        raise RuntimeError(
-            f"No MaxWell device detected ({type(exc).__name__}: {exc}). Check that the chip is "
-            "connected and MaxLab Live is running."
-        ) from exc
+        raise RuntimeError(f"{_NO_DEVICE} ({type(exc).__name__}: {exc})") from exc
+
+    # A failed query does not necessarily raise: maxlab's api_context prints its own complaint
+    # ("Connection refused / Please check, whether the server is running") and returns normally,
+    # leaving the reply unset. So no reply is the usual "nothing answered" signal, not an exception.
+    if reply is None or not str(reply).strip():
+        raise RuntimeError(f"{_NO_DEVICE} (the server did not answer; see the message above)")
+
+    try:
+        system_type = int(str(reply).strip())
+    except ValueError:
+        raise RuntimeError(f"{_NO_DEVICE} (unrecognised reply from the server: {reply!r})") from None
 
     return SYSTEM_TYPES.get(system_type, f"unrecognised system type {system_type}")
 
