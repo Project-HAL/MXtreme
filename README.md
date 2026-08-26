@@ -59,7 +59,7 @@ uv run ruff check .
 
 > **Note:** don't run a bare `python`/`pip` — that hits your system interpreter, not the project env. Always go through `uv run` (or activate `.venv` manually if you prefer).
 
-## Examples and notebooks
+## Examples, notebooks, and docs
 
 Example scripts and notebooks live in `examples/` at the repository root. Because MXtreme is installed editable, anything there can `import mxtreme` regardless of where it sits, and it resolves to your live `src/` tree. The `examples/` folder is outside `src/`, so it is never packaged into the published wheel.
 
@@ -88,6 +88,18 @@ When iterating on the library from inside a notebook, enable autoreload so `src/
 %load_ext autoreload
 %autoreload 2
 ```
+
+Building documentation locally:
+
+```python
+uv sync --group docs
+uv run sphinx-build -b html docs docs/_build/html
+```
+Then serve them:
+```python
+uv run python -m http.server -d docs/_build/html 8000
+```
+Open (http://localhost:8000/) to view.
 
 ## Contributing
 
