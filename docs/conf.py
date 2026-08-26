@@ -35,6 +35,11 @@ autodoc_default_options = {
 }
 autodoc_typehints = "description"
 
+# mxtreme.scans.mx_setup imports MaxWell's proprietary `maxlab`, which ships with MaxLab Live and is
+# not installable from any index -- so it is absent on CI and on any machine that isn't the rig.
+# Mocking it lets autodoc introspect the module's docstrings without importing the real library.
+autodoc_mock_imports = ["maxlab"]
+
 # The frozen dataclasses in params.py/identity.py/config.py carry their field documentation in the
 # class docstring; without this, autodoc also emits the generated __init__ signature docstring.
 autoclass_content = "class"

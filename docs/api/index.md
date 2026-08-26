@@ -11,6 +11,7 @@ preprocessing
 bursting
 analysis
 plotting
+scans
 ```
 
 ## Not documented here
