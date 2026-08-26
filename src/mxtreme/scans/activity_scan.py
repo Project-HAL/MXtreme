@@ -44,6 +44,9 @@ MAX_ROUTED_ELECTRODES = 1020
 #: Wells on a MaxTwo plate; MaxOne only has well 0.
 MAX_WELLS = 6
 
+#: What the MaxLab server's ``wellplate_query_version`` reply means.
+SYSTEM_TYPES = {0: "MaxOne", 1: "MaxTwo"}
+
 ProgressFn = Callable[[str], None]
 
 
@@ -296,6 +299,28 @@ def _require_maxlab():
     return mx
 
 
+def _connected_device(mx) -> str:
+    """Ask the MaxLab server which system it is attached to, and fail if nothing answers.
+
+    Cheap insurance against starting a scan with nothing plugged in: without this, a missing device
+    is only discovered inside ``mx.initialize()``, by which point the ``.h5`` has been created.
+
+    :param mx: The imported ``maxlab`` module.
+    :raises RuntimeError: If the server cannot be reached or does not name a system.
+    :returns: The device name, e.g. ``"MaxOne"``.
+    """
+    try:
+        with mx.comm.api_context() as api:
+            system_type = int(api.send("wellplate_query_version"))
+    except Exception as exc:
+        raise RuntimeError(
+            f"No MaxWell device detected ({type(exc).__name__}: {exc}). Check that the chip is "
+            "connected and MaxLab Live is running."
+        ) from exc
+
+    return SYSTEM_TYPES.get(system_type, f"unrecognised system type {system_type}")
+
+
 def run_activity_scan(
     params: ActivityScanParams,
     seed: int | None = None,
@@ -318,7 +343,7 @@ def run_activity_scan(
         to route it into a UI, or ``lambda _: None`` to silence it.
     :raises ModuleNotFoundError: If ``maxlab`` is not installed (i.e. this is not the rig).
     :raises ValueError: If the parameters are not runnable; see :meth:`ActivityScanParams.validate`.
-    :raises RuntimeError: If routing fails for any well.
+    :raises RuntimeError: If no device is connected, or if routing fails for any well.
     :returns: An :class:`ActivityScanResult` naming the file and the electrodes each scan recorded.
     """
     mx = _require_maxlab()
@@ -328,6 +353,8 @@ def run_activity_scan(
 
     on_progress("=== Activity scan ===")
     on_progress(describe(params))
+
+    on_progress(f"Device: {_connected_device(mx)}")
 
     Path(params.save_path).mkdir(parents=True, exist_ok=True)
 
