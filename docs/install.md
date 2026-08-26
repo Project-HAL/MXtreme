@@ -75,10 +75,10 @@ picked up without a kernel restart:
 %autoreload 2
 ```
 
-## Rig machines (`mxtreme.scans`)
+## Maxlab Live Dependency (`mxtreme.scans` only)
 
 {mod}`mxtreme.scans.mx_setup` drives the array — wells, sequences, stimulation units — through
-MaxWell's `maxlab` Python API.
+MaxWell's `maxlab` Python API for activity and network scans.
 
 :::{warning}
 `maxlab` **cannot be installed with pip.** It is proprietary and is not published to PyPI or any
@@ -88,14 +88,6 @@ sure its Python package is on your `PYTHONPATH`.
 
 Everything else in `mxtreme.scans` runs anywhere, with nothing beyond the core dependencies:
 
-| Module | Needs `maxlab`? | What it does |
-|---|---|---|
-| {mod}`~mxtreme.scans.electrode_selection` | No | Pick recording electrodes from an activity scan |
-| {mod}`~mxtreme.scans.mx_config` | No | Read and write MaxWell `.cfg` electrode files |
-| {mod}`~mxtreme.scans.mx_setup` | **Yes** | Configure and run experiments on the array |
-
-So choosing electrodes for a network scan is ordinary laptop work — a plain `pip install mxtreme` is
-enough. Importing `mx_setup` without `maxlab` raises an error saying exactly this.
 
 ## Building these docs locally
 

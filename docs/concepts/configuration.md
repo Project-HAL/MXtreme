@@ -1,13 +1,11 @@
 # Configuration
 
-MXtreme needs exactly one piece of local information: **where to put its outputs.** Everything else
-is derived. There is no lab-specific default anywhere in the library — a path is never silently
-guessed, so the same code runs unchanged on a laptop, a lab workstation, and a CI runner.
+MXtreme needs one piece of local information: **where to store its outputs.** 
 
 ## The managed store
 
 The *managed store* is a single directory tree the package owns. Every output goes there, and every
-later stage reads back from there:
+later stage reads back from there. The structure is as follows:
 
 ```
 <data_root>/
@@ -21,9 +19,7 @@ later stage reads back from there:
 └── registry.csv                   index of everything that has been processed
 ```
 
-Raw `.h5` inputs are **not** resolved through the store. You point at those by explicit path, and
-MXtreme never writes near them — which means the store can live on fast local disk while the raw
-recordings stay on a network share.
+Raw `.h5` inputs are **not** resolved through the store. You point at those by explicit path.
 
 ## `mxtreme.toml`
 
@@ -61,16 +57,7 @@ subtree:
 | {attr}`~mxtreme.config.Config.analysis_dir` | `data_root/analysis` |
 | {attr}`~mxtreme.config.Config.registry_path` | `data_root/registry.csv` |
 
-These are what you hand to the functions that write:
-
-```python
-paths = pipeline.run(data, datastore=config.preprocessed_dir)
-bursts = detector.detect(rec, burst_data_dir=config.burst_data_dir)
-```
-
-Every writer takes an explicit directory rather than reaching for the config itself. That keeps the
-I/O layer decoupled from configuration and makes the functions trivially testable against a
-`tmp_path`.
+These are what you hand to the functions that write.
 
 ## Naming a recording
 
@@ -125,8 +112,7 @@ machine. Move the store, edit one line of TOML, and every path follows.
 ## The registry
 
 `registry.csv` indexes what has been processed. It is upserted on **every** `.npz` write by
-{func}`mxtreme.io.register`, called from {func}`~mxtreme.io.save_preprocessed` — not as a separate
-step you have to remember, which is why its timestamps can be trusted.
+{func}`mxtreme.io.register`, called from {func}`~mxtreme.io.save_preprocessed`.
 
 If it is deleted or drifts out of sync with the files on disk,
 {func}`mxtreme.io.rebuild_registry` reconstructs it by scanning the store and returns the number of

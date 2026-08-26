@@ -1,12 +1,18 @@
-# Quickstart
+# Quickstart 
 
-One pass from a raw Maxwell `.h5` to a PDF report. Each step writes to the managed store, so you can
+## Scans 
+
+TODO
+
+## Analaysis 
+
+Raw `.h5` file(s) to a PDF report. Each step writes to the managed store, so you can
 stop after any of them and pick up later without recomputing.
 
 Before starting, create an `mxtreme.toml` pointing at a directory you can write to — see
 [Configuration](concepts/configuration.md).
 
-## 1. Point at the managed store
+### 1. Point at the managed store
 
 ```python
 from mxtreme.config import Config
@@ -15,7 +21,7 @@ config = Config.from_toml("mxtreme.toml")
 print("managed store:", config.data_root.resolve())
 ```
 
-## 2. Extract a raw recording
+### 2. Extract a raw recording
 
 ```python
 from mxtreme import extract
@@ -34,12 +40,14 @@ data = extract.extract(
 )
 ```
 
-A caller-supplied `metadata` dict is merged *over* the embedded blob per-key, so you can override or
-fill in individual fields without restating all of them.
+A user-supplied `metadata` dict is merged over the embedded metadata, so you can override or
+fill in individual, optional fields without restating all of them.
 
-## 3. Build and run a cleaning pipeline
+See {func}`~mxtreme.extact.extract` for the metadata structure. 
 
-A {class}`~mxtreme.pipeline.Pipeline` is an ordered list of step functions. Pass a bare function to
+### 3. Build and run a cleaning pipeline
+
+A {class}`~mxtreme.pipeline.Pipeline` is an ordered list of functions. Pass a bare function to
 accept its defaults, or wrap it in {func}`functools.partial` to change a parameter:
 
 ```python
@@ -63,13 +71,13 @@ paths = pipeline.run(data, datastore=config.preprocessed_dir)
 ```
 
 {meth}`~mxtreme.pipeline.Pipeline.run` transforms and saves **one well at a time**, so at most one
-well's `spike_bin` is in memory at once — this matters on long multi-well recordings. Wells left with
-no spikes are skipped rather than saved. Every saved well is recorded in `registry.csv` automatically.
+well's `spike_bin` is in memory at once, important for long multi-well recordings. Wells left with
+no spikes are skipped rather than saved. Every saved well is recorded and time-stamped in `registry.csv` automatically.
 
-Each parameterised step stamps the values it used into `well['preprocessing_params']`, so the saved
+Each parameterized step stamps the values it used into `well['preprocessing_params']`, so the saved
 `.npz` carries a record of exactly how it was processed.
 
-## 4. Load a recording
+### 4. Load a recording
 
 ```python
 from mxtreme import io
@@ -79,33 +87,21 @@ rec = Recording(0, io.load_preprocessed(paths[0]))
 print(rec.exp_id, rec.chip, rec.well, rec.DIV)
 ```
 
-With no phase information, `rec` has a single `"full"` phase. For a phased experiment, name the
-maxlab event tags that mark the boundaries:
+### 5. Detect bursts
 
 ```python
-rec = Recording(
-    0, io.load_preprocessed(paths[0]),
-    phase_tags={"pre": "pre_recording_start",
-                "train": "closed_loop_start",
-                "post": "post_recording_start"},
-    end_tag="end_experiment",
-)
-```
-
-Better still, supply that spec once at extraction time under the `Phases` metadata key and it rides
-along inside every `.npz` — every later `Recording` picks it up with no arguments. See
-[Data flow](concepts/data-flow.md#phases-ride-along-with-the-data).
-
-## 5. Detect bursts
-
-```python
+from mxtreme import io
 from mxtreme.bursting import BurstDetector
 from mxtreme.params import BurstDetectParams, BurstFeatureParams
 
 bursts = BurstDetector(BurstDetectParams()).detect(rec, burst_data_dir=config.burst_data_dir)
+
 bursts.extract_features(rec, BurstFeatureParams(), burst_data_dir=config.burst_data_dir)
 
-df = bursts.to_dataframe()
+burst_df = bursts.to_dataframe() # Veiw burst data as Pandas dataframe
+
+csv_path = io.save_burst_data(bursts, config.burst_data_dir, rec) # Save burst data as csv
+
 ```
 
 Passing `burst_data_dir=` refreshes the per-experiment burst log automatically. Omit it for pure
@@ -115,10 +111,12 @@ The default `"isi_rate"` method composes two stages: ISI-N grouping (Bakkum et a
 candidate burst intervals, then rate thresholding within each group to classify peaks as `"network"`
 or `"mini"`. Use `BurstDetector(params, method="isi_n")` for grouping alone.
 
-## 6. Plot
+### 6. Plot
 
 Every plotting helper takes an optional `ax`, so the same call works standalone or inside a figure
 you're composing:
+
+Visualize recording:
 
 ```python
 import matplotlib.pyplot as plt
@@ -130,16 +128,25 @@ viz.raster(rec.spike_bin, ax=ax_rast)
 plt.tight_layout()
 ```
 
-## 7. Generate a report
+Visualize burst detection:
 
-Once several DIVs of a culture are preprocessed, assemble them into one PDF:
+```python
+fig, (ax_asdr, ax_mea) = plt.subplots(1, 2, figsize=(16, 5))
+viz.plot_bursts_on_asdr(rec, burst_df, ax=ax_asdr, title="ASDR with network bursts") # can pass zoom=(start, stop) as an optional parameter to zoom in on the ASDR plot
+viz.plot_origin_heatmap(rec, burst_df, ax=ax_mea, title="Network-burst origins")
+plt.tight_layout()
+plt.show()
+```
+
+
+### 7. Generate a report over multiple DIVs
 
 ```python
 from mxtreme.identity import CultureID
 from mxtreme.analysis import generate_report
 
 pdf = generate_report(
-    CultureID(exp_id="May2025_Wave", chip="M07459", well="0"),
+    CultureID(exp_id=[EXP_ID], chip=[CHIP_ID], well=[WELL_ID]),
     config,
     sections=("overview", "activity", "bursting"),
 )
@@ -160,4 +167,4 @@ pdf = generate_report(CultureSelector(exp_ids=["May2025_Wave"]), config)
 - [Data flow](concepts/data-flow.md) — what each stage writes and which module owns it.
 - [Configuration](concepts/configuration.md) — the managed store and path resolution.
 - [API reference](api/index.md) — every public function and class.
-- Runnable versions of the above live in `examples/` in the repository.
+- Runnable versions of the above live in `examples/` in the MXtreme repository.
