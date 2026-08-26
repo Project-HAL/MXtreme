@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
+import h5py
 import numpy as np
 
 from mxtreme import device
@@ -281,6 +282,7 @@ def describe(params: ActivityScanParams) -> str:
         f"Array coverage : {params.array_coverage:.2f}x of the available electrodes",
         f"Recording time : {params.estimated_minutes:.1f} min (excluding routing overhead)",
         f"Saving to      : {params.h5_path}",
+        "                 (MaxLab appends _1, _2 ... if that name is already taken)",
     ]
     return "\n".join(lines)
 
@@ -302,6 +304,109 @@ def _require_maxlab():
             "electrodes from one (mxtreme.scans.electrode_selection) do not need maxlab."
         ) from exc
     return mx
+
+
+#: Where MaxLab's own Activity Scan assay records the length of each recording, and where
+#: :func:`mxtreme.scans.electrode_selection.load_activity_scan` looks for it.
+RECORD_TIME_PATH = "assay/inputs/record_time"
+
+
+def has_record_time(h5_path: str | Path) -> bool:
+    """Whether a scan file carries the recording length electrode selection needs.
+
+    :param h5_path: Path to the ``.h5``.
+    """
+    with h5py.File(str(h5_path), "r") as f:
+        return RECORD_TIME_PATH in f
+
+
+def ensure_record_time(h5_path: str | Path, seconds: int | None = None) -> int:
+    """Write ``/assay/inputs/record_time`` into a scan file if it is not already there.
+
+    :func:`mxtreme.scans.electrode_selection.load_activity_scan` reads that dataset to turn spike
+    counts into firing rates. MaxLab writes it for scans run through its own Activity Scan assay, but
+    not for one driven through the ``Saving`` API the way :func:`run_activity_scan` does -- which
+    otherwise leaves the file unreadable by the selection pipeline with::
+
+        KeyError: Unable to open object (object 'record_time' doesn't exist)
+
+    Everything else the pipeline reads (``/wells/wellNNN/recNNNN/...``) is already written by MaxLab,
+    so this one dataset is all that stands between a scan and electrode selection.
+
+    :param h5_path: Path to the ``.h5``. Opened for writing only when the dataset is missing.
+    :param seconds: The recording length to write. When ``None`` it is derived from the recordings'
+        own start/stop timestamps, so an already-recorded file can be repaired without knowing what
+        it was run with.
+    :raises ValueError: If ``seconds`` is not given and the file has no usable timestamps.
+    :returns: The recording length now stored in the file, in seconds.
+    """
+    h5_path = str(h5_path)
+
+    with h5py.File(h5_path, "r") as f:
+        if RECORD_TIME_PATH in f:
+            return int(f[RECORD_TIME_PATH][0])
+        if seconds is None:
+            seconds = _recorded_seconds(f)
+
+    with h5py.File(h5_path, "r+") as f:
+        f.require_group("assay/inputs").create_dataset(
+            "record_time", data=np.array([int(seconds)], dtype=np.int64)
+        )
+
+    return int(seconds)
+
+
+def _recorded_seconds(f: h5py.File) -> int:
+    """Derive one recording's length from the start/stop timestamps MaxLab writes per recording.
+
+    The median is used rather than the first recording's span, so one truncated recording (an
+    interrupted scan) does not skew the value every firing rate is divided by.
+
+    :param f: An open scan file.
+    :raises ValueError: If no recording carries a usable pair of timestamps.
+    :returns: Recording length in whole seconds.
+    """
+    spans = []
+    for well in f.get("wells", {}).values():
+        for recording in well.values():
+            if "start_time" in recording and "stop_time" in recording:
+                # MaxLab stores these as epoch milliseconds.
+                spans.append((int(recording["stop_time"][0]) - int(recording["start_time"][0])) / 1000)
+
+    spans = [s for s in spans if s > 0]
+    if not spans:
+        raise ValueError(
+            "Cannot work out the recording length: the file has no usable start/stop timestamps. "
+            "Pass the length explicitly."
+        )
+
+    return int(round(float(np.median(spans))))
+
+
+def _saved_file(params: ActivityScanParams, started_at: float) -> Path:
+    """Find the file MaxLab actually wrote for this scan.
+
+    ``Saving.start_file`` does not overwrite: asked for a name that already exists, it appends
+    ``_1``, ``_2`` and so on. Taking :attr:`ActivityScanParams.h5_path` on faith would therefore hand
+    the caller a *previous* scan's file -- and the chain into electrode selection would silently
+    analyse the wrong recording.
+
+    :param params: The scan that was just run.
+    :param started_at: ``time.time()`` from just before recording began; files older than this are
+        left-overs from earlier scans.
+    :returns: The newest matching file written during this scan, falling back to the predicted path
+        if nothing matches.
+    """
+    candidates = [
+        path
+        for path in Path(params.save_path).glob(f"{params.file_name}*.h5")
+        # A second of slack: the file is created just before `started_at` is taken.
+        if path.stat().st_mtime >= started_at - 1
+    ]
+    if not candidates:
+        return params.h5_path
+
+    return max(candidates, key=lambda path: path.stat().st_mtime)
 
 
 def _connected_device(mx) -> str:
@@ -444,10 +549,22 @@ def run_activity_scan(
         on_progress(f"File closed. Data saved to: {params.save_path}")
 
     duration = time.time() - scan_start
+
+    # MaxLab may have renamed the file (see _saved_file), so find what it really wrote before
+    # reporting a path or touching it.
+    h5_path = _saved_file(params, scan_start)
+    try:
+        ensure_record_time(h5_path, params.rec_length_sec)
+    except (OSError, ValueError) as exc:
+        on_progress(
+            f"Warning: could not write the recording length into {h5_path.name} ({exc}). "
+            "Electrode selection will need it added before it can read this scan."
+        )
+
     on_progress(f"\nActivity scan complete! ({duration / 60:.1f} min)")
 
     return ActivityScanResult(
-        h5_path=params.h5_path,
+        h5_path=h5_path,
         params=params,
         scan_electrodes=recorded,
         completed_scans=completed,

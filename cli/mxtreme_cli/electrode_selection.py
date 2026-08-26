@@ -18,6 +18,7 @@ matplotlib.use("Agg")  # every figure is written to disk; nothing is ever shown 
 
 import numpy as np  # noqa: E402  -- after the backend is fixed
 
+from mxtreme.scans import activity_scan as scan  # noqa: E402
 from mxtreme.scans import electrode_selection as es  # noqa: E402
 from mxtreme_cli import prompts, ui  # noqa: E402
 from mxtreme_cli.prompts import Param  # noqa: E402
@@ -140,6 +141,44 @@ def screen(h5_path: Path | None = None) -> None:
     prompts.pause()
 
 
+def _ensure_record_time(h5_path: Path) -> bool:
+    """Make sure the file carries the recording length the pipeline divides firing rates by.
+
+    Scans run outside MaxLab's own Activity Scan assay do not get ``/assay/inputs/record_time``, and
+    without it loading fails with ``KeyError: object 'record_time' doesn't exist``. Adding it writes
+    to the user's data file, so ask first -- but derive the value from the recordings' own
+    timestamps, so there is nothing to look up.
+
+    :param h5_path: The scan file.
+    :returns: ``True`` if the file is ready to load.
+    """
+    try:
+        if scan.has_record_time(h5_path):
+            return True
+    except OSError as exc:
+        ui.error(f"Could not read {h5_path.name}: {exc}")
+        return False
+
+    ui.warn(f"{h5_path.name} does not record how long each recording ran.")
+    ui.hint(
+        "MaxLab writes that only for scans run through its own Activity Scan assay. Electrode "
+        "selection needs it to turn spike counts into firing rates; it can be worked out from the "
+        "recordings' start/stop timestamps and added to the file."
+    )
+
+    try:
+        if not prompts.confirm("Add it to the file now?", default=True):
+            ui.warn("Cannot run electrode selection without it.")
+            return False
+        seconds = scan.ensure_record_time(h5_path)
+    except (OSError, ValueError) as exc:
+        ui.error(f"Could not add it: {exc}")
+        return False
+
+    ui.success(f"Recorded length: {seconds} s per recording.")
+    return True
+
+
 def _run(params: SelectionParams) -> None:
     """Drive the selection pipeline and report what it produced."""
     output_dir = Path(params.output_dir).expanduser()
@@ -149,6 +188,9 @@ def _run(params: SelectionParams) -> None:
         # network_selection() draws from the global numpy RNG, so seeding it is what makes a run
         # reproducible.
         np.random.seed(params.seed)
+
+    if not _ensure_record_time(params.h5_path):
+        return
 
     ui.section("Running")
     try:
