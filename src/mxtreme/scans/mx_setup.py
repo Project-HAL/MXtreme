@@ -1,3 +1,7 @@
+# Annotations are deferred so this module imports on the rig's Python: MaxLab Live ships an
+# interpreter older than 3.10, where evaluating `List[int] | str` below raises TypeError.
+from __future__ import annotations
+
 import os
 import datetime
 import re # regular expressions
