@@ -13,10 +13,10 @@ from mxtreme.config import Config
 from mxtreme.identity import CultureID, CultureSelector
 from mxtreme.recording import Recording
 from mxtreme.bursting import BurstDetector
-from mxtreme.params import BurstDetectParams, BurstFeatureParams
+from mxtreme.params import ActivityParams, BurstDetectParams, BurstFeatureParams
 from mxtreme.paths import CulturePaths, resolve_paths, resolve_recordings
 from mxtreme.analysis import activity, performance, stimulation, generate_report
-from mxtreme.analysis._paths import _summary_paths
+from mxtreme.analysis._paths import _summary_paths, load_population_summaries
 
 # Detection params tuned for the small synthetic fixture (see test_bursting.py).
 DETECT = BurstDetectParams(n=50, noise_thresh=0.02, burst_thresh=0.15, min_dist_bins=10)
@@ -262,9 +262,129 @@ def test_generate_report_group_across_experiments(store):
     out = generate_report(
         CultureSelector(cultures=[cid_a, cid_b]),
         config,
-        sections=("overview", "activity", "bursting"),
+        sections=("overview", "activity", "bursting", "cultures"),
     )
     assert out.exists() and out.stat().st_size > 0
+
+
+# --- distributions and per-culture pages -----------------------------------------------------------
+
+
+def test_isi_all_respects_the_isi_threshold(store):
+    config, cid_a, _ = store
+    cpath = resolve_paths(cid_a, config)
+    rec = Recording(0, io.load_preprocessed(cpath.recordings[7].npz))
+
+    # The fixture's tonic background sits ~5000 frames (500 ms) apart, so a tight threshold keeps only
+    # the dense within-burst intervals while a generous one keeps both populations.
+    tight = activity.isi_all(rec.spike_data, rec.samp_rate, ActivityParams(isi_threshold_ms=100))
+    loose = activity.isi_all(rec.spike_data, rec.samp_rate, ActivityParams(isi_threshold_ms=10_000))
+
+    assert len(tight) < len(loose)
+    assert (tight < 100).all()
+
+
+def test_culture_distributions_keys_and_cache(store):
+    config, cid_a, _ = store
+    cpath = resolve_paths(cid_a, config)
+
+    dists = activity.culture_distributions(cpath, config.analysis_dir)
+
+    assert sorted(dists) == [7, 8]
+    for per_div in dists.values():
+        assert set(per_div) == set(activity.DISTRIBUTION_KEYS)
+        for key, values in per_div.items():
+            assert np.isfinite(values).all(), key
+    # Firing rates and burst sizes are per-electrode / per-burst, so they must not be scalars.
+    assert len(dists[7]['fr_hz']) > 1
+
+    # The npz cache round-trips to the same arrays.
+    cached = activity.culture_distributions(cpath, config.analysis_dir)
+    for div, per_div in dists.items():
+        for key, values in per_div.items():
+            assert np.array_equal(cached[div][key], values)
+
+
+def test_population_plot_helpers_render(store):
+    # All three population plots now go through the shared metric grid; this exercises that path
+    # (the report only reaches it for activity/bursting).
+    config, cid_a, cid_b = store
+    sel_paths = resolve_paths(CultureSelector(cultures=[cid_a, cid_b]), config)
+    for cid in (cid_a, cid_b):
+        cpath = resolve_paths(cid, config)
+        activity.channel_activity_summary(cpath, config.analysis_dir, show_plot=False)
+        activity.burst_activity_summary(cpath, config.analysis_dir, show_plot=False)
+        performance.performance_summary(cpath, config.analysis_dir, show_plot=False)
+
+    activity.plot_population_channel_activity(sel_paths, config.analysis_dir,
+                                              savename="channel.png")
+    activity.plot_population_burst_summary(sel_paths, config.analysis_dir, savename="burst.png")
+    performance.plot_population_performance_summary(sel_paths, config.analysis_dir,
+                                                    savename="perf.png")
+
+    assert (config.analysis_dir / "activity" / "channel.png").exists()
+    assert (config.analysis_dir / "activity" / "burst.png").exists()
+    assert (config.analysis_dir / "performance" / "perf.png").exists()
+
+
+def test_pooled_summaries_carry_culture_identity(store):
+    config, cid_a, cid_b = store
+    sel_paths = resolve_paths(CultureSelector(cultures=[cid_a, cid_b]), config)
+    for cid in (cid_a, cid_b):
+        activity.channel_activity_summary(resolve_paths(cid, config), config.analysis_dir,
+                                          show_plot=False)
+
+    pop_df = load_population_summaries(
+        sel_paths, data_dir=config.analysis_dir / "activity", suffix="channel_activity_summary"
+    )
+
+    assert {"culture_id", "chip", "well"} <= set(pop_df.columns)
+    assert set(pop_df["chip"]) == {"C0001", "C0002"}
+    assert set(pop_df["culture_id"]) == {str(cid_a), str(cid_b)}
+
+
+# --- phase selection -------------------------------------------------------------------------------
+
+
+def _phased_store(tmp_path, make_recording_data):
+    """A one-culture store whose recording carries an early/late phase spec."""
+    config = Config(data_root=tmp_path)
+    spec = {"starts": {"early": 0.0, "late": 0.333}, "end": 0.833}
+    _add_recording(
+        config,
+        make_recording_data(seed=1, exp_id="expQ", chip="C0014", well=0, DIV=7,
+                            phase_spec=np.asarray(spec, dtype=object)),
+        well_no=0,
+    )
+    return config, CultureID("expQ", "C0014", "0")
+
+
+def test_generate_report_defaults_to_the_first_phase(tmp_path, make_recording_data):
+    config, cid = _phased_store(tmp_path, make_recording_data)
+
+    out = generate_report(cid, config, sections=("activity", "cultures"))
+
+    assert out.exists() and out.stat().st_size > 0
+    # The default phase is the first of the sequence, so that phase's distributions are what got cached.
+    assert (config.analysis_dir / "distributions" / "expQ" / "C0014" / "well0" /
+            f"{cid}_early_distributions.npz").exists()
+
+
+def test_generate_report_honors_an_explicit_phase(tmp_path, make_recording_data):
+    config, cid = _phased_store(tmp_path, make_recording_data)
+
+    out = generate_report(cid, config, sections=("activity", "cultures"), phase="late",
+                          output_path=config.analysis_dir / "reports" / "late.pdf")
+
+    assert out.exists() and out.stat().st_size > 0
+    assert (config.analysis_dir / "distributions" / "expQ" / "C0014" / "well0" /
+            f"{cid}_late_distributions.npz").exists()
+
+
+def test_generate_report_rejects_a_phase_the_data_lacks(store):
+    config, cid_a, _ = store
+    with pytest.raises(ValueError, match="No data for phase"):
+        generate_report(cid_a, config, sections=("activity",), phase="nonexistent")
 
 
 # --- stimulation ---------------------------------------------------------------------------------
@@ -293,28 +413,36 @@ def _stim_store(tmp_path, make_recording_data, *, chip, phase_spec=None, message
     return config, resolve_paths(CultureID("expS", chip, "0"), config)
 
 
-def test_stim_summary_uses_train_phase_window(tmp_path, make_recording_data):
-    # The fixture is 500k frames @ 10 kHz = 50 s. A train phase from 1/6 min to 0.5 min spans
-    # 1/3 min; the old hardcoded (rec_t_sec - 40*60)/60 would have returned -39.2.
+def test_stim_summary_attributes_stim_to_the_phase_it_falls_in(tmp_path, make_recording_data):
+    # The fixture's spikes start at ~frame 3000, so the phases run pre [3k, 103k), train [103k, 303k),
+    # post [303k, ...). The five stim pulses sit at 50k..250k, i.e. two in pre and three in train.
     spec = {"starts": {"pre": 0.0, "train": 1 / 6, "post": 0.5}, "end": 0.833}
     config, cpath = _stim_store(tmp_path, make_recording_data, chip="C0010", phase_spec=spec)
+
+    df = stimulation.stim_summary(cpath, config.analysis_dir, show_plot=False).set_index("phase")
+
+    assert set(df.index) == {"pre", "train", "post"}
+    assert df.loc["pre", "total_stim_ms"] == pytest.approx(2 * 200.0 / 1000)
+    assert df.loc["train", "total_stim_ms"] == pytest.approx(3 * 200.0 / 1000)
+    assert df.loc["post", "total_stim_ms"] == pytest.approx(0.0)
+    # Every pulse is attributed exactly once.
+    assert df["total_stim_ms"].sum() == pytest.approx(5 * 200.0 / 1000)
+    assert df.loc["train", "phase_dur_min"] == pytest.approx(1 / 3, abs=1e-3)
+
+
+def test_stim_summary_unphased_recording_is_a_single_full_row(tmp_path, make_recording_data):
+    # No phase spec -> a single "full" phase spanning the recording, so the whole recording is the
+    # window (rather than a negative number left over from the old 20-min pre/post assumption).
+    config, cpath = _stim_store(tmp_path, make_recording_data, chip="C0011")
+    rec = Recording(0, io.load_preprocessed(cpath.recordings[7].npz))
+    span_min = (rec.phases.phases[0].end_frame - rec.phases.phases[0].start_frame) / rec.samp_rate / 60
 
     df = stimulation.stim_summary(cpath, config.analysis_dir, show_plot=False)
 
     assert len(df) == 1
-    row = df.iloc[0]
-    assert row["total_stim_ms"] == pytest.approx(5 * 200.0 / 1000)
-    assert row["total_train_min"] == pytest.approx(1 / 3, abs=1e-3)
-
-
-def test_stim_summary_falls_back_to_full_recording_without_train_phase(tmp_path, make_recording_data):
-    # No phase spec -> a single "full" phase, so train time is the whole recording (50 s), not a
-    # negative number left over from the 20-min pre/post assumption.
-    config, cpath = _stim_store(tmp_path, make_recording_data, chip="C0011")
-
-    df = stimulation.stim_summary(cpath, config.analysis_dir, show_plot=False)
-
-    assert df.iloc[0]["total_train_min"] == pytest.approx(50 / 60, abs=1e-3)
+    assert df.iloc[0]["phase"] == "full"
+    assert df.iloc[0]["phase_dur_min"] == pytest.approx(span_min)
+    assert df.iloc[0]["total_stim_ms"] == pytest.approx(5 * 200.0 / 1000)
 
 
 def test_stim_summary_tolerates_non_dict_event_messages(tmp_path, make_recording_data):
@@ -341,3 +469,15 @@ def test_generate_report_with_stimulation_section(tmp_path, make_recording_data)
         CultureID("expS", "C0013", "0"), config, sections=("activity", "stimulation")
     )
     assert out.exists() and out.stat().st_size > 0
+
+
+def test_population_stim_plot_renders(tmp_path, make_recording_data):
+    spec = {"starts": {"pre": 0.0, "train": 1 / 6, "post": 0.5}, "end": 0.833}
+    config, cpath = _stim_store(tmp_path, make_recording_data, chip="C0015", phase_spec=spec)
+    stimulation.stim_summary(cpath, config.analysis_dir, show_plot=False)
+    sel_paths = resolve_paths(CultureSelector(cultures=[CultureID("expS", "C0015", "0")]), config)
+
+    stimulation.plot_population_stim_summary(sel_paths, config.analysis_dir, phase="train",
+                                             savename="stim.png")
+
+    assert (config.analysis_dir / "stimulation" / "stim.png").exists()

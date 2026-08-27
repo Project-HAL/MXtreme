@@ -1,12 +1,11 @@
 import os
-import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 from pathlib import Path
 
 from mxtreme import io
 from mxtreme.recording import Recording
 from mxtreme.analysis._paths import _summary_paths, load_population_summaries
+from mxtreme.analysis._plotting import plot_metric_grid
 from mxtreme.analysis._stats import aggregate_by_div_phase
 
 
@@ -30,49 +29,42 @@ def _get_stim_info(rec: Recording):
     return stim_rows
 
 
-def _phase_duration_min(rec: Recording, name: str) -> float | None:
-    """Return the duration (minutes) of ``rec``'s phase called ``name``, or ``None`` if absent."""
-    for phase in rec.phases:
-        if phase.name == name:
-            return (phase.end_frame - phase.start_frame) / rec.samp_rate / 60
+def stim_summary(cpath, analysis_dir: Path, use_existing=True, show_plot=True, save_plot=False):
+    """Summarise stimulation delivered to one culture, one row per DIV and phase.
 
-    return None
+    For each (DIV, phase): ``total_stim_ms`` is the summed pulse phase of the stimulation events that
+    fall inside that phase's window (maxlab reports these in **microseconds** as ``phase_us``, so they
+    are divided by 1000 to give milliseconds), and ``phase_dur_min`` is the span of the window itself.
 
-
-def stim_summary(cpath, analysis_dir: Path, use_existing=True, show_plot=True, save_plot=False,
-                 train_phase: str = "train"):
-    """Summarise stimulation delivered to one culture, one row per DIV.
-
-    For each DIV: ``total_stim_ms`` is the summed pulse phase of the recording's stimulation events
-    (maxlab reports these in **microseconds** as ``phase_us``, so they are divided by 1000 to give
-    milliseconds), and ``total_train_min`` is the duration of the ``train_phase`` window taken from
-    the recording's own phases.
+    Phases come from the recording (see :mod:`mxtreme.phases`), exactly as in the activity summaries,
+    so a recording with no user-supplied phases yields a single ``"full"`` row covering it.
 
     :param cpath: The culture's :class:`~mxtreme.paths.CulturePaths`.
     :param analysis_dir: Analysis output root (typically ``config.analysis_dir``).
     :param use_existing: Reuse the cached summary CSV when one already exists.
-    :param train_phase: Name of the phase whose span counts as training time. When the recording has
-        no such phase, the whole recording is used instead (and a notice is printed).
     :param show_plot: Show the per-culture summary figure.
     :param save_plot: Save that figure next to the summary CSV.
-    :returns: One row per DIV with columns ``div``, ``total_stim_ms``, ``total_train_min``,
-        ``culture_id``.
+    :returns: One row per DIV/phase with columns ``div``, ``phase``, ``total_stim_ms``,
+        ``phase_dur_min``, ``culture_id``.
     :rtype: pandas.DataFrame
     """
-    divs = []
-    total_stim_times = []
-    total_train_times = []
-
     cid = cpath.culture_id
-    print(cid)
+    columns = ['div', 'phase', 'total_stim_ms', 'phase_dur_min', 'culture_id']
 
     save_path, csv_path = _summary_paths(cpath, analysis_dir, "stimulation", "stim_summary")
 
-    if use_existing and csv_path.exists():
-        print(f"Loading existing summary from {csv_path}")
-        summary_df = pd.read_csv(csv_path)
+    # A cache without `phase` predates per-phase attribution: its stim totals cover whole recordings
+    # and can't be filtered to a phase. Recompute rather than load it back.
+    cached = pd.read_csv(csv_path) if use_existing and csv_path.exists() else None
+    if cached is not None and 'phase' not in cached.columns:
+        print(f"Ignoring pre-phase summary at {csv_path} (no phase column); recomputing.")
+        cached = None
 
+    if cached is not None:
+        print(f"Loading existing summary from {csv_path}")
+        summary_df = cached
     else:
+        rows = []
         for div in cpath.recordings:
 
             npz = cpath.recordings[div].npz
@@ -81,26 +73,20 @@ def stim_summary(cpath, analysis_dir: Path, use_existing=True, show_plot=True, s
 
             stim_df = _get_stim_info(rec)
 
-            total_stim_time = stim_df['stim_phase'].sum() / 1000  # phase_us (µs) -> ms
+            for phase in rec.phases:
+                in_phase = stim_df['eventtime'].between(
+                    phase.start_frame, phase.end_frame, inclusive='left'
+                )
+                rows.append({
+                    'div':            div,
+                    'phase':          phase.name,
+                    # phase_us (µs) -> ms
+                    'total_stim_ms':  stim_df.loc[in_phase, 'stim_phase'].sum() / 1000,
+                    'phase_dur_min':  (phase.end_frame - phase.start_frame) / rec.samp_rate / 60,
+                    'culture_id':     str(cid),
+                })
 
-            # Training time is the span of the recording's own `train_phase` window. Recordings with
-            # no such phase (e.g. the default single "full" phase) fall back to the whole recording.
-            total_train_time = _phase_duration_min(rec, train_phase)
-            if total_train_time is None:
-                print(f"  DIV{div}: no '{train_phase}' phase (found: {', '.join(rec.phases.names)}); "
-                      f"using the full recording as train time")
-                total_train_time = rec.rec_t_sec / 60
-
-            divs.append(div)
-            total_stim_times.append(total_stim_time)
-            total_train_times.append(total_train_time)
-
-        summary_df = pd.DataFrame({
-            'div':              divs,
-            'total_stim_ms':    total_stim_times,
-            'total_train_min':  total_train_times,
-            'culture_id':       cpath.culture_id,
-        })
+        summary_df = pd.DataFrame(rows, columns=columns)
 
         os.makedirs(save_path, exist_ok=True)
 
@@ -113,72 +99,59 @@ def stim_summary(cpath, analysis_dir: Path, use_existing=True, show_plot=True, s
     return summary_df
 
 
+STIM_METRICS = [
+    # (y_col,           err_col, y_label,                       panel_title)
+    ('total_stim_ms',   None,    'Total stim time (ms)',        'Stimulation Delivered'),
+    ('phase_dur_min',   None,    'Window duration (min)',       'Recorded Window'),
+]
+
+# Population variants of STIM_METRICS -- same panels, but with the across-culture SEM.
+POP_STIM_METRICS = [(y, f'sem_{y}', label, title) for (y, _e, label, title) in STIM_METRICS]
+
+
 def _plot_stim_summary(df: pd.DataFrame, cid, analysis_dir, show_plot, save_plot, title_suffix: str = ''):
-    """Reusable plotting helper — works on any df with columns: div, total_stim_ms, total_train_min."""
+    """Two-panel figure (stim delivered, window duration) vs DIV, one series per phase."""
 
-    x = np.arange(len(df))
+    save_path = (Path(analysis_dir) / f"{cid}_stim_summary.png") if save_plot else None
+    suffix = f' — {title_suffix}' if title_suffix else ''
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
-
-    ax1.bar(x, df['total_stim_ms'], color='steelblue', edgecolor='black')
-    ax1.set_xticks(x)
-    ax1.set_xticklabels(df['div'], rotation=45, ha='center')
-    ax1.set_xlabel('DIV')
-    ax1.set_ylabel('Total Stimulation Time (ms)')
-    ax1.set_title(f'Total Stimulation Time per DIV{" — " + title_suffix if title_suffix else ""}')
-
-    ax2.bar(x, df['total_train_min'], color='darkorange', edgecolor='black')
-    ax2.set_xticks(x)
-    ax2.set_xticklabels(df['div'], rotation=45, ha='center')
-    ax2.set_xlabel('DIV')
-    ax2.set_ylabel('Total Train Time (min)')
-    ax2.set_title(f'Total Train Time per DIV{" — " + title_suffix if title_suffix else ""}')
-
-    plt.tight_layout()
-    if save_plot:
-        plt.savefig(analysis_dir/f"{cid}_stim_summary.png", dpi=300, bbox_inches='tight')
-    if show_plot:
-        plt.show()
-    else:
-        plt.close()
+    plot_metric_grid(
+        df, STIM_METRICS,
+        suptitle=f'Stimulation Summary — {cid}{suffix}',
+        save_path=save_path,
+        show_plot=show_plot,
+        figsize=(11, 4.5),
+        dpi=150,
+    )
 
 
-def plot_population_stim_summary(sel_paths, analysis_dir: Path, savename=None):
-    """Bar chart of mean ± SEM across cultures, one bar per DIV."""
+def plot_population_stim_summary(sel_paths, analysis_dir: Path, phase: str = None, savename=None):
+    """Stimulation vs DIV pooled across cultures: mean ± SEM, with a faint line per culture.
+
+    :param sel_paths: ``{exp_id: ExperimentPaths}`` from :func:`mxtreme.paths.resolve_paths`.
+    :param analysis_dir: Analysis output root (typically ``config.analysis_dir``).
+    :param phase: If given, restrict to this phase only; ``None`` plots all phases as separate lines.
+    :param savename: Filename for the saved figure, written into ``<analysis_dir>/stimulation/``.
+    """
 
     # TODO: update if sel_paths has more than one exp_id, decide whether to combine them or plot them separately
 
     pop_df = load_population_summaries(sel_paths, data_dir=analysis_dir/"stimulation", suffix='stim_summary')
 
-    stats = aggregate_by_div_phase(
-        pop_df, value_cols=['total_stim_ms', 'total_train_min'], group_cols=('div',)
-    )
+    if phase is not None:
+        pop_df = pop_df[pop_df['phase'] == phase]
+
+    stats = aggregate_by_div_phase(pop_df, value_cols=['total_stim_ms', 'phase_dur_min'])
 
     n_cultures = pop_df['culture_id'].nunique()
-    x = np.arange(len(stats))
+    save_path = (Path(analysis_dir) / "stimulation" / savename) if savename else None
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
-
-    ax1.bar(x, stats['total_stim_ms'], yerr=stats['sem_total_stim_ms'],
-            color='steelblue', edgecolor='black', capsize=4)
-    ax1.set_xticks(x)
-    ax1.set_xticklabels(stats['div'], rotation=45, ha='center')
-    ax1.set_xlabel('DIV')
-    ax1.set_ylabel('Total Stimulation Time (ms)')
-    ax1.set_title(f'Total Stimulation Time per DIV (n={n_cultures} cultures)')
-
-    ax2.bar(x, stats['total_train_min'], yerr=stats['sem_total_train_min'],
-            color='darkorange', edgecolor='black', capsize=4)
-    ax2.set_xticks(x)
-    ax2.set_xticklabels(stats['div'], rotation=45, ha='center')
-    ax2.set_xlabel('DIV')
-    ax2.set_ylabel('Total Train Time (min)')
-    ax2.set_title(f'Total Train Time per DIV (n={n_cultures} cultures)')
-
-    save_path = analysis_dir / "stimulation"
-    os.makedirs(save_path, exist_ok=True)
-
-    plt.tight_layout()
-    if savename:
-        plt.savefig(save_path / savename, dpi=300, bbox_inches='tight')
-    plt.show()
+    plot_metric_grid(
+        stats, POP_STIM_METRICS,
+        overlay_df=pop_df,
+        suptitle=f'Population Stimulation\nmean ± SEM, n = {n_cultures} cultures',
+        save_path=save_path,
+        show_plot=True,
+        figsize=(11, 4.5),
+        dpi=300,
+    )

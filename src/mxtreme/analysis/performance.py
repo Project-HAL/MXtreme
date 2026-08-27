@@ -15,10 +15,11 @@ to a paradigm-free left-to-right propagation fraction.
 import os
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 from pathlib import Path
 
 from mxtreme.analysis._paths import _summary_paths, load_population_summaries
+from mxtreme.analysis._plotting import plot_metric_grid
+from mxtreme.analysis._stats import aggregate_by_div_phase
 
 
 def trained_side(condition) -> str | None:
@@ -173,40 +174,40 @@ def performance_summary(
 
 
 def _plot_performance_summary(df, cid, analysis_dir, show_plot, save_plot, score_label='Score'):
-    """Line plot of score vs DIV, one series per phase."""
+    """Line plot of score vs DIV, one series per phase.
 
-    fig, ax = plt.subplots(1, 1, figsize=(7, 5))
+    The y-axis is left to the data rather than pinned to ``[0, 1]``: the objective is pluggable, so
+    only the shipped default happens to be a fraction.
+    """
+    if df.empty:
+        print(f"No performance data for {cid}")
+        return
 
-    if len(df):
-        for phase in df['phase'].unique():
-            phase_df = df[df['phase'] == phase].sort_values(by='div')
-            ax.plot(phase_df['div'], phase_df['score'], marker='o', label=phase)
+    save_path = (Path(analysis_dir) / f"{cid}_performance_summary.png") if save_plot else None
 
-    ax.set_xlabel('DIV')
-    ax.set_ylabel(score_label)
-    ax.set_title(f'{cid.chip}, well {cid.well}')
-    ax.set_ylim([-0.01, 1.01])
-    ax.legend()
-    fig.tight_layout()
-
-    if save_plot:
-        os.makedirs(analysis_dir, exist_ok=True)
-        fig.savefig(analysis_dir / f"{cid}_performance_summary.png", dpi=300, bbox_inches='tight')
-    if show_plot:
-        plt.show()
-    else:
-        plt.close(fig)
+    plot_metric_grid(
+        df, [('score', None, score_label, 'Performance')],
+        suptitle=f'Performance Summary — {cid}',
+        save_path=save_path,
+        show_plot=show_plot,
+        ncols=1,
+        figsize=(7, 5),
+        dpi=150,
+    )
 
 
 def plot_population_performance_summary(sel_paths,
                                         analysis_dir: Path,
                                         phase: str = None,
-                                        savename=None):
-    """Learning curve pooled across cultures: score vs DIV (mean ± SEM), with light per-culture lines.
+                                        savename=None,
+                                        score_label: str = 'Score'):
+    """Learning curve pooled across cultures: score vs DIV (mean ± SEM), with faint per-culture lines.
 
     :param sel_paths: ``dict[exp_id, ExperimentPaths]`` from :func:`~mxtreme.paths.resolve_paths`.
     :param analysis_dir: Analysis output root (typically ``config.analysis_dir``).
     :param phase: If given, restrict to this phase; otherwise pool all phases.
+    :param savename: Filename for the saved figure, written into ``<analysis_dir>/performance/``.
+    :param score_label: Y-axis label (should match the objective's units).
     """
     pop_df = load_population_summaries(
         sel_paths, data_dir=analysis_dir / "performance", suffix='performance_summary'
@@ -215,51 +216,22 @@ def plot_population_performance_summary(sel_paths,
     if phase is not None:
         pop_df = pop_df[pop_df['phase'] == phase]
 
-    df = pop_df.copy()
-    if df.empty:
+    if pop_df.empty:
         print(f"No performance data for phase={phase!r}")
         return
 
-    df['culture_id'] = df['chip'].astype(str) + '_' + df['well'].astype(str)
-    cultures = sorted(df['culture_id'].unique())
+    stats = aggregate_by_div_phase(pop_df, value_cols=['score'])
 
-    stats = (
-        df.groupby('div')['score']
-        .agg(mean='mean', sem=lambda x: x.sem())
-        .reset_index()
-        .sort_values('div')
+    n_cultures = pop_df['culture_id'].nunique()
+    save_path = (Path(analysis_dir) / "performance" / savename) if savename else None
+
+    return plot_metric_grid(
+        stats, [('score', 'sem_score', score_label, 'Performance')],
+        overlay_df=pop_df,
+        suptitle=f'Population Performance\nmean ± SEM, n = {n_cultures} cultures',
+        save_path=save_path,
+        show_plot=True,
+        ncols=1,
+        figsize=(8, 5),
+        dpi=300,
     )
-
-    cmap = plt.get_cmap('tab10')
-    culture_colors = {c: cmap(i % 10) for i, c in enumerate(cultures)}
-
-    fig, ax = plt.subplots(figsize=(8, 5))
-
-    for cid in cultures:
-        cdf = df[df['culture_id'] == cid].sort_values('div')
-        ax.plot(cdf['div'], cdf['score'], color=culture_colors[cid], alpha=0.35,
-                linewidth=1.2, marker='o', markersize=3, label=cid, zorder=2)
-
-    ax.plot(stats['div'], stats['mean'], color='steelblue', linewidth=2.5,
-            marker='o', markersize=6, label='Mean ± SEM', zorder=4)
-    ax.fill_between(stats['div'], stats['mean'] - stats['sem'], stats['mean'] + stats['sem'],
-                    color='steelblue', alpha=0.18, zorder=3)
-
-    ax.set_xlabel('DIV')
-    ax.set_ylabel('Score')
-    cond_str = f'phase={phase}' if phase is not None else 'all phases'
-    ax.set_title(f'Performance vs DIV  |  {cond_str}  (n={len(cultures)} cultures)')
-    ax.set_ylim(0, 1)
-
-    handles, labels = ax.get_legend_handles_labels()
-    ax.legend(handles, labels, fontsize=8, ncol=max(1, len(cultures) // 6 + 1),
-              loc='upper left', framealpha=0.7)
-
-    fig.tight_layout()
-
-    if savename:
-        out = analysis_dir / "performance"
-        os.makedirs(out, exist_ok=True)
-        fig.savefig(out / savename, dpi=300, bbox_inches='tight')
-
-    plt.show()

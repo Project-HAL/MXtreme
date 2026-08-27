@@ -9,7 +9,7 @@ from mxtreme.params import ActivityParams
 from mxtreme.recording import Recording
 from mxtreme.utils import frame_to_sec
 from mxtreme.analysis._paths import _summary_paths, load_population_summaries
-from mxtreme.analysis._plotting import plot_metric_grid
+from mxtreme.analysis._plotting import plot_metric_grid, sort_phases
 from mxtreme.analysis._stats import aggregate_by_div_phase
 
 
@@ -195,9 +195,9 @@ def channel_activity_summary(cpath, analysis_dir: Path, use_existing=True, show_
                     'median_fr_hz':    _safe(np.median, fr_vals),
                     'std_fr_hz':       _safe(np.std,    fr_vals),
                     # ISI
-                    'mean_isi_sec':    _safe(np.mean,   isi_vals),
-                    'median_isi_sec':  _safe(np.median, isi_vals),
-                    'std_isi_sec':     _safe(np.std,    isi_vals),
+                    'mean_isi_msec':    _safe(np.mean,   isi_vals),
+                    'median_isi_msec':  _safe(np.median, isi_vals),
+                    'std_isi_msec':     _safe(np.std,    isi_vals),
                     # Amplitude
                     'mean_amp_uv':     _safe(np.mean,   amp_vals),
                     'median_amp_uv':   _safe(np.median, amp_vals),
@@ -258,6 +258,32 @@ def ISI_chan(spike_data, samp_rate, params: ActivityParams | None = None):
     return median_chan_isi
 
 
+def isi_all(spike_data, samp_rate, params: ActivityParams | None = None):
+    """Every inter-spike interval in ``spike_data``, pooled across channels, in milliseconds.
+
+    The per-channel counterpart :func:`ISI_chan` reduces each channel to its median, which is what the
+    summary tables need; this keeps the whole distribution, which is what a CDF needs. Both apply the
+    same ``isi_threshold_ms`` filter, so the two views describe the same set of intervals.
+
+    :param spike_data: Structured spike array with ``channel`` and ``frameno`` fields.
+    :param samp_rate: Sampling rate in Hz.
+    :param params: Activity settings; defaults to :class:`~mxtreme.params.ActivityParams`.
+    :returns: 1-D array of ISIs in ms.
+    """
+    params = params or ActivityParams()
+
+    spike_df = pd.DataFrame(spike_data)
+    if spike_df.empty:
+        return np.array([])
+
+    isis = []
+    for _channel, group_df in spike_df.groupby('channel'):
+        isi_ms = np.diff(np.sort(group_df['frameno'].to_numpy())) / samp_rate * 1000
+        isis.append(isi_ms[isi_ms < params.isi_threshold_ms])
+
+    return np.concatenate(isis) if isis else np.array([])
+
+
 def mean_spike_amplitude_chan(spike_data, samp_rate):
 
     spike_df = pd.DataFrame(spike_data)
@@ -283,7 +309,7 @@ def _plot_channel_activity_summary(
     metrics = [
         # (mean_col,        err_col,            y_label,               panel_title)
         ('mean_fr_hz',      'std_fr_hz',      'Firing rate (Hz)',     'Firing Rate'),
-        ('mean_isi_sec',    'std_isi_sec',    'Median ISI (s)',       'Inter-Spike Interval'),
+        ('mean_isi_msec',    'std_isi_msec',    'Median ISI (ms)',      'Inter-Spike Interval'),
         ('mean_amp_uv',     'std_amp_uv',     'Spike amplitude (µV)', 'Spike Amplitude'),
         ('pct_active_chan', None,             'Active channels (%)', 'Active Channels'),
     ]
@@ -298,6 +324,118 @@ def _plot_channel_activity_summary(
         figsize=(11, 8),
         dpi=150,
     )
+
+
+# --- distributions ------------------------------------------------------------------------------
+#
+# The summary tables above reduce each recording to a handful of statistics. These keep the underlying
+# distributions so a culture can be examined in depth (one CDF per DIV) rather than through its means.
+
+# (key, source) pairs documented on `culture_distributions`; kept here so the report and the cache
+# agree on what a distribution set contains.
+DISTRIBUTION_KEYS = ('fr_hz', 'isi_ms', 'ibi_sec', 'size_pct')
+
+
+def _phase_window(rec, phase: str | None) -> tuple[str, int, int]:
+    """Resolve ``phase`` against ``rec``'s own phases, as ``(name, start_frame, end_frame)``.
+
+    ``None`` selects the recording's first phase -- ``"full"`` for a recording with no user-supplied
+    phases, the first of the sequence otherwise. A name the recording doesn't carry falls back to the
+    whole recording, so one report phase can be applied across a batch whose recordings don't all
+    share the same phase spec.
+    """
+    named = {p.name: p for p in rec.phases}
+
+    if phase is None:
+        first = sort_phases(list(named))[0]
+        return first, named[first].start_frame, named[first].end_frame
+
+    if phase in named:
+        return phase, named[phase].start_frame, named[phase].end_frame
+
+    frames = rec.spike_data["frameno"]
+    start = int(np.min(frames)) if len(frames) else 0
+    stop = int(np.max(frames)) + 1 if len(frames) else 0
+    print(f"  no {phase!r} phase (found: {', '.join(named)}); using the whole recording")
+    return phase, start, stop
+
+
+def culture_distributions(cpath, analysis_dir: Path, *, phase: str | None = None,
+                          use_existing: bool = True, params: ActivityParams | None = None):
+    """Per-DIV distributions underlying the activity summaries, for one culture.
+
+    Returns ``{div: {key: values}}`` with these keys:
+
+    ============ ===========================================================================
+    ``fr_hz``    per-electrode firing rate (:func:`firing_rate_chan`)
+    ``isi_ms``   every inter-spike interval, pooled across electrodes (:func:`isi_all`)
+    ``ibi_sec``  interval between successive network-burst peaks
+    ``size_pct`` network-burst size, as a percentage of electrodes recruited
+    ============ ===========================================================================
+
+    Each is restricted to ``phase``'s window, matching how :func:`channel_activity_summary` and
+    :func:`burst_activity_summary` compute their statistics.
+
+    The result is cached as one ``.npz`` per culture per phase. That cache is what makes re-running a
+    report cheap: the arrays themselves are small, but producing them means decompressing every
+    recording's full spike matrix.
+
+    :param cpath: The culture's :class:`~mxtreme.paths.CulturePaths`.
+    :param analysis_dir: Analysis output root (typically ``config.analysis_dir``).
+    :param phase: Phase to restrict to; ``None`` selects each recording's first phase.
+    :param use_existing: Reuse the cached ``.npz`` when one already exists.
+    :param params: Activity settings; defaults to :class:`~mxtreme.params.ActivityParams`.
+    :returns: ``{div: {key: numpy array}}``, keyed by DIV.
+    """
+    params = params or ActivityParams()
+    cid = cpath.culture_id
+
+    save_path, npz_path = _summary_paths(
+        cpath, analysis_dir, "distributions", f"{phase or 'default'}_distributions", ext=".npz"
+    )
+
+    if use_existing and npz_path.exists():
+        print(f"Loading existing distributions from {npz_path}")
+        with np.load(npz_path) as cached:
+            dists: dict[int, dict[str, np.ndarray]] = {}
+            for flat_key in cached.files:
+                div_str, key = flat_key.split("__", 1)
+                dists.setdefault(int(div_str), {})[key] = cached[flat_key]
+        return dists
+
+    dists = {}
+    for div in sorted(cpath.recordings):
+        rec = _load_recording(cpath.recordings[div].npz)
+        _name, start, stop = _phase_window(rec, phase)
+
+        spikes = rec.spike_data[(rec.spike_data["frameno"] > start) & (rec.spike_data["frameno"] < stop)]
+
+        firing_rates = firing_rate_chan(spikes, rec.samp_rate)
+        fr_vals = np.array([v for v in firing_rates.values() if v is not None], dtype=float)
+
+        bursts = pd.read_csv(cpath.recordings[div].burst_stats)
+        bursts = bursts[bursts['kind'] == 'network']
+        if phase is not None and 'phase' in bursts.columns:
+            bursts = bursts[bursts['phase'] == phase]
+        bursts = bursts.sort_values('peak_frame')
+
+        peak_sec = frame_to_sec(bursts['peak_frame'].to_numpy(), rec.samp_rate)
+
+        dists[div] = {
+            'fr_hz':    fr_vals,
+            'isi_ms':   isi_all(spikes, rec.samp_rate, params),
+            'ibi_sec':  np.diff(peak_sec) if len(peak_sec) > 1 else np.array([]),
+            'size_pct': bursts['size_frac_elec'].to_numpy(dtype=float) * 100,
+        }
+
+    os.makedirs(save_path, exist_ok=True)
+    np.savez_compressed(
+        npz_path,
+        **{f"{div}__{key}": values for div, per_div in dists.items() for key, values in per_div.items()},
+    )
+    print(f"Saved distributions to {npz_path}")
+
+    return dists
 
 
 def plot_population_burst_summary(
@@ -399,7 +537,7 @@ def plot_population_channel_activity(sel_paths,
     metrics = [
         # (y_col,            err_col,                 y_label,               panel_title)
         ('mean_fr_hz',      'sem_mean_fr_hz',      'Firing rate (Hz)',     'Firing Rate'),
-        ('mean_isi_sec',    'sem_mean_isi_sec',    'Median ISI (s)',       'Inter-Spike Interval'),
+        ('mean_isi_msec',    'sem_mean_isi_msec',    'Median ISI (ms)',      'Inter-Spike Interval'),
         ('mean_amp_uv',     'sem_mean_amp_uv',     'Spike amplitude (µV)', 'Spike Amplitude'),
         ('pct_active_chan', 'sem_pct_active_chan', 'Active channels (%)',  'Active Channels'),
     ]

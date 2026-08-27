@@ -152,7 +152,12 @@ def load_raw_waveforms(path_to_raw, well_no, recording_no, channels, block_size,
             yield chan, arr
 
 def get_n_colors(n, cmap_name='viridis'):
+    """``n`` colors spanning ``cmap_name``. A single color is taken from the middle of the map."""
     cmap = plt.get_cmap(cmap_name)
+    if n < 1:
+        return []
+    if n == 1:
+        return [cmap(0.5)]
     colors = [cmap(i / (n - 1)) for i in range(n)]
     return colors
 
