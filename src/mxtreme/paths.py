@@ -172,6 +172,12 @@ def resolve_paths(
         target type.
     """
     df = pd.read_csv(config.registry_path)
+    # Resolution here is about preprocessed recordings, and the registry also indexes activity scans
+    # -- raw .h5 files with no .npz behind them. Including those rows would invent DIVs (and whole
+    # cultures) that resolve to preprocessed paths which do not exist. A registry written before
+    # scans were indexed has no `kind` column and holds recordings only.
+    if "kind" in df.columns:
+        df = df[df["kind"].astype(str) == "preprocessed"]
     # An older registry on disk may carry duplicate rows for a recording (written before `io.register`
     # deduped on write); dedupe so a culture's DIVs aren't double-counted.
     key = ["exp_id", "chip", "well", "div"]

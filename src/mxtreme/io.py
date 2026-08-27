@@ -7,6 +7,7 @@ Contents:
 - :func:`load_preprocessed` -- read a cleaned ``.npz`` back into a dict.
 - :func:`save_preprocessed` -- write one well's cleaned data to an ``.npz`` (and register it).
 - :func:`register` -- record processed recordings in the registry CSV.
+- :func:`register_scan` -- record an activity scan in that same registry.
 - :func:`rebuild_registry` -- rebuild that registry by scanning the store (recovery path).
 - :func:`save_burst_data` / :func:`load_burst_data` -- per-recording burst CSVs.
 - :func:`update_burst_log` -- per-experiment burst summary CSV.
@@ -132,29 +133,69 @@ def save_preprocessed(
     return out_path
 
 
-def register(data: dict[int, dict], registry_path: str | Path, *, timestamp=None) -> None:
+#: Columns identifying one registry row. ``kind`` is part of the key because a scan and the
+#: recordings preprocessed from it share an ``(exp_id, chip, well, div)``.
+REGISTRY_KEY = ["exp_id", "chip", "well", "div", "kind"]
+
+#: What a registry row describes. ``"preprocessed"`` is one well of a cleaned recording;
+#: ``"activity_scan"`` is one well of an activity scan's raw ``.h5``.
+REGISTRY_KINDS = ("preprocessed", "activity_scan")
+
+
+def _read_registry(registry_path: Path) -> pd.DataFrame:
+    """Read the registry CSV into the current schema, or an empty frame if it does not exist yet.
+
+    Two migrations happen on read, so an older registry converges on the current schema at its next
+    write rather than needing a separate upgrade step:
+
+    - the legacy ``status`` column is dropped;
+    - a missing ``kind`` column is backfilled with ``"preprocessed"``. Registries written before
+      scans were indexed hold cleaned recordings and nothing else, so that is what those rows are.
+
+    :param registry_path: Path to the registry CSV.
+    :returns: The registry, with ``status`` gone and ``kind`` present.
+    :rtype: pandas.DataFrame
+    """
+    if not registry_path.exists():
+        return pd.DataFrame()
+
+    df = pd.read_csv(registry_path).drop(columns=["status"], errors="ignore")
+    if not df.empty and "kind" not in df.columns:
+        position = df.columns.get_loc("div") + 1 if "div" in df.columns else len(df.columns)
+        df.insert(position, "kind", "preprocessed")
+    return df
+
+
+def register(
+    data: dict[int, dict],
+    registry_path: str | Path,
+    *,
+    kind: str = "preprocessed",
+    timestamp=None,
+) -> None:
     """Upsert one row per processed recording into the registry CSV.
 
-    Rows are keyed by ``(exp_id, chip, well, div)``; an existing row for the same key is replaced.
-    Each row records a ``timestamp`` and the well's ``conditions`` (whatever the well's
+    Rows are keyed by ``(exp_id, chip, well, div, kind)``; an existing row for the same key is
+    replaced. Each row records a ``timestamp`` and the well's ``conditions`` (whatever the well's
     ``experimental_condition`` holds, or blank when absent).
 
     :param data: Mapping of well number to well data dict.
     :type data: dict[int, dict]
     :param registry_path: Path to the registry CSV (typically ``config.registry_path``).
     :type registry_path: str or Path
+    :param kind: What these rows describe -- see :data:`REGISTRY_KINDS`. Because ``kind`` is part of
+        the key, an activity scan and the recordings later preprocessed from the same well and DIV
+        coexist as separate rows instead of overwriting one another.
+    :type kind: str
     :param timestamp: Value for the rows' ``timestamp`` column. Defaults to now, which is what a live
-        write wants; :func:`rebuild_registry` passes each ``.npz``'s modification time instead, so a
+        write wants; :func:`rebuild_registry` passes each file's modification time instead, so a
         retroactively rebuilt row reflects when the file was actually written.
     """
     registry_path = Path(registry_path)
     os.makedirs(registry_path.parent, exist_ok=True)
     stamp = (pd.Timestamp.now() if timestamp is None else pd.Timestamp(timestamp)).isoformat()
 
-    df = pd.read_csv(registry_path) if registry_path.exists() else pd.DataFrame()
-    # Drop the legacy `status` column if an older registry still carries it, so it disappears on the
-    # next write.
-    df = df.drop(columns=["status"], errors="ignore")
+    df = _read_registry(registry_path)
 
     for well_no, well in data.items():
         condition = well.get("experimental_condition")
@@ -163,6 +204,7 @@ def register(data: dict[int, dict], registry_path: str | Path, *, timestamp=None
             "chip": well["chip"],
             "well": well_no,
             "div": well["DIV"],
+            "kind": kind,
             "conditions": "" if condition is None else condition,
             "timestamp": stamp,
         }
@@ -174,6 +216,7 @@ def register(data: dict[int, dict], registry_path: str | Path, *, timestamp=None
                 & (df["chip"].astype(str) == str(well["chip"]))
                 & (df["well"].astype(str) == str(well_no))
                 & (df["div"].astype(str) == str(well["DIV"]))
+                & (df["kind"].astype(str) == str(kind))
             )
             df = df[~mask]
             df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
@@ -181,26 +224,71 @@ def register(data: dict[int, dict], registry_path: str | Path, *, timestamp=None
             df = pd.DataFrame([new_row])
 
     # Defensive: collapse any pre-existing duplicates (mixed-dtype rows from older writes).
-    df = df.drop_duplicates(subset=["exp_id", "chip", "well", "div"], keep="last")
+    df = df.drop_duplicates(subset=REGISTRY_KEY, keep="last")
     df.to_csv(registry_path, index=False)
 
 
-def rebuild_registry(config, *, registry_path: str | Path | None = None) -> int:
-    """Rebuild the registry by scanning every preprocessed ``.npz`` in the managed store.
+# --- activity scans -------------------------------------------------------------------------------
 
-    :func:`save_preprocessed` keeps the registry current as data is written, so this is a recovery
-    path: use it when the registry has been lost or has drifted from what is actually on disk.
+
+def register_scan(params, registry_path: str | Path, *, timestamp=None) -> None:
+    """Upsert one ``activity_scan`` row per scanned well into the registry CSV.
+
+    A scan records every well simultaneously into a single ``.h5``, but it is registered per well so
+    the rows key the same way every other row does -- and so "what do I have for this culture" is one
+    query over one table, whether the answer is a scan or a cleaned recording.
+
+    Only the identity fields land here; they are also written into the ``.h5`` itself by
+    :func:`mxtreme.scans.mx_setup.write_metadata`, which is what :func:`rebuild_registry` reads back.
+
+    :param params: The scan's :class:`~mxtreme.scans.activity_scan.ActivityScanParams`. Only
+        ``exp_id``, ``chip``, ``div``, ``wells`` and ``conditions`` are read, so any object carrying
+        those works.
+    :param registry_path: Path to the registry CSV (typically ``config.registry_path``).
+    :type registry_path: str or Path
+    :param timestamp: Value for the rows' ``timestamp`` column; defaults to now.
+    """
+    conditions = list(params.conditions)
+    register(
+        {
+            well: {
+                "exp_id": params.exp_id,
+                "chip": params.chip,
+                "DIV": params.div,
+                # `conditions` is empty or one label per well -- validated by ActivityScanParams.
+                "experimental_condition": conditions[i] if i < len(conditions) else None,
+            }
+            for i, well in enumerate(params.wells)
+        },
+        registry_path,
+        kind="activity_scan",
+        timestamp=timestamp,
+    )
+
+
+def rebuild_registry(config, *, registry_path: str | Path | None = None) -> int:
+    """Rebuild the registry by scanning the managed store: every preprocessed ``.npz`` and every scan.
+
+    :func:`save_preprocessed` and :func:`register_scan` keep the registry current as data is written,
+    so this is a recovery path: use it when the registry has been lost or has drifted from what is
+    actually on disk.
 
     Each recording's identity and conditions are read from *inside* its ``.npz`` rather than inferred
     from the directory names, and each row is upserted through :func:`register`, so a rebuilt registry
-    is schema-identical to a live-written one. Rows carry the ``.npz``'s modification time as their
-    ``timestamp``. Existing rows are updated in place rather than dropped, so recordings whose ``.npz``
-    is no longer on disk survive a rebuild.
+    is schema-identical to a live-written one. Rows carry the source file's modification time as their
+    ``timestamp``. Existing rows are updated in place rather than dropped, so recordings whose file is
+    no longer on disk survive a rebuild.
+
+    A scan is rebuilt from the ``/assay/metadata`` blob inside its own ``.h5`` -- the same blob
+    :func:`mxtreme.extract.extract` reads -- rather than from its file name, which cannot be parsed
+    back into fields unambiguously (an ``exp_id`` may itself contain the underscores the name
+    separates fields with). A scan file with no such blob is counted and reported rather than guessed
+    at.
 
     :param config: The :class:`~mxtreme.config.Config` describing the managed store.
     :param registry_path: Override the destination; defaults to ``config.registry_path``.
     :type registry_path: str or Path or None
-    :returns: The number of recordings registered.
+    :returns: The number of recordings and scans registered.
     :rtype: int
     """
     if registry_path is None:
@@ -215,7 +303,7 @@ def rebuild_registry(config, *, registry_path: str | Path | None = None) -> int:
         """
         return np.asarray(npz[key]).tolist() if key in npz else None
 
-    n = 0
+    n_recordings = 0
     for npz_path in sorted(config.preprocessed_dir.glob("*/*/*/DIV*.npz")):
         # np.load is lazy, so reading these few keys never decompresses the spike arrays.
         with np.load(npz_path, allow_pickle=True) as npz:
@@ -230,10 +318,65 @@ def rebuild_registry(config, *, registry_path: str | Path | None = None) -> int:
                 registry_path,
                 timestamp=pd.Timestamp.fromtimestamp(npz_path.stat().st_mtime),
             )
-        n += 1
+        n_recordings += 1
 
-    print(f"Registry rebuilt from {n} recordings -> {registry_path}")
-    return n
+    n_scans, n_unreadable = 0, 0
+    for h5_path in sorted(config.scans_dir.glob("*/*/*.h5")):
+        embedded = _embedded_metadata(h5_path)
+        if embedded is None:
+            n_unreadable += 1
+            continue
+
+        register_scan(
+            _ScanIdentity(embedded),
+            registry_path,
+            timestamp=pd.Timestamp.fromtimestamp(h5_path.stat().st_mtime),
+        )
+        n_scans += 1
+
+    print(
+        f"Registry rebuilt from {n_recordings} recording(s) and {n_scans} scan(s) -> {registry_path}"
+    )
+    if n_unreadable:
+        print(
+            f"  {n_unreadable} scan file(s) skipped: no readable /assay/metadata blob inside them, "
+            "so their wells and DIV could not be recovered."
+        )
+    return n_recordings + n_scans
+
+
+def _embedded_metadata(h5_path: Path) -> dict | None:
+    """Read a scan's ``/assay/metadata`` blob, or ``None`` if it has none that can be parsed.
+
+    Same blob, and the same repr-with-quotes-swapped decoding, as :func:`mxtreme.extract.extract`.
+
+    :param h5_path: Path to the scan ``.h5``.
+    :returns: The decoded metadata dict, or ``None``.
+    """
+    import h5py  # local: io is imported off the rig, where the h5 half is often unused
+
+    try:
+        with h5py.File(str(h5_path), "r") as f:
+            raw = f["/assay/metadata"][:][0]
+        return json.loads(raw.decode("utf-8").strip().replace("'", '"'))
+    except (OSError, KeyError, ValueError, IndexError):
+        return None
+
+
+class _ScanIdentity:
+    """The fields :func:`register_scan` reads, pulled out of an ``.h5``'s metadata blob.
+
+    A thin adapter rather than a rebuilt :class:`~mxtreme.scans.activity_scan.ActivityScanParams`, so
+    :mod:`mxtreme.io` stays free of any import from :mod:`mxtreme.scans` (which reaches for rig-only
+    modules).
+    """
+
+    def __init__(self, embedded: dict):
+        self.exp_id = embedded["Exp ID"]
+        self.chip = embedded["Chip ID"]
+        self.div = embedded["DIV"]
+        self.wells = list(embedded["Well IDs"])
+        self.conditions = list(embedded.get("Conditions") or [])
 
 
 def repair_spike_order(config, *, dry_run: bool = False) -> list[Path]:

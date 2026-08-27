@@ -345,6 +345,7 @@ def write_metadata(s: mx.Saving, metadata: dict):
     :type s: mx.Saving
     :param metadata: Experiment metadata 
     :type metadata: dict
+    :returns: The metadata as written.
     """     
 
     # Format checks
@@ -360,15 +361,7 @@ def write_metadata(s: mx.Saving, metadata: dict):
     if not isinstance(metadata["Conditions"], list) or (len(metadata["Well IDs"]) != len(metadata["Conditions"]) and len(metadata["Conditions"])!=0):
         raise ValueError("Conditions must be a list the same length as the number of wells or length 0.")
     
-    # Convert the experiment ID to camelCase so there's no underscores or spaces
-    # e.g. "wave training" or "wave_training" --> "waveTraining"
-    parts = re.split(r'[_\s]+', metadata["Exp ID"].strip())
-    if parts:
-        if len(parts)>1:
-            metadata["Exp ID"] = parts[0].lower() + ''.join(word.capitalize() for word in parts[1:]) # replace experiment ID in the metadata dict
-        else:
-            metadata["Exp ID"] = parts[0][0].lower()+parts[0][1:] # make sure it starts lowercase
-    else:
+    if not isinstance(metadata["Exp ID"], str) or not metadata["Exp ID"].strip():
         raise ValueError("Enter an valid string Experiment ID.")
     
     s.write_assay_property("metadata", str(metadata))
