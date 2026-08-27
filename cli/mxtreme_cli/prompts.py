@@ -212,11 +212,15 @@ _DIRECT_LIMIT = 10
 _KEY_HINT = "\u2191/\u2193 move \u00b7 Enter select \u00b7 number jumps \u00b7 q back"
 _EDIT_HINT = "\u2191/\u2193 move \u00b7 Enter select \u00b7 number jumps \u00b7 q cancel"
 
+#: How often a menu repaints while something is running in the background, in seconds.
+_STATUS_REFRESH = 1.0
+
 
 def menu(
     options: Sequence[tuple[Any, str] | tuple[Any, str, str]],
     prompt: str = "Select an option",
     back_label: str = "Back",
+    refresh: float | None = None,
 ) -> Any | None:
     """Show a menu and return the chosen option's value.
 
@@ -227,11 +231,16 @@ def menu(
     :param prompt: Question shown with the list.
     :param back_label: Label for option ``0``, which returns ``None``. Empty for a menu with no way
         back, where only Ctrl-C leaves.
+    :param refresh: Repaint every this many seconds even when no key is pressed, so a live status
+        line stays current. Left unset, a menu shown while something is running picks its own.
     :returns: The chosen value, or ``None`` if the user chose to go back.
     :raises Cancelled: If the user backs out with Ctrl-C.
     """
+    if refresh is None and ui.status():
+        # Any menu shown while a scan is running gets the live block, not just the main one.
+        refresh = _STATUS_REFRESH
     if keys.available():
-        return _menu_keys(options, prompt, back_label)
+        return _menu_keys(options, prompt, back_label, refresh)
     return _menu_numbers(options, prompt, back_label)
 
 
@@ -244,6 +253,8 @@ def _menu_numbers(
     label_width = max(len(option[1]) for option in options)
     while True:
         print()
+        for line in ui.status():  # no live repaint here, but the menu still says what is running
+            ui.info(f"  {line}")
         for index, option in enumerate(options, start=1):
             _value, label, *rest = option
             ui.numbered(index, label, rest[0] if rest else "", label_width)
@@ -261,8 +272,14 @@ def _menu_keys(
     options: Sequence[tuple[Any, str] | tuple[Any, str, str]],
     prompt: str,
     back_label: str,
+    refresh: float | None = None,
 ) -> Any | None:
-    """Menu driven with the arrow keys, redrawn in place as the cursor moves."""
+    """Menu driven with the arrow keys, redrawn in place as the cursor moves.
+
+    A live status -- a scan running in the background -- is drawn inside this repaint region rather
+    than left to the banner above, which is only a snapshot from when the screen was entered. That
+    is what keeps the progress bar moving while the menu just sits there.
+    """
     label_width = max(len(option[1]) for option in options)
 
     # The back entry is one more row rather than a hidden key, so everything on offer is on screen.
@@ -274,27 +291,48 @@ def _menu_keys(
         rows.append((0, None, back_label, ""))
 
     position = 0
-    drawn = False
+    painted = 0  # lines the last paint used, which is how far back up the next one starts
 
     def draw() -> None:
-        nonlocal drawn
-        if drawn:
-            ui.cursor_up(len(rows) + 1)
+        nonlocal painted
+        if painted:
+            ui.cursor_up(painted)
+
+        lines = 0
+        if refresh is not None:
+            for line in ui.status():
+                ui.info(f"{ui.CLEAR_LINE}  {line}")
+                lines += 1
+            if lines:
+                print(ui.CLEAR_LINE)
+                lines += 1
+
         for row_index, (number, _value, label, detail) in enumerate(rows):
             ui.numbered(number, label, detail, label_width, selected=row_index == position)
+            lines += 1
         ui.hint(f"{prompt}: {_KEY_HINT}")
-        drawn = True
+        lines += 1
+
+        # A shorter paint than the last one -- a scan ended and dropped off the status -- would
+        # leave the tail of the old paint on screen, so blank it and step back over it.
+        for _ in range(painted - lines):
+            print(ui.CLEAR_LINE)
+        if painted > lines:
+            ui.cursor_up(painted - lines)
+        painted = lines
 
     print()
     with keys.raw_mode():
         while True:
             draw()
             try:
-                key = keys.read_key()
+                key = keys.read_key(refresh)
             except (EOFError, KeyboardInterrupt):
                 print()
                 raise Cancelled from None
 
+            if key is None:
+                continue  # refresh tick: nothing pressed, come round and repaint the status
             if key == keys.UP:
                 position = (position - 1) % len(rows)
             elif key == keys.DOWN:

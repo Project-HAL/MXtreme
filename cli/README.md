@@ -48,6 +48,25 @@ Set `MXTREME_CLI_TRACEBACK=1` to see a traceback when a screen raises something 
 
 After a scan finishes, the CLI offers to run electrode selection on the file it just produced.
 
+### Scans run in the background
+
+Starting an activity scan hands you straight back to the main menu. The scan runs on its own thread,
+and every screen's header carries its progress — recordings done, a bar, and an estimate of the time
+left worked out from the rounds already recorded rather than from the nominal recording length, so
+routing and offset-compensation overhead are included.
+
+Choosing **Activity scan** while one is running warns you first and offers to start another anyway,
+to stop the running one, or to go back. Starting another is allowed but rarely what you want: one
+rig drives one chip, and two scans sharing it will interleave their routing and recording.
+
+Nothing is ever overwritten. MaxLab refuses to reuse a filename that already exists and appends
+`_1`, `_2`, … instead, so an earlier scan's `.h5` survives a new scan of the same name — you end up
+with both. The screen says which case you are in before anything is written.
+
+Quitting with a scan still running is refused. The recording in progress has to end before the `.h5`
+can be closed, so you are offered either to wait it out or to stop after the current recording; both
+finalize the file, and everything recorded so far stays readable.
+
 ### Scan protocols
 
 The Activity Scan screen lists protocols from `SCANS` in `mxtreme_cli/screens/activity_scan.py`. Today there
@@ -87,6 +106,7 @@ Electrode selection writes, into the output directory:
 | `mxtreme_cli/screens/data_analysis.py` | Data Analysis stub |
 | `mxtreme_cli/prompts.py` | Menus, typed prompts, the parameter editor |
 | `mxtreme_cli/keys.py` | Single-keypress input for the arrow-driven lists |
+| `mxtreme_cli/jobs.py` | Background scan threads and the status the banner reads |
 | `mxtreme_cli/ui.py` | Headings, status lines, tables, colour |
 
 One module per menu entry lives under `mxtreme_cli/screens/`; `app.py` imports each lazily, so a

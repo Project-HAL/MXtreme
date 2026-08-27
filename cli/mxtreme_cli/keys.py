@@ -100,13 +100,19 @@ def raw_mode(hide_cursor: bool = True) -> Iterator[None]:
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
 
 
-def read_key() -> str:
+def read_key(timeout: float | None = None) -> str | None:
     """Block until one key is pressed and return it. Only meaningful inside :func:`raw_mode`.
 
-    :returns: One of this module's key tokens, or the character itself for an ordinary key.
+    :param timeout: Give up after this many seconds and return ``None``. Used by menus that have a
+        live status line to repaint while the user is not pressing anything.
+    :returns: One of this module's key tokens, the character itself for an ordinary key, or ``None``
+        if the timeout ran out first.
     :raises KeyboardInterrupt: On Ctrl-C.
     :raises EOFError: On Ctrl-D, or if the input stream ends.
     """
+    if timeout is not None and not _pending(timeout):
+        return None
+
     fd = sys.stdin.fileno()
     data = os.read(fd, 6)
 

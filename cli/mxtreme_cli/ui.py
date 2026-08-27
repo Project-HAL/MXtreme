@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import shutil
 import sys
+from typing import Callable
 
 _COLOR = sys.stdout.isatty()
 
@@ -27,6 +28,9 @@ CLEAR_LINE = "\033[2K" if _COLOR else ""
 
 #: Marks the highlighted row of an arrow-driven menu.
 MARKER = "\u25b8"
+
+#: Name shown above every screen heading, so the user always knows what they are in.
+PRODUCT = "MXtreme"
 
 #: Width used for rules and wrapping, clamped so it stays readable in a very wide terminal.
 WIDTH = min(shutil.get_terminal_size((80, 24)).columns, 88)
@@ -48,13 +52,38 @@ def rule(char: str = "=") -> None:
     print(_DIM + char * WIDTH + _RESET)
 
 
-def banner(title: str, subtitle: str = "") -> None:
-    """Print a screen heading -- the title of whatever menu or step is now in front of the user."""
+#: Supplies the lines shown under every banner, or ``None`` for none. The CLI points this at the
+#: background scan registry at startup; keeping it a hook rather than an import is what lets
+#: :mod:`mxtreme_cli.ui` stay the bottom of the import graph.
+status_provider: Callable[[], list[str]] | None = None
+
+
+def status() -> list[str]:
+    """Whatever the status provider currently reports, or nothing if it is unset or broken."""
+    if status_provider is None:
+        return []
+    try:
+        return status_provider()
+    except Exception:  # noqa: BLE001 -- a broken status line must not take a screen down with it
+        return []
+
+
+def banner(title: str, subtitle: str = "", product: str = "") -> None:
+    """Print a screen heading -- the title of whatever menu or step is now in front of the user.
+
+    :param title: The screen's own name.
+    :param subtitle: One line saying what the screen is for.
+    :param product: Shown above the title, so every screen carries the same identity. Screens pass
+        nothing and get the CLI's own name.
+    """
     print()
     rule("=")
+    print(f"{_DIM}{product or PRODUCT}{_RESET}")
     print(f"{_BOLD}{title}{_RESET}")
     if subtitle:
         print(f"{_DIM}{subtitle}{_RESET}")
+    for line in status():
+        print(f"{_CYAN}\u2022 {line}{_RESET}")
     rule("=")
 
 

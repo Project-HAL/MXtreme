@@ -55,6 +55,14 @@ _NO_DEVICE = (
 
 ProgressFn = Callable[[str], None]
 
+#: Called with ``(completed_rounds, total_rounds)`` after each recording finishes. Text progress is
+#: fine for a log, but a caller that wants to draw a progress bar should not have to parse it.
+RoundFn = Callable[[int, int], None]
+
+#: Asked before each round whether to stop. Lets a caller on another thread end a scan tidily at a
+#: round boundary, where the file can still be finalized, rather than killing it mid-recording.
+StopFn = Callable[[], bool]
+
 
 @dataclass
 class ActivityScanParams:
@@ -444,6 +452,8 @@ def run_activity_scan(
     params: ActivityScanParams,
     seed: int | None = None,
     on_progress: ProgressFn = print,
+    on_round: RoundFn | None = None,
+    should_stop: StopFn | None = None,
 ) -> ActivityScanResult:
     """Run an activity scan on the rig and save every recording into one ``.h5``.
 
@@ -460,6 +470,11 @@ def run_activity_scan(
     :param seed: Seed for electrode-subset shuffling, for a reproducible scan.
     :param on_progress: Called with each progress line. Defaults to :func:`print`; pass a callback
         to route it into a UI, or ``lambda _: None`` to silence it.
+    :param on_round: Called with ``(completed, total)`` after each recording, for a caller that
+        wants counts rather than text.
+    :param should_stop: Asked before each round; return ``True`` to end the scan early. The file is
+        finalized as usual and the rounds already recorded are kept, so the result is a short scan
+        rather than a failed one.
     :raises ModuleNotFoundError: If ``maxlab`` is not installed (i.e. this is not the rig).
     :raises ValueError: If the parameters are not runnable; see :meth:`ActivityScanParams.validate`.
     :raises RuntimeError: If no device is connected, or if routing fails for any well.
@@ -502,6 +517,10 @@ def run_activity_scan(
 
     try:
         for i in range(params.n_scans):
+            if should_stop is not None and should_stop():
+                on_progress(f"\nStopping early after {completed} of {params.n_scans} recordings.")
+                break
+
             on_progress(f"\n--- Scan {i + 1}/{params.n_scans} ---")
 
             # 1. Route this round's electrodes in every well
@@ -537,6 +556,8 @@ def run_activity_scan(
             on_progress(
                 f"  Scan {i + 1}/{params.n_scans} complete ({elapsed / 60:.1f} min elapsed)"
             )
+            if on_round is not None:
+                on_round(completed, params.n_scans)
 
     finally:
         on_progress("\nFinalizing file and closing arrays...")
