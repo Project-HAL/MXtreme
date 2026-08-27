@@ -7,6 +7,12 @@ Choosing electrodes and reading configuration files are ordinary offline work an
 dependencies. Only :mod:`mxtreme.scans.mx_setup`, which drives the array itself, requires MaxWell's
 ``maxlab`` API — see :doc:`../install` for how to get it onto a rig machine.
 
+Activity scans
+--------------
+
+.. automodule:: mxtreme.scans.activity_scan
+   :members:
+
 Electrode selection
 -------------------
 
