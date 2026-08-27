@@ -19,9 +19,23 @@ The launcher works whether or not `mxtreme` is installed: it prefers the install
 back to `src/` on the path. Nothing outside `cli/` has to be configured, and no existing module is
 modified.
 
-Menus are numbered. `0` goes back (and quits from the main menu), Enter accepts the shown default,
-and Ctrl-C backs out of the current step rather than killing the session. Set
-`MXTREME_CLI_TRACEBACK=1` to see a traceback when a screen raises something unexpected.
+### Getting around
+
+Lists are driven with the arrow keys: **↑/↓** moves the highlighted row, **Enter** chooses it, and
+**q** or **Esc** goes back. Typing a row's number jumps to it, and in a list short enough that every
+row has a single digit, the number *is* the choice — no Enter needed. Ctrl-C backs out of the
+current step rather than killing the session.
+
+The parameter editor works the same way. Its first row is "Continue with these values" and the
+cursor starts there, so the fast path is unchanged: open the screen, press Enter, run with the
+defaults. Choosing a parameter prompts for a new value and returns you to the same row.
+
+Where the terminal cannot deliver single keypresses — piped input, output to a log, Windows — every
+list falls back to the older numbered form, where you type a number and press Enter. That fallback
+is what keeps the CLI scriptable, so both paths are maintained rather than one being a legacy
+leftover.
+
+Set `MXTREME_CLI_TRACEBACK=1` to see a traceback when a screen raises something unexpected.
 
 ## Menu
 
@@ -72,6 +86,7 @@ Electrode selection writes, into the output directory:
 | `mxtreme_cli/screens/electrode_selection.py` | Electrode Selection screen |
 | `mxtreme_cli/screens/data_analysis.py` | Data Analysis stub |
 | `mxtreme_cli/prompts.py` | Menus, typed prompts, the parameter editor |
+| `mxtreme_cli/keys.py` | Single-keypress input for the arrow-driven lists |
 | `mxtreme_cli/ui.py` | Headings, status lines, tables, colour |
 
 One module per menu entry lives under `mxtreme_cli/screens/`; `app.py` imports each lazily, so a
