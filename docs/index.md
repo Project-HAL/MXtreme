@@ -28,6 +28,7 @@ quickstart
 :maxdepth: 2
 :caption: Concepts
 
+concepts/data-flow
 concepts/configuration
 ```
 
