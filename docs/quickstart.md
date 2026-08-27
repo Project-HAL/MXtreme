@@ -4,7 +4,7 @@
 
 TODO
 
-## Analaysis 
+## Analysis 
 
 Raw `.h5` file(s) to a PDF report. Each step writes to the managed store, so you can
 stop after any of them and pick up later without recomputing.
