@@ -27,23 +27,23 @@ from scipy.spatial.distance import cdist
 from mxtreme import device
 
 
-def MEA(ax, channelmap, stim_elecs, title="MEA Channel Layout"):
+def MEA(ax, channelmap, stim_elecs, title="MEA Channel Layout", marker_size=36, stim_fontsize=16):
     """Plot the electrode layout of the MEA, marking stimulation electrodes.
 
     :param ax: Matplotlib axes to draw on.
     :param channelmap: ``(n, 5)`` channel map (cols: index, channel, electrode, x, y; positions in µm).
     :param stim_elecs: Electrode IDs to mark with a ⚡ (may be ``None``/empty).
     :param title: Axes title.
+    :param marker_size: Electrode marker area. The default suits a full-page axes; shrink it when
+        drawing the array into a small panel, where ~1k default-sized markers merge into a blob.
+    :param stim_fontsize: Size of the ⚡ marking stimulation electrodes; scale it with ``marker_size``.
     """
     mid_point = (device.CHIP_WIDTH / 2) * device.ELEC_SIZE  # x midpoint of the array
     chip_ht_um = device.CHIP_HEIGHT * device.ELEC_SIZE
 
     # channelmap[:, 3] are x locations, channelmap[:, 4] are y locations
-    num_chans_left = np.sum(channelmap[:, 3] < mid_point)
-    num_chans_right = np.sum(channelmap[:, 3] > mid_point)
-    print(f"Left: {num_chans_left}, Right: {num_chans_right}")
-
-    ax.scatter(channelmap[:, 3], chip_ht_um - channelmap[:, 4], marker=".", facecolors="none", edgecolors="k")
+    ax.scatter(channelmap[:, 3], chip_ht_um - channelmap[:, 4], marker=".", s=marker_size,
+               facecolors="none", edgecolors="k")
     ax.plot([mid_point, mid_point], [0, chip_ht_um], "b--", label="Midpoint")
     ax.set_title(title)
     ax.set_xlabel("x direction (µm)")
@@ -55,7 +55,8 @@ def MEA(ax, channelmap, stim_elecs, title="MEA Channel Layout"):
     # Mark stimulation electrodes (channelmap[:, 2] is the electrode ID) with lightning-bolt emojis
     stim_coords = channelmap[np.isin(channelmap[:, 2], stim_elecs), 3:5]
     for x, y in stim_coords:
-        txt = ax.text(x, chip_ht_um - y, "⚡", fontsize=16, ha="center", va="center", color="gold")
+        txt = ax.text(x, chip_ht_um - y, "⚡", fontsize=stim_fontsize, ha="center", va="center",
+                      color="gold")
         txt.set_path_effects([path_effects.Stroke(linewidth=1, foreground="black"), path_effects.Normal()])
 
 
@@ -239,7 +240,8 @@ def _smoothed_density(xs, ys, weights, *, bandwidth_um, chip_wd_um, chip_ht_um):
 
 def plot_origin_heatmap(recording, burst_df, ax=None, phase=None, kind="network",
                         color="r", kde_cmap="Blues", title=None, method="hist",
-                        bandwidth_um=None, vmax=None, colorbar=True):
+                        bandwidth_um=None, vmax=None, colorbar=True, marker_size=100,
+                        elec_marker_size=36):
     """Plot burst-origin locations and their spiking-channel density over the MEA.
 
     The density layer pools every burst's ``origin_chan_counts``, weighting each electrode by its
@@ -278,6 +280,8 @@ def plot_origin_heatmap(recording, burst_df, ax=None, phase=None, kind="network"
     :param vmax: Upper limit of the density color scale (``"hist"`` only). ``None`` scales each plot
         to its own peak; pass the same value across plots to preserve relative magnitude between them.
     :param colorbar: Draw a colorbar for the density (``"hist"`` only), so the scale is readable.
+    :param marker_size: Area of the origin markers; shrink it when drawing into a small panel.
+    :param elec_marker_size: Area of the electrode markers, passed to :func:`MEA`.
     """
     if method not in ("kde", "hist", "per_burst"):
         raise ValueError(f"Unknown method {method!r}; expected 'hist', 'kde' or 'per_burst'.")
@@ -325,11 +329,12 @@ def plot_origin_heatmap(recording, burst_df, ax=None, phase=None, kind="network"
     x_origin = bursts["origin_x"].to_numpy()
     y_origin = bursts["origin_y"].to_numpy()
 
-    MEA(ax, channelmap, recording.stim_elecs, title="")
+    MEA(ax, channelmap, recording.stim_elecs, title="", marker_size=elec_marker_size,
+        stim_fontsize=max(6, 16 * elec_marker_size / 36))
     # Semi-transparent: with a few hundred bursts these markers otherwise merge into a solid blob and
     # hide both the density layer and their own concentration.
-    ax.scatter(x_origin, chip_ht_um - y_origin, color=color, marker="x", s=100, linewidths=3,
-               alpha=0.5)
+    ax.scatter(x_origin, chip_ht_um - y_origin, color=color, marker="x", s=marker_size,
+               linewidths=3 * min(1, marker_size / 100), alpha=0.5)
     ax.set_xlim([0, chip_wd_um])
     ax.set_ylim([0, chip_ht_um])
     base = title if title is not None else "MEA electrode layout - burst origins"
