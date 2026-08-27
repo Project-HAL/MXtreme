@@ -15,9 +15,9 @@ import numpy as np
 
 from mxtreme.scans import activity_scan as scan
 from mxtreme.scans.activity_scan import ActivityScanParams
-from mxtreme_cli import electrode_selection as selection_screen
 from mxtreme_cli import prompts, ui
 from mxtreme_cli.prompts import Param
+from mxtreme_cli.screens import electrode_selection as selection_screen
 
 
 @dataclass(frozen=True)

@@ -1,8 +1,8 @@
 """Top-level menu: the three things the CLI can do.
 
-Screens are imported lazily, one per menu entry, so a machine that is missing a screen's
-dependencies (matplotlib for electrode selection, ``maxlab`` on the rig side) can still start the CLI
-and use the screens that do work.
+The screens themselves live in :mod:`mxtreme_cli.screens`, one module per entry. They are
+imported lazily, so a machine that is missing a screen's dependencies (matplotlib for electrode
+selection, ``maxlab`` on the rig side) can still start the CLI and use the screens that do work.
 """
 
 from __future__ import annotations
@@ -15,19 +15,19 @@ SUBTITLE = "HD-MEA scans, electrode selection and analysis"
 
 
 def _activity_scan() -> None:
-    from mxtreme_cli import activity_scan
+    from mxtreme_cli.screens import activity_scan
 
     activity_scan.screen()
 
 
 def _electrode_selection() -> None:
-    from mxtreme_cli import electrode_selection
+    from mxtreme_cli.screens import electrode_selection
 
     electrode_selection.screen()
 
 
 def _data_analysis() -> None:
-    from mxtreme_cli import data_analysis
+    from mxtreme_cli.screens import data_analysis
 
     data_analysis.screen()
 

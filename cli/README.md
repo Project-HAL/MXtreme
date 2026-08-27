@@ -36,7 +36,7 @@ After a scan finishes, the CLI offers to run electrode selection on the file it 
 
 ### Scan protocols
 
-The Activity Scan screen lists protocols from `SCANS` in `mxtreme_cli/activity_scan.py`. Today there
+The Activity Scan screen lists protocols from `SCANS` in `mxtreme_cli/screens/activity_scan.py`. Today there
 is one, **Kam Scan**: the array is covered by a series of short recordings, each routing a different
 random subset of the available electrodes, drawn without replacement so a well's recordings do not
 overlap until the array has been covered once.
@@ -68,11 +68,15 @@ Electrode selection writes, into the output directory:
 | --- | --- |
 | `run_cli.py` | Launcher; sets up `sys.path` and calls `app.main()` |
 | `mxtreme_cli/app.py` | Top-level menu and error handling |
-| `mxtreme_cli/activity_scan.py` | Activity Scan screen and the protocol list |
-| `mxtreme_cli/electrode_selection.py` | Electrode Selection screen |
-| `mxtreme_cli/data_analysis.py` | Data Analysis stub |
+| `mxtreme_cli/screens/activity_scan.py` | Activity Scan screen and the protocol list |
+| `mxtreme_cli/screens/electrode_selection.py` | Electrode Selection screen |
+| `mxtreme_cli/screens/data_analysis.py` | Data Analysis stub |
 | `mxtreme_cli/prompts.py` | Menus, typed prompts, the parameter editor |
 | `mxtreme_cli/ui.py` | Headings, status lines, tables, colour |
+
+One module per menu entry lives under `mxtreme_cli/screens/`; `app.py` imports each lazily, so a
+missing dependency takes out only the screen that needs it. Adding a screen is a module there plus a
+row in `MAIN_MENU`.
 
 The scan itself lives in the package, not here: `mxtreme.scans.activity_scan`. Its planning half
 (`ActivityScanParams`, `plan_scan_electrodes`) is pure Python, which is what lets this CLI show and
