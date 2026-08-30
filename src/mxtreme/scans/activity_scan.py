@@ -361,6 +361,7 @@ def _require_maxlab():
     """Import ``maxlab``, with an error that says what to do when it is missing.
 
     Imported lazily so the planning half of this module works off the rig.
+    :mod:`mxtreme.scans.network_scan` uses this too.
 
     :raises ModuleNotFoundError: When MaxLab Live's Python API is not importable.
     """
@@ -368,7 +369,7 @@ def _require_maxlab():
         import maxlab as mx
     except ModuleNotFoundError as exc:  # pragma: no cover -- depends on a rig-only install
         raise ModuleNotFoundError(
-            "Running an activity scan requires the 'maxlab' Python API, which ships with MaxWell's "
+            "Recording on the rig requires the 'maxlab' Python API, which ships with MaxWell's "
             "MaxLab Live software and is not available from PyPI. Install MaxLab Live on the rig "
             "machine and put its Python package on PYTHONPATH. Planning a scan and selecting "
             "electrodes from one (mxtreme.scans.electrode_selection) do not need maxlab."
