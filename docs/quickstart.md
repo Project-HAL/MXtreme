@@ -2,6 +2,74 @@
 
 ## Scans 
 
+### Activity Scanning
+
+An *activity scan* sweeps the whole array to find where a culture is firing. The chip can only route
+1020 electrodes at a time per well, so the array is covered by a series of short recordings, each
+routing a different subset. The result is one `.h5` that feeds
+{mod}`~mxtreme.scans.electrode_selection` to pick the electrodes for a network scan.
+
+#### 1. Describe the scan with ActivityScanParams
+
+```python
+from mxtreme.config import Config
+from mxtreme.scans import activity_scan
+
+config = Config.from_toml("mxtreme.toml")
+
+params = activity_scan.ActivityScanParams(
+    exp_id="May2025_Wave",
+    chip="M07460",
+    plate_date=260810,   # YYMMDD
+    div=1,
+    wells=[0],           # 0..5; all selected wells are scanned simultaneously
+    n_scans=8,           # number of recordings
+    rec_length_sec=60,   # length of each recording
+    electrode_spacing=1, # 0 = every electrode, 1 = every other in rows and columns
+)
+
+print(activity_scan.describe(params))
+```
+
+{func}`~mxtreme.scans.activity_scan.describe` prints the run time and how much of the array the scan covers, so you can adjust before committing to the recording. The defaults are a working scan: ~8 minutes over one well, covering roughly a quarter of the array. Use `params.estimated_minutes` and `params.array_coverage` if you want the numbers directly — coverage above `1.0` means the scan revisits electrodes it has already recorded.
+
+{meth}`~mxtreme.scans.activity_scan.ActivityScanParams.validate` runs automatically before the chip is touched, so bad wells, an over-long routing request or too coarse a spacing fail immediately rather than mid-scan.
+
+#### 2. Run it (requires Maxwell device connection)
+
+```python
+result = activity_scan.run_activity_scan(params, config)
+
+print(result.h5_path, result.completed_scans, result.complete)
+```
+
+The `.h5` is always finalized — even if a round fails or you stop early — so a partial scan is still readable.
+
+#### 3. Where it lands
+
+A scan is an MXtreme output, so it goes into the managed store: the `.h5` under
+`config.scans_dir/<exp_id>/<chip>/`, and one `activity_scan` row per scanned well in
+`registry.csv`. Set `save_path` to write somewhere else instead (a scratch directory on the rig,
+say); the scan is then left out of the registry, since nothing says which store it belongs to.
+
+```python
+params = activity_scan.ActivityScanParams(..., save_path="/tmp/scratch")
+```
+
+#### 4. Select recording electrodes
+
+Feed the file to {func}`~mxtreme.scans.electrode_selection.select_electrodes`, which filters down to an active subset across all rounds of the activity scan. 
+
+```python
+from mxtreme.scans import electrode_selection
+
+rec_elecs = electrode_selection.select_electrodes(str(result.h5_path), save_path="…")
+```
+
+It returns `{well: [electrode, ...]}` and writes the summary plots and per-well `recording_electrodes` `.npz` files.
+
+### Network Scanning
+
 TODO
 
 ## Analaysis 
