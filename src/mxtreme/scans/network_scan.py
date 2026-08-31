@@ -16,7 +16,11 @@ Structurally this mirrors :mod:`mxtreme.scans.activity_scan`, and for the same r
   imported on the first call rather than at module import.
 
 The difference is that a network scan is one recording rather than a series of them, so there is no
-electrode plan to make: what to record is an input, not something this module decides.
+electrode plan to make: what to record is an input, not something this module decides. The one thing
+it does decide is the *rest* of the routing -- electrode selection's thresholds usually leave fewer
+than the :data:`~mxtreme.scans.activity_scan.MAX_ROUTED_ELECTRODES` the chip can route, and unused
+routing capacity is free data, so each well is topped up to the limit with random electrodes (see
+:func:`pad_electrodes`).
 
 Like an activity scan it lands in the package-managed store -- the ``.h5`` under
 ``config.scans_dir/<exp_id>/<chip>/``, one ``network_scan`` row per well in ``registry.csv`` -- and
@@ -42,6 +46,8 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+
+import numpy as np
 
 from mxtreme import io
 from mxtreme.scans.activity_scan import (
@@ -77,6 +83,9 @@ class NetworkScanParams:
     :param recording_electrodes: ``{well: [electrode, ...]}``, as returned by
         :func:`mxtreme.scans.electrode_selection.select_electrodes`. Numpy arrays are accepted and
         normalized to plain lists of ``int``, so the selector's output can be passed straight in.
+        Unless ``pad_to_max`` is off, each well is topped up to
+        :data:`~mxtreme.scans.activity_scan.MAX_ROUTED_ELECTRODES` here, so after construction this
+        holds exactly what the scan will record.
     :param chip: Chip serial, e.g. ``"M07460"``. Written to the file's metadata and used in its name.
     :param plate_date: Plating date as ``YYMMDD``; validated by :func:`mxtreme.scans.mx_setup.write_metadata`.
     :param div: Days *in vitro* at the time of the scan.
@@ -85,6 +94,9 @@ class NetworkScanParams:
         the same length as ``wells``.
     :param description: Free-text description written to the file.
     :param rec_length_sec: Length of the recording, in seconds.
+    :param pad_to_max: Fill each well's selection up to the routing limit with random electrodes.
+        Set it to ``False`` to record only the electrodes selection chose.
+    :param seed: Seed for that random fill, for a reproducible electrode set.
     :param save_path: Directory the ``.h5`` is written into. ``None`` -- the default -- means the
         managed store, resolved against the :class:`~mxtreme.config.Config` passed to
         :func:`run_network_scan`. Set it to write somewhere outside the store instead; the scan is
@@ -103,22 +115,37 @@ class NetworkScanParams:
 
     # Scan
     rec_length_sec: int = 300
+    pad_to_max: bool = True
+    seed: int | None = None
 
     # Output -- None means "the managed store"; see `resolved`.
     save_path: str | None = None
 
     def __post_init__(self) -> None:
-        """Normalize the electrode mapping to plain ``{int: [int, ...]}``.
+        """Normalize the electrode mapping to plain ``{int: [int, ...]}``, and fill it to the limit.
 
         ``select_electrodes`` hands back numpy arrays of numpy integers. Those route perfectly well,
         but they serialize into the metadata blob as ``np.int64(4213)`` and compare unequally to the
         ints everything else uses, so they are converted once here rather than guarded against
         everywhere downstream.
+
+        The padding happens here too, rather than at record time, so that everything downstream --
+        :func:`describe`, :meth:`validate`, a front end previewing the scan -- sees the electrodes
+        that will actually be recorded. A well selection left empty is *not* padded: recording 1020
+        random electrodes in a well nothing was chosen for would be data from nowhere, and would
+        quietly satisfy the empty-well check in :meth:`validate`.
         """
         self.recording_electrodes = {
             int(well): [int(e) for e in electrodes]
             for well, electrodes in self.recording_electrodes.items()
         }
+
+        if self.pad_to_max:
+            rng = np.random.default_rng(self.seed)
+            self.recording_electrodes = {
+                well: pad_electrodes(electrodes, rng=rng) if electrodes else electrodes
+                for well, electrodes in self.recording_electrodes.items()
+            }
 
     @property
     def wells(self) -> list[int]:
@@ -256,6 +283,34 @@ class NetworkScanResult:
         return self.recorded_sec >= self.params.rec_length_sec
 
 
+def pad_electrodes(
+    electrodes, n: int = MAX_ROUTED_ELECTRODES, rng=None
+) -> list[int]:
+    """Top one well's electrode list up to ``n`` with electrodes drawn at random from the rest.
+
+    Electrode selection thresholds a scan down to the electrodes that were genuinely active, which
+    is usually well under the chip's routing limit. Routing capacity left unused records nothing, so
+    the remainder is filled at random: the chosen electrodes are still recorded exactly as selected,
+    and the spare channels are a free look at the rest of the array.
+
+    :param electrodes: The electrodes selection chose for this well.
+    :param n: Electrodes to fill up to. A list already at or over ``n`` is returned unchanged.
+    :param rng: A :class:`numpy.random.Generator` to draw with; ``None`` draws fresh randomness.
+    :returns: The chosen electrodes, in their original order, followed by the random fill.
+    :rtype: list[int]
+    """
+    chosen = [int(e) for e in electrodes]
+    shortfall = n - len(chosen)
+    if shortfall <= 0:
+        return chosen
+
+    rng = np.random.default_rng() if rng is None else rng
+    remaining = np.setdiff1d(np.arange(N_TOTAL_ELECTRODES), chosen)
+    fill = rng.choice(remaining, size=shortfall, replace=False)
+
+    return chosen + sorted(int(e) for e in fill)
+
+
 def describe(params: NetworkScanParams) -> str:
     """Render a human-readable summary of a scan, for confirming it before it runs.
 
@@ -273,6 +328,12 @@ def describe(params: NetworkScanParams) -> str:
         f"Experiment     : {params.exp_id}",
         f"Wells          : {params.wells}",
         f"Electrodes     : {per_well or 'none'}",
+        (
+            "                 (selection topped up to "
+            f"{MAX_ROUTED_ELECTRODES} per well with random electrodes)"
+            if params.pad_to_max
+            else "                 (as chosen by electrode selection; no random fill)"
+        ),
         f"Recording time : {params.estimated_minutes:.1f} min (excluding routing overhead)",
         # Describing a scan is a planning step, and planning happens before a Config is necessarily
         # in hand -- so an unresolved destination is reported, not raised over.

@@ -99,6 +99,12 @@ recording length. {meth}`~mxtreme.scans.network_scan.NetworkScanParams.validate`
 asking for more than the 1020 electrodes the chip can route, a duplicated or out-of-range electrode,
 and a bad well before the chip is touched.
 
+Electrode selection thresholds each well down to the electrodes that were genuinely active, usually
+well under the routing limit. Spare routing capacity records nothing, so each well is topped up to
+1020 with random electrodes — the chosen ones are recorded exactly as selected, and the rest is a
+free look at the array. Pass `seed=` for a reproducible fill, or `pad_to_max=False` to record only
+what selection chose. A well selection left empty is not padded.
+
 Then run it on the rig:
 
 ```python
