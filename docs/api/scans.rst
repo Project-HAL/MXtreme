@@ -13,6 +13,12 @@ Activity scans
 .. automodule:: mxtreme.scans.activity_scan
    :members:
 
+Network scans
+-------------
+
+.. automodule:: mxtreme.scans.network_scan
+   :members:
+
 Electrode selection
 -------------------
 

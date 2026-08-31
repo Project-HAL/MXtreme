@@ -7,7 +7,7 @@ Contents:
 - :func:`load_preprocessed` -- read a cleaned ``.npz`` back into a dict.
 - :func:`save_preprocessed` -- write one well's cleaned data to an ``.npz`` (and register it).
 - :func:`register` -- record processed recordings in the registry CSV.
-- :func:`register_scan` -- record an activity scan in that same registry.
+- :func:`register_scan` -- record an activity or network scan in that same registry.
 - :func:`rebuild_registry` -- rebuild that registry by scanning the store (recovery path).
 - :func:`save_burst_data` / :func:`load_burst_data` -- per-recording burst CSVs.
 - :func:`update_burst_log` -- per-experiment burst summary CSV.
@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 
@@ -138,8 +139,8 @@ def save_preprocessed(
 REGISTRY_KEY = ["exp_id", "chip", "well", "div", "kind"]
 
 #: What a registry row describes. ``"preprocessed"`` is one well of a cleaned recording;
-#: ``"activity_scan"`` is one well of an activity scan's raw ``.h5``.
-REGISTRY_KINDS = ("preprocessed", "activity_scan")
+#: ``"activity_scan"`` and ``"network_scan"`` are one well of the corresponding scan's raw ``.h5``.
+REGISTRY_KINDS = ("preprocessed", "activity_scan", "network_scan")
 
 
 def _read_registry(registry_path: Path) -> pd.DataFrame:
@@ -228,11 +229,31 @@ def register(
     df.to_csv(registry_path, index=False)
 
 
-# --- activity scans -------------------------------------------------------------------------------
+# --- scans ----------------------------------------------------------------------------------------
+
+#: Matches the scan kind in a file name written by :mod:`mxtreme.scans` (``..._activity_scan.raw.h5``,
+#: ``..._network_scan_1.raw.h5``), which is the only thing on disk that tells the two apart -- the
+#: embedded metadata blob carries the culture's identity, not what was run on it.
+_SCAN_KIND = re.compile(r"_(activity|network)_scan(_\d+)?\.raw\.h5$")
 
 
-def register_scan(params, registry_path: str | Path, *, timestamp=None) -> None:
-    """Upsert one ``activity_scan`` row per scanned well into the registry CSV.
+def scan_kind(h5_path: str | Path) -> str:
+    """Work out whether a scan file is an activity scan or a network scan, from its name.
+
+    :param h5_path: Path to the scan ``.h5``.
+    :returns: ``"activity_scan"`` or ``"network_scan"``. Anything unrecognised is reported as an
+        activity scan, which is what the scans directory held before network scans were written into
+        it.
+    :rtype: str
+    """
+    match = _SCAN_KIND.search(Path(h5_path).name)
+    return f"{match.group(1)}_scan" if match else "activity_scan"
+
+
+def register_scan(
+    params, registry_path: str | Path, *, kind: str = "activity_scan", timestamp=None
+) -> None:
+    """Upsert one scan row per scanned well into the registry CSV.
 
     A scan records every well simultaneously into a single ``.h5``, but it is registered per well so
     the rows key the same way every other row does -- and so "what do I have for this culture" is one
@@ -246,6 +267,9 @@ def register_scan(params, registry_path: str | Path, *, timestamp=None) -> None:
         those works.
     :param registry_path: Path to the registry CSV (typically ``config.registry_path``).
     :type registry_path: str or Path
+    :param kind: Which sort of scan these rows describe -- ``"activity_scan"`` or
+        ``"network_scan"``, see :data:`REGISTRY_KINDS`.
+    :type kind: str
     :param timestamp: Value for the rows' ``timestamp`` column; defaults to now.
     """
     conditions = list(params.conditions)
@@ -261,7 +285,7 @@ def register_scan(params, registry_path: str | Path, *, timestamp=None) -> None:
             for i, well in enumerate(params.wells)
         },
         registry_path,
-        kind="activity_scan",
+        kind=kind,
         timestamp=timestamp,
     )
 
@@ -330,6 +354,7 @@ def rebuild_registry(config, *, registry_path: str | Path | None = None) -> int:
         register_scan(
             _ScanIdentity(embedded),
             registry_path,
+            kind=scan_kind(h5_path),
             timestamp=pd.Timestamp.fromtimestamp(h5_path.stat().st_mtime),
         )
         n_scans += 1

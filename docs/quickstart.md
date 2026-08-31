@@ -70,7 +70,65 @@ It returns `{well: [electrode, ...]}` and writes the summary plots and per-well 
 
 ### Network Scanning
 
-TODO
+A *network scan* is the recording the activity scan exists to set up: one fixed set of electrodes per
+well, recorded continuously at full rate. It takes the `{well: [electrode, ...]}` mapping
+{func}`~mxtreme.scans.electrode_selection.select_electrodes` returns and records exactly those wells.
+
+Same shape as an activity scan — planning is offline, running needs `maxlab` on the rig, and the
+`.h5` lands in the managed store.
+
+```python
+from mxtreme.scans import electrode_selection, network_scan
+
+rec_elecs = electrode_selection.select_electrodes(str(result.h5_path), save_path="…")
+
+params = network_scan.NetworkScanParams(
+    recording_electrodes=rec_elecs,   # {well: [electrode, ...]}; the wells come from its keys
+    exp_id="May2025_Wave",
+    chip="M07460",
+    plate_date=260810,
+    div=25,
+    rec_length_sec=300,
+)
+
+print(network_scan.describe(params))
+```
+
+There is no electrode plan to make — what to record is an input — so the only scan parameter is the
+recording length. {meth}`~mxtreme.scans.network_scan.NetworkScanParams.validate` catches a well
+asking for more than the 1020 electrodes the chip can route, a duplicated or out-of-range electrode,
+and a bad well before the chip is touched.
+
+Electrode selection thresholds each well down to the electrodes that were genuinely active, usually
+well under the routing limit. Spare routing capacity records nothing, so each well is topped up to
+1020 with random electrodes — the chosen ones are recorded exactly as selected, and the rest is a
+free look at the array. Pass `seed=` for a reproducible fill, or `pad_to_max=False` to record only
+what selection chose. A well selection left empty is not padded.
+
+Then run it on the rig:
+
+```python
+scan = network_scan.run_network_scan(params, config)
+
+print(scan.h5_path, scan.recorded_sec, scan.complete)
+```
+
+Each well's electrodes are routed, amplifier offsets are compensated, then every well records
+simultaneously. Progress is printed every 30 s; pass `on_progress=` to route it elsewhere and
+`should_stop=` for a callback that ends the recording early. The `.h5` is always finalized, so a
+scan cut short is still readable.
+
+The file goes to `config.scans_dir/<exp_id>/<chip>/` as `..._network_scan.raw.h5` with one
+`network_scan` row per well in `registry.csv`; `save_path` writes it elsewhere, unregistered — the
+same rules as an activity scan.
+
+A network scan is an ordinary recording, so it feeds straight into the analysis workflow below:
+
+```python
+from mxtreme import extract
+
+data = extract.extract(str(scan.h5_path))
+```
 
 ## Analysis 
 
