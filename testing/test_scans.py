@@ -128,3 +128,114 @@ def test_dist_thresh_relaxation_restarts_for_each_well(capsys):
     # Five steps per well (83, 66, 49, 32, 15), for two wells.
     assert len(relaxations) == 10, relaxations
     assert relaxations[:5] == relaxations[5:], "second well did not restart from the caller's value"
+
+
+# --- where a scan is written --------------------------------------------------------------------
+
+
+def _params(**overrides):
+    from mxtreme.scans.activity_scan import ActivityScanParams
+
+    defaults = {"exp_id": "expA", "chip": "C0001", "plate_date": 250512, "div": 14, "wells": [0]}
+    return ActivityScanParams(**{**defaults, **overrides})
+
+
+def test_scan_defaults_into_the_managed_store(tmp_path):
+    """No save_path means the store: <scans_dir>/<exp_id>/<chip>/, mirroring the other trees."""
+    from mxtreme.config import Config
+
+    config = Config(data_root=tmp_path)
+    resolved = _params().resolved(config)
+
+    assert resolved.h5_path.parent == config.scans_dir / "expA" / "C0001"
+    assert resolved.h5_path.name == "DIV14_250512_C0001_expA_activity_scan.raw.h5"
+
+
+def test_resolved_returns_a_copy_and_leaves_the_caller_s_params_alone(tmp_path):
+    from mxtreme.config import Config
+
+    params = _params()
+    resolved = params.resolved(Config(data_root=tmp_path))
+
+    assert params.save_path is None
+    assert resolved is not params and resolved.save_path is not None
+
+
+def test_an_explicit_save_path_wins(tmp_path):
+    from mxtreme.config import Config
+
+    params = _params(save_path=str(tmp_path / "scratch"))
+    resolved = params.resolved(Config(data_root=tmp_path))
+
+    assert resolved is params
+    assert resolved.h5_path.parent == tmp_path / "scratch"
+
+
+def test_no_config_and_no_save_path_is_an_error():
+    params = _params()
+    with pytest.raises(ValueError, match="needs somewhere to write"):
+        params.resolved()
+    with pytest.raises(ValueError, match="save_path is unset"):
+        _ = params.h5_path
+
+
+def test_file_name_separates_scans_of_one_chip_by_div():
+    """Without the DIV in the name, two scans of a chip collide and MaxLab writes the second as _1."""
+    assert _params(div=14).file_name != _params(div=21).file_name
+
+
+def test_describe_reports_an_unresolved_destination_rather_than_raising():
+    """Planning happens before a Config is necessarily in hand."""
+    from mxtreme.scans.activity_scan import describe
+
+    text = describe(_params())
+    assert "the managed store" in text
+    assert "DIV14_250512_C0001_expA_activity_scan.raw.h5" in text
+
+
+def test_run_activity_scan_rejects_a_stale_positional_seed():
+    """`config` took the position `seed` used to hold; a stale call must fail loudly, not silently."""
+    from mxtreme.scans.activity_scan import run_activity_scan
+
+    with pytest.raises(TypeError, match="expects a Config"):
+        run_activity_scan(_params(), 42)
+
+
+def test_register_scan_only_for_a_scan_that_landed_in_the_store(tmp_path):
+    """A registry row for a file outside the store could never be resolved back to it."""
+    import pandas as pd
+
+    from mxtreme.config import Config
+    from mxtreme.scans.activity_scan import ActivityScanResult, _register_scan
+
+    config = Config(data_root=tmp_path)
+    params = _params(save_path=str(tmp_path / "scratch"))
+    result = ActivityScanResult(
+        h5_path=params.h5_path, params=params, scan_electrodes={0: [[1, 2]]},
+        completed_scans=1, duration_sec=1.0,
+    )
+
+    _register_scan(result, None, lambda _: None)  # registry_path=None: written outside the store
+    assert not config.registry_path.exists()
+
+    _register_scan(result, config.registry_path, lambda _: None)
+    assert len(pd.read_csv(config.registry_path)) == 1
+
+
+def test_register_scan_survives_a_registry_it_cannot_write(tmp_path):
+    """Bookkeeping must never cost a scan that is already safely on disk."""
+    from mxtreme.scans.activity_scan import ActivityScanResult, _register_scan
+
+    params = _params(save_path=str(tmp_path))
+    result = ActivityScanResult(
+        h5_path=params.h5_path, params=params, scan_electrodes={}, completed_scans=1,
+        duration_sec=1.0,
+    )
+
+    messages = []
+    # A directory where the registry CSV should be: writing it raises OSError.
+    blocked = tmp_path / "registry.csv"
+    blocked.mkdir()
+    _register_scan(result, blocked, messages.append)
+
+    assert any("could not register" in m for m in messages)

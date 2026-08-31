@@ -9,6 +9,8 @@ later stage reads back from there. The structure is as follows:
 
 ```
 <data_root>/
+├── scans/                         activity-scan .h5, as written on the rig
+│   └── <exp_id>/<chip>/DIV<d>_<plate_date>_<chip>_<exp_id>_activity_scan.raw.h5
 ├── preprocessed/                  cleaned .npz, one per well per recording
 │   └── <exp_id>/<chip>/well<N>/DIV<d>_<plate_date>_<chip>_<exp_id>_well<N>_exp_data.npz
 ├── burst_data/                    per-recording burst CSVs + per-experiment burst logs
@@ -16,10 +18,13 @@ later stage reads back from there. The structure is as follows:
 ├── analysis/                      per-culture summary CSVs, plots, PDF reports
 │   ├── <category>/<exp_id>/<chip>/well<N>/<culture_id>_<name>.csv
 │   └── reports/<slug>_report.pdf
-└── registry.csv                   index of everything that has been processed
+└── registry.csv                   index of every scan and recording in the store
 ```
 
-Raw `.h5` inputs are **not** resolved through the store. You point at those by explicit path.
+An activity scan has no `well<N>` level: one `.h5` holds every well it recorded.
+
+Raw `.h5` recordings acquired **outside** MXtreme are not resolved through the store — you point at
+those by explicit path. A scan MXtreme ran itself is an output, and does live in the store.
 
 ## `mxtreme.toml`
 
@@ -52,6 +57,7 @@ subtree:
 
 | Property | Directory |
 |---|---|
+| {attr}`~mxtreme.config.Config.scans_dir` | `data_root/scans` |
 | {attr}`~mxtreme.config.Config.preprocessed_dir` | `data_root/preprocessed` |
 | {attr}`~mxtreme.config.Config.burst_data_dir` | `data_root/burst_data` |
 | {attr}`~mxtreme.config.Config.analysis_dir` | `data_root/analysis` |
@@ -111,9 +117,38 @@ machine. Move the store, edit one line of TOML, and every path follows.
 
 ## The registry
 
-`registry.csv` indexes what has been processed. It is upserted on **every** `.npz` write by
-{func}`mxtreme.io.register`, called from {func}`~mxtreme.io.save_preprocessed`.
+`registry.csv` indexes what is in the store. It is upserted on **every** `.npz` write by
+{func}`mxtreme.io.register`, called from {func}`~mxtreme.io.save_preprocessed`, and on every activity
+scan by {func}`mxtreme.io.register_scan`.
 
-If it is deleted or drifts out of sync with the files on disk,
-{func}`mxtreme.io.rebuild_registry` reconstructs it by scanning the store and returns the number of
-recordings found.
+Rows are keyed by `(exp_id, chip, well, div, kind)`:
+
+| Column | |
+|---|---|
+| `exp_id`, `chip`, `well`, `div` | which culture, on which day |
+| `kind` | `preprocessed` for a cleaned recording, `activity_scan` for a scan |
+| `conditions` | the well's experimental condition, when it has one |
+| `timestamp` | when the row was written |
+
+`kind` is part of the key, so a scan and the recordings later preprocessed from the same well and DIV
+are separate rows rather than one overwriting the other:
+
+```
+exp_id,chip,well,div,kind,conditions,timestamp
+May2025_Wave,M07459,0,14,activity_scan,,2026-08-27T09:14:02
+May2025_Wave,M07459,0,14,preprocessed,"[2, 0]",2026-08-27T11:40:57
+```
+
+A scan is registered once per well it recorded, so "what do I have for this culture" stays a single
+query over a single table. Path resolution ({mod}`mxtreme.paths`) reads only the `preprocessed` rows —
+a scan is a raw `.h5` with no cleaned `.npz` behind it, so counting those rows would resolve to files
+that do not exist. A registry written before scans were indexed has no `kind` column; it is read as
+all-`preprocessed` and gains the column on its next write.
+
+If the registry is deleted or drifts out of sync with the files on disk,
+{func}`mxtreme.io.rebuild_registry` reconstructs it by scanning the store — both the preprocessed
+`.npz` files and the scans — and returns how many it found. Both are rebuilt from inside the file
+itself: recordings from the `.npz`, scans from the `/assay/metadata` blob in the `.h5` that
+{func}`mxtreme.extract.extract` also reads. File names are never parsed back into fields, since an
+`exp_id` may contain the same underscores the name separates fields with. A scan with no such blob is
+reported rather than guessed at.

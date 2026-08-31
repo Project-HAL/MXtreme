@@ -15,6 +15,7 @@ def test_from_toml_resolves_directories(tmp_path):
     toml = _write_toml(tmp_path, '[data]\nroot = "/data/store"\n')
     cfg = Config.from_toml(toml)
     assert str(cfg.data_root) == "/data/store"
+    assert cfg.scans_dir == cfg.data_root / "scans"
     assert cfg.preprocessed_dir == cfg.data_root / "preprocessed"
     assert cfg.burst_data_dir == cfg.data_root / "burst_data"
     assert cfg.analysis_dir == cfg.data_root / "analysis"

@@ -184,6 +184,120 @@ def test_rebuild_registry_preserves_rows_without_npz(make_well, tmp_path):
     assert set(df["exp_id"]) == {"testExp", "gone"}
 
 
+# --- activity scans -------------------------------------------------------------------------------
+
+
+class _FakeScanParams:
+    """The five fields ``register_scan`` reads, without importing the rig-side scan module."""
+
+    def __init__(self, wells=(0, 1), conditions=(), exp_id="scanExp", chip="C1", div=3):
+        self.exp_id, self.chip, self.div = exp_id, chip, div
+        self.wells, self.conditions = list(wells), list(conditions)
+
+
+def test_register_scan_writes_one_row_per_well(tmp_path):
+    import pandas as pd
+
+    registry = tmp_path / "registry.csv"
+    io.register_scan(_FakeScanParams(wells=(0, 2), conditions=("ctrl", "drug")), registry)
+
+    df = pd.read_csv(registry).sort_values("well").reset_index(drop=True)
+    assert list(df["well"]) == [0, 2]
+    assert set(df["kind"]) == {"activity_scan"}
+    assert list(df["conditions"]) == ["ctrl", "drug"]
+    assert (df["div"] == 3).all()
+
+
+def test_scan_and_recording_coexist_for_the_same_culture(make_well, tmp_path):
+    """`kind` is part of the key, so a scan does not overwrite the recording preprocessed from it."""
+    import pandas as pd
+
+    registry = tmp_path / "registry.csv"
+    well = _clean_well(make_well)
+    io.save_preprocessed(tmp_path, well, registry_path=registry)
+    io.register_scan(
+        _FakeScanParams(wells=(well["well"],), exp_id=well["exp_id"], chip=well["chip"],
+                        div=well["DIV"]),
+        registry,
+    )
+
+    df = pd.read_csv(registry)
+    assert len(df) == 2
+    assert set(df["kind"]) == {"preprocessed", "activity_scan"}
+
+
+def test_register_backfills_kind_on_an_older_registry(tmp_path):
+    """A registry written before scans were indexed holds recordings, and is labelled as such."""
+    import pandas as pd
+
+    registry = tmp_path / "registry.csv"
+    pd.DataFrame(
+        [{"exp_id": "old", "chip": "C9", "well": 3, "div": 1, "conditions": "",
+          "timestamp": "2020-01-01T00:00:00"}]
+    ).to_csv(registry, index=False)
+
+    io.register_scan(_FakeScanParams(wells=(0,)), registry)
+
+    df = pd.read_csv(registry)
+    assert len(df) == 2
+    assert df.loc[df["exp_id"] == "old", "kind"].item() == "preprocessed"
+    assert df.loc[df["exp_id"] == "scanExp", "kind"].item() == "activity_scan"
+
+
+def _store_with_scan(tmp_path, wells=(0, 1), metadata=True):
+    """Write a scan .h5 into a managed store, carrying the /assay/metadata blob MaxLab writes."""
+    import h5py
+
+    from mxtreme.config import Config
+
+    config = Config(data_root=tmp_path)
+    params = _FakeScanParams(wells=wells, conditions=("ctrl", "drug")[: len(wells)])
+    h5_path = (
+        config.scans_dir / params.exp_id / params.chip
+        / f"DIV{params.div}_250512_{params.chip}_{params.exp_id}_activity_scan.raw.h5"
+    )
+    h5_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with h5py.File(h5_path, "w") as f:
+        if metadata:
+            blob = str({
+                "Exp ID": params.exp_id, "Chip ID": params.chip, "Plate date": 250512,
+                "DIV": params.div, "Well IDs": list(params.wells),
+                "Conditions": list(params.conditions),
+            })
+            f.create_dataset("/assay/metadata", data=np.array([blob.encode("utf-8")]))
+    return config, h5_path
+
+
+def test_rebuild_registry_recovers_scans_from_their_embedded_metadata(tmp_path):
+    import pandas as pd
+
+    config, _ = _store_with_scan(tmp_path)
+    assert io.rebuild_registry(config) == 1  # one scan, no recordings
+
+    df = pd.read_csv(config.registry_path)
+    assert list(df["well"]) == [0, 1]
+    assert set(df["kind"]) == {"activity_scan"}
+    assert list(df["conditions"]) == ["ctrl", "drug"]
+
+
+def test_rebuild_registry_skips_a_scan_with_no_embedded_metadata(tmp_path, capsys):
+    """Wells and DIV cannot be recovered from the file name alone, so the scan is reported, not guessed."""
+    config, _ = _store_with_scan(tmp_path, metadata=False)
+
+    assert io.rebuild_registry(config) == 0
+    assert "1 scan file(s) skipped" in capsys.readouterr().out
+
+
+def test_rebuild_registry_counts_recordings_and_scans_together(make_well, tmp_path):
+    config, _ = _store_with_scan(tmp_path, wells=(0,))
+    well = _clean_well(make_well)
+    io.save_preprocessed(config.preprocessed_dir, well, registry_path=config.registry_path)
+
+    config.registry_path.unlink()
+    assert io.rebuild_registry(config) == 2  # one recording + one scan
+
+
 # --- spike-order repair -------------------------------------------------------------------------
 
 

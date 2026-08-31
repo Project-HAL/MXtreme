@@ -6,7 +6,16 @@ is cheap and re-runnable. This page traces what moves between the stages and whi
 each hop.
 
 ```
-   raw .raw.h5                (your files, read-only, referenced by explicit path)
+   mxtreme.scans.activity_scan.run_activity_scan()   (on the rig; optional)
+        │
+        ▼
+   scans/…/*_activity_scan.raw.h5  +  registry.csv
+        │                                          ◄── managed store begins here
+        │  mxtreme.scans.electrode_selection.select_electrodes()
+        ▼
+   the network-scan electrode list a recording is then made with
+        ⋮
+   raw .raw.h5                (a recording: yours by explicit path, or a scan MXtreme ran)
         │
         │  mxtreme.extract.extract()
         ▼
@@ -30,9 +39,37 @@ each hop.
    analysis/reports/*.pdf
 ```
 
-Everything from `preprocessed/` down lives inside the **managed store**, a single directory tree the
-package owns. Raw `.h5` inputs are deliberately *outside* it — you point at those by explicit path,
-and MXtreme never writes near them. See [Configuration](configuration.md).
+Everything in that diagram except the raw recording lives inside the **managed store**, a single
+directory tree the package owns. Raw `.h5` files MXtreme did not produce are deliberately *outside*
+it — you point at those by explicit path, and MXtreme never writes near them. An activity scan is
+different: MXtreme wrote it, so it is an output and goes in the store like any other.
+See [Configuration](configuration.md).
+
+## Stage 0 — Scan (rig only, optional)
+
+{func}`mxtreme.scans.activity_scan.run_activity_scan` sweeps the array to find where a culture is
+firing, and is the one stage that produces a raw `.h5` rather than consuming one. Give it a
+`Config` and it writes into the store:
+
+```python
+from mxtreme.config import Config
+from mxtreme.scans import activity_scan
+
+config = Config.from_toml("mxtreme.toml")
+params = activity_scan.ActivityScanParams(
+    exp_id="May2025_Wave", chip="M07459", plate_date=250512, div=14, wells=[0, 1]
+)
+result = activity_scan.run_activity_scan(params, config)   # -> result.h5_path
+```
+
+Two things land: the `.h5` under `config.scans_dir/<exp_id>/<chip>/`, and one `activity_scan` row per
+scanned well in `registry.csv`. The row is written even when a scan stops early, so a short scan is
+still findable. Setting `ActivityScanParams.save_path` sends the `.h5` somewhere else instead and
+skips registration — a row pointing outside the store could never be resolved back.
+
+The scan then feeds {func}`mxtreme.scans.electrode_selection.select_electrodes`, which turns it into
+the electrode list the actual network-scan recording is made with. That recording is what Stage 1
+picks up.
 
 ## Stage 1 — Extract
 

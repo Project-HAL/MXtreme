@@ -79,6 +79,34 @@ def test_resolve_single_culture_all_divs(store):
     assert cpath.recordings[7].burst_stats.exists()
 
 
+def test_resolve_ignores_activity_scan_rows(store):
+    """The registry also indexes scans -- raw .h5 files with no .npz behind them.
+
+    Counting those rows would invent DIVs (and whole cultures) that resolve to preprocessed paths
+    which do not exist.
+    """
+    config, cid_a, _ = store
+
+    class _ScanParams:
+        exp_id, chip, div = "expA", "C0001", 21  # a DIV culture A has no recording for
+        wells, conditions = [0], []
+
+    io.register_scan(_ScanParams(), config.registry_path)
+    assert len(pd.read_csv(config.registry_path)) == 4  # the scan row really is there
+
+    assert sorted(resolve_paths(cid_a, config).recordings) == [7, 8]
+    assert len(resolve_recordings(CultureSelector(exp_ids=["expA"]), config)) == 2
+
+
+def test_resolve_reads_a_registry_written_before_scans_were_indexed(store):
+    """No `kind` column at all: every row is a recording, and resolution is unchanged."""
+    config, cid_a, _ = store
+    df = pd.read_csv(config.registry_path).drop(columns=["kind"])
+    df.to_csv(config.registry_path, index=False)
+
+    assert sorted(resolve_paths(cid_a, config).recordings) == [7, 8]
+
+
 def test_resolve_recordings_flattens_a_selection(store):
     config, cid_a, cid_b = store
     recs = resolve_recordings(CultureSelector(cultures=[cid_a, cid_b]), config)

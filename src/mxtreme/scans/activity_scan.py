@@ -1,9 +1,16 @@
-"""Run an activity scan on the rig and write it to a single ``.h5``.
+"""Run an activity scan on the rig and write it to a single ``.h5`` in the managed store.
 
 An *activity scan* sweeps the whole array to find where a culture is firing. The chip can only route
 :data:`MAX_ROUTED_ELECTRODES` electrodes at a time, so the array is covered in a series of short
 recordings, each routing a different random subset. Feed the resulting file to
 :mod:`mxtreme.scans.electrode_selection` to turn it into a network-scan electrode list.
+
+A scan is an MXtreme *output*, so it lands in the package-managed data store like every other one:
+:func:`run_activity_scan` takes a :class:`~mxtreme.config.Config`, writes the ``.h5`` under
+``config.scans_dir/<exp_id>/<chip>/`` and upserts one ``activity_scan`` row per scanned well into
+``registry.csv``. Set :attr:`ActivityScanParams.save_path` to write somewhere else instead -- a
+scratch directory on the rig, say -- and the scan is left out of the registry, since nothing then
+says which store it belongs to.
 
 The module is split in two, deliberately:
 
@@ -17,24 +24,28 @@ The module is split in two, deliberately:
 
 Typical use::
 
+    from mxtreme.config import Config
     from mxtreme.scans import activity_scan
 
-    params = activity_scan.ActivityScanParams(chip="M07460", plate_date=260810, div=1, wells=[0])
-    result = activity_scan.run_activity_scan(params)
+    config = Config.from_toml("mxtreme.toml")
+    params = activity_scan.ActivityScanParams(
+        exp_id="May2025_Wave", chip="M07460", plate_date=260810, div=1, wells=[0]
+    )
+    result = activity_scan.run_activity_scan(params, config)
     # -> result.h5_path feeds electrode_selection.select_electrodes()
 """
 
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable
 
 import h5py
 import numpy as np
 
-from mxtreme import device
+from mxtreme import device, io
 
 #: Total electrodes on the array.
 N_TOTAL_ELECTRODES = device.CHIP_WIDTH * device.CHIP_HEIGHT  # 26400
@@ -69,8 +80,10 @@ class ActivityScanParams:
     """Everything needed to plan and run one activity scan.
 
     The defaults are a working scan: ~8 minutes of recording over one well, covering roughly a
-    quarter of the array. Only ``chip``, the plate metadata and ``save_path`` really have to be set
-    per experiment.
+    quarter of the array. Only ``chip``, ``exp_id`` and the plate metadata really have to be set per
+    experiment -- those five fields name the scan's place in the managed store, so leaving ``exp_id``
+    at its default files the scan under a directory of that name rather than with the experiment it
+    belongs to.
 
     :param chip: Chip serial, e.g. ``"M07460"``. Written to the file's metadata and used in its name.
     :param plate_date: Plating date as ``YYMMDD``; validated by :func:`mxtreme.scans.mx_setup.write_metadata`.
@@ -87,14 +100,17 @@ class ActivityScanParams:
         so on -- a coarser grid covers more of the array's *area* per scan.
     :param electrodes_per_scan: Electrodes routed per well per recording; capped at
         :data:`MAX_ROUTED_ELECTRODES`.
-    :param save_path: Directory the ``.h5`` is written into.
+    :param save_path: Directory the ``.h5`` is written into. ``None`` -- the default -- means the
+        managed store, resolved against the :class:`~mxtreme.config.Config` passed to
+        :func:`run_activity_scan`. Set it to write somewhere outside the store instead; the scan is
+        then not registered.
     """
 
     # Metadata
     chip: str = "M07460"
     plate_date: int = 260810
     div: int = 1
-    exp_id: str = "activity scan"
+    exp_id: str = "activity_scan"
     wells: list[int] = field(default_factory=lambda: [0])
     conditions: list[str] = field(default_factory=list)
     description: str = "Activity scan to determine recording electrodes for each well"
@@ -105,18 +121,60 @@ class ActivityScanParams:
     electrode_spacing: int = 1
     electrodes_per_scan: int = MAX_ROUTED_ELECTRODES
 
-    # Output
-    save_path: str = "/home/mxwbio/Desktop/HAL/data/kam_activity_scan_testing"
+    # Output -- None means "the managed store"; see `resolved`.
+    save_path: str | None = None
 
     @property
     def file_name(self) -> str:
-        """Base name of the ``.h5``, without MaxWell's ``.raw.h5`` suffix."""
-        return f"{self.chip}_{self.plate_date}_ACTIVITY_SCAN"
+        """Base name of the ``.h5``, without MaxWell's ``.raw.h5`` suffix.
+
+        Built the same way as every other name in the store
+        (``DIV<div>_<plate_date>_<chip>_<exp_id>_...``), so a scan sorts beside the recordings it
+        belongs to. Including the DIV also keeps two scans of one chip on different days apart --
+        without it they collide on a single name and MaxLab quietly writes the second as ``_1``.
+        """
+        return f"DIV{self.div}_{self.plate_date}_{self.chip}_{self.exp_id}_activity_scan"
 
     @property
     def h5_path(self) -> Path:
-        """Where MaxWell will write the scan: ``<save_path>/<file_name>.raw.h5``."""
+        """Where MaxWell will write the scan: ``<save_path>/<file_name>.raw.h5``.
+
+        :raises ValueError: If ``save_path`` is unset, since the destination then depends on a
+            :class:`~mxtreme.config.Config` this object does not have. Call :meth:`resolved` first.
+        """
+        if self.save_path is None:
+            raise ValueError(
+                "save_path is unset, so this scan's destination is not known yet: it comes from the "
+                "managed store. Call params.resolved(config) for a copy that knows where it writes."
+            )
         return Path(self.save_path) / f"{self.file_name}.raw.h5"
+
+    def resolved(self, config=None) -> ActivityScanParams:
+        """Return a copy whose ``save_path`` is filled in, so every path property is answerable.
+
+        An explicit ``save_path`` wins and the object is returned unchanged; otherwise the scan lands
+        in the managed store at ``config.scans_dir/<exp_id>/<chip>/``, mirroring the
+        ``<exp_id>/<chip>/`` layout the preprocessed and burst trees already use (with no ``well``
+        level, since one scan file holds every well it recorded).
+
+        Returning a copy rather than mutating in place keeps a caller's params reusable across
+        scans, while :attr:`ActivityScanResult.params` still records where the scan actually went.
+
+        :param config: The :class:`~mxtreme.config.Config` describing the managed store. Only needed
+            when ``save_path`` is unset.
+        :raises ValueError: If there is neither a ``save_path`` nor a ``config`` to derive one from.
+        :returns: This object, or a copy with ``save_path`` set.
+        :rtype: ActivityScanParams
+        """
+        if self.save_path is not None:
+            return self
+        if config is None:
+            raise ValueError(
+                "An activity scan needs somewhere to write, and this one has neither. Pass "
+                "config=Config.from_toml('mxtreme.toml') to save it into the managed store, or set "
+                "ActivityScanParams.save_path to write outside the store."
+            )
+        return replace(self, save_path=str(Path(config.scans_dir) / self.exp_id / self.chip))
 
     @property
     def estimated_minutes(self) -> float:
@@ -273,9 +331,11 @@ def plan_scan_electrodes(
 def describe(params: ActivityScanParams) -> str:
     """Render a human-readable summary of a scan, for confirming it before it runs.
 
-    :param params: The scan to describe.
+    :param params: The scan to describe. An unresolved ``save_path`` is fine; the destination is
+        then reported as the managed store rather than as a concrete path.
     :returns: A multi-line summary.
     """
+    destination = f"the managed store, as {params.file_name}.raw.h5"
     lines = [
         f"Chip           : {params.chip}",
         f"Plate date     : {params.plate_date} | DIV: {params.div}",
@@ -289,7 +349,9 @@ def describe(params: ActivityScanParams) -> str:
         ),
         f"Array coverage : {params.array_coverage:.2f}x of the available electrodes",
         f"Recording time : {params.estimated_minutes:.1f} min (excluding routing overhead)",
-        f"Saving to      : {params.h5_path}",
+        # Describing a scan is a planning step, and planning happens before a Config is necessarily
+        # in hand -- so an unresolved destination is reported, not raised over.
+        f"Saving to      : {params.h5_path if params.save_path is not None else destination}",
         "                 (MaxLab appends _1, _2 ... if that name is already taken)",
     ]
     return "\n".join(lines)
@@ -399,7 +461,7 @@ def _saved_file(params: ActivityScanParams, started_at: float) -> Path:
     the caller a *previous* scan's file -- and the chain into electrode selection would silently
     analyse the wrong recording.
 
-    :param params: The scan that was just run.
+    :param params: The scan that was just run. Must be :meth:`~ActivityScanParams.resolved`.
     :param started_at: ``time.time()`` from just before recording began; files older than this are
         left-overs from earlier scans.
     :returns: The newest matching file written during this scan, falling back to the predicted path
@@ -450,6 +512,8 @@ def _connected_device(mx) -> str:
 
 def run_activity_scan(
     params: ActivityScanParams,
+    config=None,
+    *,
     seed: int | None = None,
     on_progress: ProgressFn = print,
     on_round: RoundFn | None = None,
@@ -462,11 +526,20 @@ def run_activity_scan(
     ``params.rec_length_sec``. The electrode subsets come from :func:`plan_scan_electrodes`, so the
     rounds of a well do not overlap until the array has been covered once.
 
+    The scan goes into the managed store described by ``config``: the ``.h5`` under
+    ``config.scans_dir/<exp_id>/<chip>/``, and one ``activity_scan`` row per scanned well in
+    ``config.registry_path``. Registration happens after the recording finishes, including when it
+    stopped early, so a short scan is still findable. An explicit ``params.save_path`` overrides the
+    destination and skips registration -- a row for a file outside the store could never be resolved
+    back to it.
+
     The file is finalized and the arrays closed even if a round fails partway through -- otherwise
     every completed recording would be lost to an unclosed file. A failure still propagates, but the
-    partial file on disk is readable.
+    partial file on disk is readable. Registration is skipped on that path.
 
     :param params: The scan to run. Validated before the chip is touched.
+    :param config: The :class:`~mxtreme.config.Config` naming the managed store to save into and
+        register with. Optional only when ``params.save_path`` says where to write instead.
     :param seed: Seed for electrode-subset shuffling, for a reproducible scan.
     :param on_progress: Called with each progress line. Defaults to :func:`print`; pass a callback
         to route it into a UI, or ``lambda _: None`` to silence it.
@@ -476,13 +549,32 @@ def run_activity_scan(
         finalized as usual and the rounds already recorded are kept, so the result is a short scan
         rather than a failed one.
     :raises ModuleNotFoundError: If ``maxlab`` is not installed (i.e. this is not the rig).
-    :raises ValueError: If the parameters are not runnable; see :meth:`ActivityScanParams.validate`.
+    :raises TypeError: If ``config`` is not a :class:`~mxtreme.config.Config`.
+    :raises ValueError: If the parameters are not runnable (see :meth:`ActivityScanParams.validate`),
+        or if there is neither a ``config`` nor a ``save_path`` to write to.
     :raises RuntimeError: If no device is connected, or if routing fails for any well.
     :returns: An :class:`ActivityScanResult` naming the file and the electrodes each scan recorded.
     """
+    if config is not None and not hasattr(config, "scans_dir"):
+        # `config` sits where `seed` used to, so catch a stale positional call loudly rather than
+        # letting an int through to be ignored whenever save_path happens to be set.
+        raise TypeError(
+            f"run_activity_scan() expects a Config as its second argument, got "
+            f"{type(config).__name__}. `seed` is now keyword-only: run_activity_scan(params, config, "
+            "seed=...)."
+        )
+
     mx = _require_maxlab()
     from mxtreme.scans import mx_setup  # rig-only import; deferred for the same reason as maxlab
 
+    # Registering only makes sense for a scan that actually lands in the store: a row for a file
+    # written anywhere else could never be resolved back to it. Decided before resolution, which is
+    # what erases the distinction between a derived save_path and a given one.
+    registry_path = config.registry_path if config is not None and params.save_path is None else None
+
+    # Resolve before anything is created, so a scan with nowhere to go fails now rather than after
+    # eight minutes of recording.
+    params = params.resolved(config)
     plan = plan_scan_electrodes(params, seed=seed)  # validates params
 
     on_progress("=== Activity scan ===")
@@ -582,12 +674,49 @@ def run_activity_scan(
             "Electrode selection will need it added before it can read this scan."
         )
 
-    on_progress(f"\nActivity scan complete! ({duration / 60:.1f} min)")
-
-    return ActivityScanResult(
+    result = ActivityScanResult(
         h5_path=h5_path,
         params=params,
         scan_electrodes=recorded,
         completed_scans=completed,
         duration_sec=duration,
     )
+    _register_scan(result, registry_path, on_progress)
+
+    on_progress(f"\nActivity scan complete! ({duration / 60:.1f} min)")
+
+    return result
+
+
+def _register_scan(
+    result: ActivityScanResult, registry_path: Path | None, on_progress: ProgressFn
+) -> None:
+    """Record the scan in the registry, without letting bookkeeping lose a finished scan.
+
+    The recording is the expensive, unrepeatable part; a registry someone has open in Excel is not a
+    reason to raise over eight minutes of data that is already safely on disk. So the failure is
+    reported and swallowed rather than propagated -- :func:`mxtreme.io.rebuild_registry` recovers the
+    row from the file's own metadata afterwards.
+
+    :param result: The completed (or early-stopped) scan.
+    :param registry_path: The registry to record the scan in, or ``None`` to skip registration --
+        which is the case when the caller redirected the scan out of the store.
+    :param on_progress: Where to report a failure.
+    """
+    params = result.params
+
+    if registry_path is None:
+        on_progress(
+            "Not registered: this scan was written to an explicit save_path, so it is not in a "
+            "managed store to be indexed by one."
+        )
+        return
+
+    try:
+        io.register_scan(params, registry_path)
+        on_progress(f"Registered wells {params.wells} in {registry_path}")
+    except (OSError, ValueError) as exc:  # ValueError covers a registry CSV pandas cannot parse
+        on_progress(
+            f"Warning: could not register the scan ({exc}). The file is fine; "
+            "io.rebuild_registry(config) will pick it up."
+        )
