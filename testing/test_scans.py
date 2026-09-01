@@ -132,23 +132,53 @@ def test_dist_thresh_relaxation_restarts_for_each_well(capsys):
 
 # --- where a scan is written --------------------------------------------------------------------
 
+BATCH = "fall2026_batch1_DRG_M1"
+STEM = f"plating_250512_{BATCH}_chip_C0001_well_0_DIV_14"
+
 
 def _params(**overrides):
     from mxtreme.scans.activity_scan import ActivityScanParams
 
-    defaults = {"exp_id": "expA", "chip": "C0001", "plate_date": 250512, "div": 14, "wells": [0]}
+    defaults = {"batch": BATCH, "chip": "C0001", "plate_date": 250512, "div": 14, "wells": [0]}
     return ActivityScanParams(**{**defaults, **overrides})
 
 
 def test_scan_defaults_into_the_managed_store(tmp_path):
-    """No save_path means the store: <scans_dir>/<exp_id>/<chip>/, mirroring the other trees."""
+    """No save_path means the store: a single-well scan records straight into its well/DIV home."""
     from mxtreme.config import Config
 
     config = Config(data_root=tmp_path)
     resolved = _params().resolved(config)
 
-    assert resolved.h5_path.parent == config.scans_dir / "expA" / "C0001"
-    assert resolved.h5_path.name == "DIV14_250512_C0001_expA_activity_scan.raw.h5"
+    assert resolved.h5_path.parent == (
+        config.recordings_dir / f"plating_250512_{BATCH}" / "chip_M1_C0001" / "well_0" / "DIV_14"
+    )
+    assert resolved.h5_path.name == f"{STEM}_activity_scan.raw.h5"
+
+
+def test_multi_well_scan_records_into_the_chip_directory(tmp_path):
+    """Several wells record into one file first, so it stages in the chip dir until it is split."""
+    from mxtreme.config import Config
+
+    config = Config(data_root=tmp_path)
+    resolved = _params(wells=[0, 3]).resolved(config)
+
+    assert resolved.h5_path.parent == (
+        config.recordings_dir / f"plating_250512_{BATCH}" / "chip_M1_C0001"
+    )
+    assert "well_0-3" in resolved.h5_path.name
+
+
+def test_scan_into_the_store_requires_a_batch(tmp_path):
+    """The recordings tree is keyed by plating batch, so a store scan without one cannot resolve."""
+    from mxtreme.config import Config
+
+    with pytest.raises(ValueError, match="batch"):
+        _params(batch=None).resolved(Config(data_root=tmp_path))
+    with pytest.raises(ValueError, match="batch"):
+        _params(batch=None).validate()
+    with pytest.raises(ValueError, match="batch id"):
+        _params(batch="not-a-batch-id").validate()
 
 
 def test_resolved_returns_a_copy_and_leaves_the_caller_s_params_alone(tmp_path):
@@ -185,12 +215,15 @@ def test_file_name_separates_scans_of_one_chip_by_div():
 
 
 def test_describe_reports_an_unresolved_destination_rather_than_raising():
-    """Planning happens before a Config is necessarily in hand."""
+    """Planning happens before a Config (or even the batch) is necessarily in hand."""
     from mxtreme.scans.activity_scan import describe
 
     text = describe(_params())
     assert "the managed store" in text
-    assert "DIV14_250512_C0001_expA_activity_scan.raw.h5" in text
+    assert f"{STEM}_activity_scan.raw.h5" in text
+
+    # With no batch yet, describe must still render -- the run is what refuses.
+    assert "batch not set yet" in describe(_params(batch=None))
 
 
 def test_run_activity_scan_rejects_a_stale_positional_seed():

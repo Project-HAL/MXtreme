@@ -22,9 +22,10 @@ than the :data:`~mxtreme.scans.activity_scan.MAX_ROUTED_ELECTRODES` the chip can
 routing capacity is free data, so each well is topped up to the limit with random electrodes (see
 :func:`pad_electrodes`).
 
-Like an activity scan it lands in the package-managed store -- the ``.h5`` under
-``config.scans_dir/<exp_id>/<chip>/``, one ``network_scan`` row per well in ``registry.csv`` -- and
-setting :attr:`NetworkScanParams.save_path` writes it elsewhere, unregistered.
+Like an activity scan it lands in the package-managed store -- the ``.h5`` in the recordings tree at
+``.../well_<w>/DIV_<div>/`` (a multi-well recording is split into per-well files on the way in), one
+``network_scan`` row per well in ``registry.csv`` -- and setting :attr:`NetworkScanParams.save_path`
+writes it elsewhere, unsplit and unregistered.
 
 Typical use::
 
@@ -32,10 +33,10 @@ Typical use::
     from mxtreme.scans import electrode_selection, network_scan
 
     config = Config.from_toml("mxtreme.toml")
-    rec_elecs = electrode_selection.select_electrodes(str(scan.h5_path), str(config.scans_dir))
+    rec_elecs = electrode_selection.select_electrodes(str(scan.h5_path), str(scan.h5_path.parent))
     params = network_scan.NetworkScanParams(
         recording_electrodes=rec_elecs,
-        exp_id="May2025_Wave", chip="M07460", plate_date=260810, div=25,
+        batch="fall2026_batch1_DRG_M1", chip="M07460", plate_date=260810, div=25,
         rec_length_sec=300,
     )
     result = network_scan.run_network_scan(params, config)
@@ -49,7 +50,7 @@ from pathlib import Path
 
 import numpy as np
 
-from mxtreme import io
+from mxtreme import io, store
 from mxtreme.scans.activity_scan import (
     MAX_ROUTED_ELECTRODES,
     MAX_WELLS,
@@ -59,6 +60,7 @@ from mxtreme.scans.activity_scan import (
     _connected_device,
     _require_maxlab,
     _saved_file,
+    _split_into_store,
 )
 
 #: Amplifier channels per well. Every one is saved, via a single recording group -- a channel with no
@@ -86,10 +88,12 @@ class NetworkScanParams:
         Unless ``pad_to_max`` is off, each well is topped up to
         :data:`~mxtreme.scans.activity_scan.MAX_ROUTED_ELECTRODES` here, so after construction this
         holds exactly what the scan will record.
+    :param batch: The plating batch the culture belongs to -- a :class:`mxtreme.store.Batch` or its
+        id string (e.g. ``"fall2026_batch1_DRG_M1"``). Required for any scan saved into the managed
+        store; validated by :meth:`validate`.
     :param chip: Chip serial, e.g. ``"M07460"``. Written to the file's metadata and used in its name.
     :param plate_date: Plating date as ``YYMMDD``; validated by :func:`mxtreme.scans.mx_setup.write_metadata`.
     :param div: Days *in vitro* at the time of the scan.
-    :param exp_id: Task name recorded in the metadata blob, and the directory the scan files under.
     :param conditions: Optional per-well condition labels, in :attr:`wells` order; must be empty or
         the same length as ``wells``.
     :param description: Free-text description written to the file.
@@ -106,10 +110,10 @@ class NetworkScanParams:
     recording_electrodes: dict[int, list[int]]
 
     # Metadata
+    batch: store.Batch | str | None = None
     chip: str = "M07460"
     plate_date: int = 260810
     div: int = 1
-    exp_id: str = "network_scan"
     conditions: list[str] = field(default_factory=list)
     description: str = "Network scan of the recording electrodes chosen from an activity scan"
 
@@ -153,14 +157,32 @@ class NetworkScanParams:
         return sorted(self.recording_electrodes)
 
     @property
+    def batch_id(self) -> str:
+        """The batch id string, however ``batch`` was given; ``""`` when it is unset."""
+        return store.Batch.parse(self.batch).id if self.batch is not None else ""
+
+    @property
     def file_name(self) -> str:
         """Base name of the ``.h5``, without MaxWell's ``.raw.h5`` suffix.
 
-        Built like every other name in the store (``DIV<div>_<plate_date>_<chip>_<exp_id>_...``), and
-        ending in ``_network_scan`` so :func:`mxtreme.io.scan_kind` can tell it from an activity scan
-        of the same culture -- the two sit in the same tree and carry the same metadata blob.
+        The store's canonical stem (see :func:`mxtreme.store.recording_stem`) plus the
+        ``_network_scan`` tail, so :func:`mxtreme.io.scan_kind` can tell it from an activity scan of
+        the same culture -- the two sit in the same directory and carry the same metadata blob. A
+        multi-well scan's well token is the joined list (``0-3``) until
+        :func:`mxtreme.store.split_by_well` breaks it into per-well names.
+
+        :raises ValueError: If ``batch`` is unset -- the name is built from it.
         """
-        return f"DIV{self.div}_{self.plate_date}_{self.chip}_{self.exp_id}_network_scan"
+        if self.batch is None:
+            raise ValueError(
+                "batch is unset, so this scan cannot be named. Every scan needs the plating batch "
+                "it records, e.g. batch='fall2026_batch1_DRG_M1'."
+            )
+        well_token = "-".join(str(w) for w in self.wells)
+        return (
+            store.recording_stem(self.batch, self.plate_date, self.chip, well_token, self.div)
+            + "_network_scan"
+        )
 
     @property
     def h5_path(self) -> Path:
@@ -179,12 +201,15 @@ class NetworkScanParams:
     def resolved(self, config=None) -> NetworkScanParams:
         """Return a copy whose ``save_path`` is filled in, so every path property is answerable.
 
-        An explicit ``save_path`` wins and the object is returned unchanged; otherwise the scan lands
-        beside the activity scan it came from, at ``config.scans_dir/<exp_id>/<chip>/``.
+        An explicit ``save_path`` wins and the object is returned unchanged; otherwise the scan
+        lands beside the activity scan it came from, in the recordings tree: straight into
+        ``.../well_<w>/DIV_<div>/`` for one well, or into the chip directory (split per well
+        afterwards) for several.
 
         :param config: The :class:`~mxtreme.config.Config` describing the managed store. Only needed
             when ``save_path`` is unset.
-        :raises ValueError: If there is neither a ``save_path`` nor a ``config`` to derive one from.
+        :raises ValueError: If there is neither a ``save_path`` nor a ``config`` to derive one from,
+            or if the scan is headed for the store without a ``batch`` to file it under.
         :returns: This object, or a copy with ``save_path`` set.
         :rtype: NetworkScanParams
         """
@@ -196,7 +221,18 @@ class NetworkScanParams:
                 "config=Config.from_toml('mxtreme.toml') to save it into the managed store, or set "
                 "NetworkScanParams.save_path to write outside the store."
             )
-        return replace(self, save_path=str(Path(config.scans_dir) / self.exp_id / self.chip))
+        if self.batch is None:
+            raise ValueError(
+                "A scan saved into the managed store needs the plating batch it records: the "
+                "recordings tree is keyed by batch. Set batch (e.g. 'fall2026_batch1_DRG_M1')."
+            )
+        if len(self.wells) == 1:
+            directory = store.recording_dir(
+                config, self.batch, self.plate_date, self.chip, self.wells[0], self.div
+            )
+        else:
+            directory = store.chip_dir(config, self.batch, self.plate_date, self.chip)
+        return replace(self, save_path=str(directory))
 
     @property
     def estimated_minutes(self) -> float:
@@ -208,10 +244,12 @@ class NetworkScanParams:
 
         Shaped for :func:`mxtreme.scans.mx_setup.write_metadata`, and therefore for
         :func:`mxtreme.extract.extract`, which reads the same blob back out -- so a network scan
-        extracts and preprocesses like any other recording.
+        extracts and preprocesses like any other recording. A scan has no experiment name, so
+        ``Exp ID`` carries the batch id and the preprocessed tree files the data under its batch.
         """
         return {
-            "Exp ID": self.exp_id,
+            "Exp ID": self.batch_id,
+            "Batch ID": self.batch_id,
             "Chip ID": self.chip,
             "Plate date": self.plate_date,
             "DIV": self.div,
@@ -222,12 +260,14 @@ class NetworkScanParams:
     def validate(self) -> None:
         """Check the parameters are runnable, so failures surface before the chip is touched.
 
-        :raises ValueError: On any parameter that would fail mid-scan -- no wells, an out-of-range
-            well or electrode, an empty or duplicated electrode set, a well asking for more than
+        :raises ValueError: On any parameter that would fail mid-scan -- a missing or malformed
+            batch id, no wells, an out-of-range well or electrode, an empty or duplicated electrode
+            set, a well asking for more than
             :data:`~mxtreme.scans.activity_scan.MAX_ROUTED_ELECTRODES` electrodes (which the chip
             cannot route, so some would be silently dropped), a mismatched condition list, or a
             non-positive recording length.
         """
+        _ = self.file_name  # raises on a missing batch, and Batch.parse raises on a malformed one
         if not self.recording_electrodes:
             raise ValueError(
                 "No recording electrodes. Pass the {well: [electrode, ...]} mapping returned by "
@@ -264,18 +304,22 @@ class NetworkScanParams:
 class NetworkScanResult:
     """What a completed (or early-stopped) network scan produced.
 
-    :param h5_path: The file that was written. It exists even if the scan stopped early -- the file
-        is always finalized.
+    :param h5_path: The file that was written -- after a multi-well store scan is split per well,
+        the first well's file. It exists even if the scan stopped early; the file is always
+        finalized.
     :param params: The parameters the scan ran with.
     :param recorded_sec: How long the recording actually ran, which is less than
         ``params.rec_length_sec`` only when it was stopped early.
     :param duration_sec: Wall-clock time from the start of recording, including teardown.
+    :param well_files: The file holding each well's data. For a single-well scan every well maps to
+        ``h5_path``; for a multi-well store scan these are the split per-well files.
     """
 
     h5_path: Path
     params: NetworkScanParams
     recorded_sec: float
     duration_sec: float
+    well_files: dict[int, Path] | None = None
 
     @property
     def complete(self) -> bool:
@@ -314,18 +358,21 @@ def pad_electrodes(
 def describe(params: NetworkScanParams) -> str:
     """Render a human-readable summary of a scan, for confirming it before it runs.
 
-    :param params: The scan to describe. An unresolved ``save_path`` is fine; the destination is
-        then reported as the managed store rather than as a concrete path.
+    :param params: The scan to describe. An unresolved ``save_path`` (or a still-unset ``batch``)
+        is fine; the destination is then reported rather than raised over.
     :returns: A multi-line summary.
     """
-    destination = f"the managed store, as {params.file_name}.raw.h5"
+    if params.batch is None:
+        destination = "the managed store (batch not set yet -- required before running)"
+    else:
+        destination = f"the managed store, as {params.file_name}.raw.h5"
     per_well = ", ".join(
         f"well {well}: {len(params.recording_electrodes[well])}" for well in params.wells
     )
     lines = [
         f"Chip           : {params.chip}",
         f"Plate date     : {params.plate_date} | DIV: {params.div}",
-        f"Experiment     : {params.exp_id}",
+        f"Batch          : {params.batch_id or '(unset)'}",
         f"Wells          : {params.wells}",
         f"Electrodes     : {per_well or 'none'}",
         (
@@ -335,9 +382,9 @@ def describe(params: NetworkScanParams) -> str:
             else "                 (as chosen by electrode selection; no random fill)"
         ),
         f"Recording time : {params.estimated_minutes:.1f} min (excluding routing overhead)",
-        # Describing a scan is a planning step, and planning happens before a Config is necessarily
-        # in hand -- so an unresolved destination is reported, not raised over.
-        f"Saving to      : {params.h5_path if params.save_path is not None else destination}",
+        # Describing a scan is a planning step, and planning happens before a Config (or even the
+        # batch) is necessarily in hand -- so an unresolved destination is reported, not raised over.
+        f"Saving to      : {params.h5_path if params.save_path is not None and params.batch is not None else destination}",
         "                 (MaxLab appends _1, _2 ... if that name is already taken)",
     ]
     return "\n".join(lines)
@@ -355,12 +402,13 @@ def run_network_scan(
     Routes each well's chosen electrodes, compensates amplifier offsets, then records every well
     simultaneously for ``params.rec_length_sec``.
 
-    The scan goes into the managed store described by ``config``: the ``.h5`` under
-    ``config.scans_dir/<exp_id>/<chip>/``, and one ``network_scan`` row per well in
+    The scan goes into the managed store described by ``config``: the ``.h5`` into the recordings
+    tree (``.../well_<w>/DIV_<div>/`` for one well; a multi-well scan is recorded whole and then
+    split into per-well files there), and one ``network_scan`` row per well in
     ``config.registry_path``. Registration happens after the recording finishes, including when it
     stopped early, so a short scan is still findable. An explicit ``params.save_path`` overrides the
-    destination and skips registration -- a row for a file outside the store could never be resolved
-    back to it.
+    destination, skips the split, and skips registration -- a row for a file outside the store could
+    never be resolved back to it.
 
     The file is finalized and the arrays closed even if the recording fails partway through, so what
     was recorded up to that point is readable. A failure still propagates; registration is skipped on
@@ -380,7 +428,7 @@ def run_network_scan(
     :raises RuntimeError: If no device is connected.
     :returns: A :class:`NetworkScanResult` naming the file and how long it recorded for.
     """
-    if config is not None and not hasattr(config, "scans_dir"):
+    if config is not None and not hasattr(config, "recordings_dir"):
         raise TypeError(
             f"run_network_scan() expects a Config as its second argument, got "
             f"{type(config).__name__}."
@@ -465,11 +513,20 @@ def run_network_scan(
 
     # MaxLab may have renamed the file (see _saved_file), so find what it really wrote before
     # reporting a path.
+    h5_path = _saved_file(params, scan_start)
+
+    well_files = {well: h5_path for well in params.wells}
+    if registry_path is not None and len(params.wells) > 1:
+        on_progress("\nSplitting into one file per well...")
+        well_files = _split_into_store(h5_path, params, config, "network_scan", on_progress)
+        h5_path = well_files[min(well_files)]
+
     result = NetworkScanResult(
-        h5_path=_saved_file(params, scan_start),
+        h5_path=h5_path,
         params=params,
         recorded_sec=recorded_sec,
         duration_sec=duration,
+        well_files=well_files,
     )
     _register_scan(result, registry_path, on_progress)
 

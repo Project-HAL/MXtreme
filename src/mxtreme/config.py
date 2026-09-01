@@ -2,10 +2,10 @@
 
 `Config` decouples the package from any particular machine's directory layout. It holds a single
 ``data_root`` -- the root of the *package-managed data store*, i.e. the directory the package writes
-its outputs to (activity-scan ``.h5`` files, cleaned ``.npz`` files, burst CSVs, analysis outputs, the
-registry) and later reads those same outputs back from. Raw ``.h5`` recordings acquired *outside*
-MXtreme are not resolved through here; the user points at those by explicit path. An activity scan
-MXtreme ran itself is an output, and does live in the store.
+its outputs to (raw ``.h5`` recordings, cleaned ``.npz`` files, burst CSVs, analysis outputs, the
+registry) and later reads those same outputs back from. A scan MXtreme ran itself lands in the
+store's ``recordings/`` tree; a raw ``.h5`` acquired *outside* MXtreme joins it through
+:func:`mxtreme.store.ingest_recording`.
 
 The root is supplied by a small TOML file so it never has to be hard-coded in library code:
 
@@ -32,9 +32,10 @@ class Config:
     data_root: Path
 
     @property
-    def scans_dir(self) -> Path:
-        """Directory holding activity-scan ``.h5`` files."""
-        return self.data_root / "scans"
+    def recordings_dir(self) -> Path:
+        """Root of the recordings tree: raw ``.h5`` files (scans and ingested experiments), one
+        file per well, laid out by plating batch -- see :mod:`mxtreme.store`."""
+        return self.data_root / "recordings"
 
     @property
     def preprocessed_dir(self) -> Path:

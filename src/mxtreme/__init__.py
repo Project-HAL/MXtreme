@@ -14,5 +14,6 @@ matplotlib/seaborn/h5py, so those stay behind explicit submodule imports to keep
 __version__ = "0.1.0"
 
 from mxtreme.identity import CultureID, CultureSelector, RecordingID
+from mxtreme.store import Batch
 
-__all__ = ["CultureID", "CultureSelector", "RecordingID", "__version__"]
+__all__ = ["Batch", "CultureID", "CultureSelector", "RecordingID", "__version__"]
