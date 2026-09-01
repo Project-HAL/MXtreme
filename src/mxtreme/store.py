@@ -63,6 +63,10 @@ _EXP_TAIL = re.compile(r"_DIV_\d+_(?P<exp_id>.+?)\.raw\.h5$")
 #: Plating dates are ``YYMMDD``, matching :func:`mxtreme.scans.mx_setup.write_metadata`.
 _PLATE_DATE = re.compile(r"^\d{6}$")
 
+#: The directory names the layout functions below produce, for reading the tree back.
+_PLATING_DIR = re.compile(r"^plating_(?P<plate_date>\d{6})_(?P<batch_id>.+)$")
+_CHIP_DIR = re.compile(r"^chip_M[12]_(?P<chip>.+)$")
+
 
 @dataclass(frozen=True)
 class Batch:
@@ -182,6 +186,58 @@ def recording_stem(batch: Batch | str, plate_date, chip: str, well, div: int) ->
     )
 
 
+@dataclass(frozen=True)
+class Plating:
+    """One plating found in the recordings tree: a batch, its plate date, and its directory.
+
+    What :func:`list_platings` returns -- the read-back counterpart of :func:`plating_dirname`,
+    for a front end offering "which plating is this session about" from what the store already
+    holds.
+
+    :param batch: The plating batch, parsed from the directory name.
+    :param plate_date: Plating date (``YYMMDD``), from the directory name.
+    :param path: The plating's directory.
+    """
+
+    batch: Batch
+    plate_date: int
+    path: Path
+
+    def chips(self) -> list[str]:
+        """Chip serials this plating has recordings for, from its ``chip_*`` directories."""
+        if not self.path.is_dir():
+            return []
+        found = (_CHIP_DIR.match(entry.name) for entry in self.path.iterdir() if entry.is_dir())
+        return sorted(match["chip"] for match in found if match)
+
+
+def list_platings(config) -> list[Plating]:
+    """Every plating in the recordings tree, most recently plated first.
+
+    A directory that does not follow the plating naming convention is skipped rather than fatal:
+    the tree is also a place people look at in a file browser, and a stray folder should not stop
+    the real platings from being listed.
+
+    :param config: The :class:`~mxtreme.config.Config` describing the managed store.
+    :returns: The platings, sorted by plate date, newest first.
+    """
+    root = config.recordings_dir
+    if not root.is_dir():
+        return []
+
+    platings = []
+    for entry in root.iterdir():
+        match = _PLATING_DIR.match(entry.name)
+        if not entry.is_dir() or match is None:
+            continue
+        try:
+            batch = Batch.parse(match["batch_id"])
+        except ValueError:
+            continue
+        platings.append(Plating(batch=batch, plate_date=int(match["plate_date"]), path=entry))
+    return sorted(platings, key=lambda p: p.plate_date, reverse=True)
+
+
 def recording_kind(h5_path: str | Path) -> str:
     """What a file in the recordings tree is, from its name -- see :data:`RECORDING_KINDS`.
 
@@ -231,14 +287,14 @@ def parse_recording_path(h5_path: Path, recordings_dir: Path) -> RecordingLocati
     except ValueError:
         return None
 
-    plating_match = re.match(r"^plating_(\d{6})_(.+)$", plating)
-    chip_match = re.match(r"^chip_M[12]_(.+)$", chip_part)
+    plating_match = _PLATING_DIR.match(plating)
+    chip_match = _CHIP_DIR.match(chip_part)
     well_match = re.match(r"^well_(\d+)$", well_part)
     div_match = re.match(r"^DIV_(\d+)$", div_part)
     if not (plating_match and chip_match and well_match and div_match):
         return None
     try:
-        batch = Batch.parse(plating_match.group(2))
+        batch = Batch.parse(plating_match["batch_id"])
     except ValueError:
         return None
 
@@ -252,8 +308,8 @@ def parse_recording_path(h5_path: Path, recordings_dir: Path) -> RecordingLocati
 
     return RecordingLocation(
         batch=batch,
-        plate_date=int(plating_match.group(1)),
-        chip=chip_match.group(1),
+        plate_date=int(plating_match["plate_date"]),
+        chip=chip_match["chip"],
         well=int(well_match.group(1)),
         div=int(div_match.group(1)),
         kind=kind,
