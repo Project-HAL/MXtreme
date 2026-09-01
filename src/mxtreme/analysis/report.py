@@ -57,7 +57,7 @@ DEFAULT_SECTIONS = ("activity", "bursting", "cultures")
 # mean_col) the faint per-culture overlay drawn from the un-aggregated frame.
 _SPIKING_METRICS = [
     ('mean_fr_hz',      'sem_mean_fr_hz',      'Firing rate (Hz)',     'Firing Rate'),
-    ('mean_isi_sec',    'sem_mean_isi_sec',    'Median ISI (ms)',      'Inter-Spike Interval'),
+    ('mean_isi_msec',   'sem_mean_isi_msec',   'Median ISI (ms)',      'Inter-Spike Interval'),
     ('mean_amp_uv',     'sem_mean_amp_uv',     'Spike amplitude (µV)', 'Spike Amplitude'),
     ('pct_active_chan', 'sem_pct_active_chan', 'Active electrodes (%)', 'Active Electrodes'),
 ]
@@ -236,7 +236,7 @@ def _spiking_summaries(cultures, analysis_dir) -> pd.DataFrame:
 def _section_activity(pdf, cultures, pop_df, phase):
     _population_page(
         pdf, _for_phase(pop_df, phase), _SPIKING_METRICS,
-        value_cols=["mean_fr_hz", "mean_isi_sec", "mean_amp_uv", "pct_active_chan"],
+        value_cols=["mean_fr_hz", "mean_isi_msec", "mean_amp_uv", "pct_active_chan"],
         suptitle=f"Spiking Activity — {len(cultures)} cultures  |  phase: {phase}",
     )
 

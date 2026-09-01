@@ -531,7 +531,7 @@ def plot_population_channel_activity(sel_paths,
     exp_ids    = list(sel_paths.keys())
 
     stats = aggregate_by_div_phase(
-        pop_df, value_cols=['mean_fr_hz', 'mean_isi_sec', 'mean_amp_uv', 'pct_active_chan']
+        pop_df, value_cols=['mean_fr_hz', 'mean_isi_msec', 'mean_amp_uv', 'pct_active_chan']
     )
 
     metrics = [
