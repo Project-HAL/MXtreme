@@ -18,7 +18,7 @@ from mxtreme.scans import activity_scan
 config = Config.from_toml("mxtreme.toml")
 
 params = activity_scan.ActivityScanParams(
-    exp_id="May2025_Wave",
+    batch="fall2026_batch1_DRG_M1",  # the plating batch -- see Configuration: batches
     chip="M07460",
     plate_date=260810,   # YYMMDD
     div=1,
@@ -33,7 +33,7 @@ print(activity_scan.describe(params))
 
 {func}`~mxtreme.scans.activity_scan.describe` prints the run time and how much of the array the scan covers, so you can adjust before committing to the recording. The defaults are a working scan: ~8 minutes over one well, covering roughly a quarter of the array. Use `params.estimated_minutes` and `params.array_coverage` if you want the numbers directly — coverage above `1.0` means the scan revisits electrodes it has already recorded.
 
-{meth}`~mxtreme.scans.activity_scan.ActivityScanParams.validate` runs automatically before the chip is touched, so bad wells, an over-long routing request or too coarse a spacing fail immediately rather than mid-scan.
+{meth}`~mxtreme.scans.activity_scan.ActivityScanParams.validate` runs automatically before the chip is touched, so a missing or malformed batch id, bad wells, an over-long routing request or too coarse a spacing fail immediately rather than mid-scan.
 
 #### 2. Run it (requires Maxwell device connection)
 
@@ -47,10 +47,19 @@ The `.h5` is always finalized — even if a round fails or you stop early — so
 
 #### 3. Where it lands
 
-A scan is an MXtreme output, so it goes into the managed store: the `.h5` under
-`config.scans_dir/<exp_id>/<chip>/`, and one `activity_scan` row per scanned well in
-`registry.csv`. Set `save_path` to write somewhere else instead (a scratch directory on the rig,
-say); the scan is then left out of the registry, since nothing says which store it belongs to.
+A scan is an MXtreme output, so it goes into the managed store's recordings tree, keyed by plating
+batch:
+
+```
+recordings/plating_<plate_date>_<batch_id>/chip_<M1|M2>_<chip>/well_<w>/DIV_<div>/
+    plating_<plate_date>_<batch_id>_chip_<chip>_well_<w>_DIV_<div>_activity_scan.raw.h5
+```
+
+with one `activity_scan` row per scanned well in `registry.csv`. Each file in the tree holds one
+well: a multi-well scan (on a MaxTwo) records into a single `.h5` and is then split into one file
+per well ({func}`mxtreme.store.split_by_well`), so every culture's directory holds its own data.
+Set `save_path` to write somewhere else instead (a scratch directory on the rig, say); the scan is
+then left unsplit and out of the registry, since nothing says which store it belongs to.
 
 ```python
 params = activity_scan.ActivityScanParams(..., save_path="/tmp/scratch")
@@ -84,7 +93,7 @@ rec_elecs = electrode_selection.select_electrodes(str(result.h5_path), save_path
 
 params = network_scan.NetworkScanParams(
     recording_electrodes=rec_elecs,   # {well: [electrode, ...]}; the wells come from its keys
-    exp_id="May2025_Wave",
+    batch="fall2026_batch1_DRG_M1",
     chip="M07460",
     plate_date=260810,
     div=25,
@@ -118,9 +127,10 @@ simultaneously. Progress is printed every 30 s; pass `on_progress=` to route it 
 `should_stop=` for a callback that ends the recording early. The `.h5` is always finalized, so a
 scan cut short is still readable.
 
-The file goes to `config.scans_dir/<exp_id>/<chip>/` as `..._network_scan.raw.h5` with one
-`network_scan` row per well in `registry.csv`; `save_path` writes it elsewhere, unregistered — the
-same rules as an activity scan.
+The file goes into the recordings tree beside the activity scan it came from — the same
+`.../well_<w>/DIV_<div>/` directory, as `..._network_scan.raw.h5` — with one `network_scan` row per
+well in `registry.csv`. A multi-well scan is split per well on the way in, and `save_path` writes it
+elsewhere, unsplit and unregistered — the same rules as an activity scan.
 
 A network scan is an ordinary recording, so it feeds straight into the analysis workflow below:
 
@@ -129,6 +139,27 @@ from mxtreme import extract
 
 data = extract.extract(str(scan.h5_path))
 ```
+
+### Ingesting an outside recording
+
+A raw `.h5` recorded outside MXtreme (MaxLab's own Record tab, a collaborator's export) joins the
+same tree through {func}`mxtreme.store.ingest_recording`. You supply the identity the file cannot —
+its batch, chip, DIV — plus a free-form `exp_id` naming the experiment, which becomes the file-name
+tail and the registry row's `exp_id`:
+
+```python
+from mxtreme.store import ingest_recording
+
+ingest_recording(
+    "/path/to/export.raw.h5", config,
+    batch="fall2026_batch1_DRG_M1", plate_date=260810,
+    chip="M07460", div=21, exp_id="stim_trial_3",
+)
+```
+
+The file is copied into `.../well_<w>/DIV_<div>/` under the canonical name (pass `move=True` to move
+it instead), a multi-well file is split into one file per well, and each well gets an `experiment`
+row in `registry.csv`.
 
 ## Analysis 
 

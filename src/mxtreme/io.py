@@ -8,7 +8,7 @@ Contents:
 - :func:`save_preprocessed` -- write one well's cleaned data to an ``.npz`` (and register it).
 - :func:`register` -- record processed recordings in the registry CSV.
 - :func:`register_scan` -- record an activity or network scan in that same registry.
-- :func:`rebuild_registry` -- rebuild that registry by scanning the store (recovery path).
+- :func:`rebuild_registry` -- rebuild that registry by walking the store (recovery path).
 - :func:`save_burst_data` / :func:`load_burst_data` -- per-recording burst CSVs.
 - :func:`update_burst_log` -- per-experiment burst summary CSV.
 """
@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 
@@ -135,35 +134,51 @@ def save_preprocessed(
 
 
 #: Columns identifying one registry row. ``kind`` is part of the key because a scan and the
-#: recordings preprocessed from it share an ``(exp_id, chip, well, div)``.
-REGISTRY_KEY = ["exp_id", "chip", "well", "div", "kind"]
+#: recordings preprocessed from it share an identity; ``batch_id`` is part of it because a chip is
+#: re-plated across batches, so ``(chip, well, div)`` alone recurs batch after batch.
+REGISTRY_KEY = ["exp_id", "batch_id", "chip", "well", "div", "kind"]
 
 #: What a registry row describes. ``"preprocessed"`` is one well of a cleaned recording;
-#: ``"activity_scan"`` and ``"network_scan"`` are one well of the corresponding scan's raw ``.h5``.
-REGISTRY_KINDS = ("preprocessed", "activity_scan", "network_scan")
+#: ``"activity_scan"`` and ``"network_scan"`` are one well of the corresponding scan's raw ``.h5``;
+#: ``"experiment"`` is one well of an exogenous recording ingested by
+#: :func:`mxtreme.store.ingest_recording` (its ``exp_id`` column carries the experiment's name).
+REGISTRY_KINDS = ("preprocessed", "activity_scan", "network_scan", "experiment")
 
 
 def _read_registry(registry_path: Path) -> pd.DataFrame:
     """Read the registry CSV into the current schema, or an empty frame if it does not exist yet.
 
-    Two migrations happen on read, so an older registry converges on the current schema at its next
+    Migrations happen on read, so an older registry converges on the current schema at its next
     write rather than needing a separate upgrade step:
 
     - the legacy ``status`` column is dropped;
     - a missing ``kind`` column is backfilled with ``"preprocessed"``. Registries written before
-      scans were indexed hold cleaned recordings and nothing else, so that is what those rows are.
+      scans were indexed hold cleaned recordings and nothing else, so that is what those rows are;
+    - missing ``batch_id`` / ``plate_date`` columns (from before the recordings tree) are added,
+      blank -- those rows predate batch identity;
+    - blank string key fields come back from CSV as NaN and are normalized to ``""`` so the string
+      comparisons in :func:`register` treat "no value" consistently.
 
     :param registry_path: Path to the registry CSV.
-    :returns: The registry, with ``status`` gone and ``kind`` present.
+    :returns: The registry, in the current schema.
     :rtype: pandas.DataFrame
     """
     if not registry_path.exists():
         return pd.DataFrame()
 
     df = pd.read_csv(registry_path).drop(columns=["status"], errors="ignore")
-    if not df.empty and "kind" not in df.columns:
+    if df.empty:
+        return df
+
+    if "kind" not in df.columns:
         position = df.columns.get_loc("div") + 1 if "div" in df.columns else len(df.columns)
         df.insert(position, "kind", "preprocessed")
+    after_exp = df.columns.get_loc("exp_id") + 1 if "exp_id" in df.columns else 0
+    for i, column in enumerate(("batch_id", "plate_date")):
+        if column not in df.columns:
+            df.insert(after_exp + i, column, "")
+    for column in ("exp_id", "batch_id"):
+        df[column] = df[column].fillna("")
     return df
 
 
@@ -176,9 +191,11 @@ def register(
 ) -> None:
     """Upsert one row per processed recording into the registry CSV.
 
-    Rows are keyed by ``(exp_id, chip, well, div, kind)``; an existing row for the same key is
-    replaced. Each row records a ``timestamp`` and the well's ``conditions`` (whatever the well's
-    ``experimental_condition`` holds, or blank when absent).
+    Rows are keyed by :data:`REGISTRY_KEY`; an existing row for the same key is replaced. Each row
+    records a ``timestamp`` and the well's ``conditions`` (whatever the well's
+    ``experimental_condition`` holds, or blank when absent). Batch identity (``batch_id``,
+    ``plate_date``) is recorded when the well dict carries it; rows from before the recordings tree
+    simply leave it blank.
 
     :param data: Mapping of well number to well data dict.
     :type data: dict[int, dict]
@@ -201,7 +218,9 @@ def register(
     for well_no, well in data.items():
         condition = well.get("experimental_condition")
         new_row = {
-            "exp_id": well["exp_id"],
+            "exp_id": well.get("exp_id", ""),
+            "batch_id": well.get("batch_id", ""),
+            "plate_date": well.get("plate_date", ""),
             "chip": well["chip"],
             "well": well_no,
             "div": well["DIV"],
@@ -213,7 +232,8 @@ def register(
             # Compare as strings: an older registry on disk may hold a different dtype for
             # `well`/`div`, which would otherwise leak a duplicate row on re-registration.
             mask = (
-                (df["exp_id"].astype(str) == str(well["exp_id"]))
+                (df["exp_id"].astype(str) == str(new_row["exp_id"]))
+                & (df["batch_id"].astype(str) == str(new_row["batch_id"]))
                 & (df["chip"].astype(str) == str(well["chip"]))
                 & (df["well"].astype(str) == str(well_no))
                 & (df["div"].astype(str) == str(well["DIV"]))
@@ -231,23 +251,20 @@ def register(
 
 # --- scans ----------------------------------------------------------------------------------------
 
-#: Matches the scan kind in a file name written by :mod:`mxtreme.scans` (``..._activity_scan.raw.h5``,
-#: ``..._network_scan_1.raw.h5``), which is the only thing on disk that tells the two apart -- the
-#: embedded metadata blob carries the culture's identity, not what was run on it.
-_SCAN_KIND = re.compile(r"_(activity|network)_scan(_\d+)?\.raw\.h5$")
-
 
 def scan_kind(h5_path: str | Path) -> str:
-    """Work out whether a scan file is an activity scan or a network scan, from its name.
+    """What a file in the recordings tree is, from its name.
 
-    :param h5_path: Path to the scan ``.h5``.
-    :returns: ``"activity_scan"`` or ``"network_scan"``. Anything unrecognised is reported as an
-        activity scan, which is what the scans directory held before network scans were written into
-        it.
+    A thin wrapper over :func:`mxtreme.store.recording_kind`, kept here so registry callers have
+    the whole vocabulary (:data:`REGISTRY_KINDS`) in one module.
+
+    :param h5_path: Path to the ``.h5``.
+    :returns: ``"activity_scan"``, ``"network_scan"``, or ``"experiment"``.
     :rtype: str
     """
-    match = _SCAN_KIND.search(Path(h5_path).name)
-    return f"{match.group(1)}_scan" if match else "activity_scan"
+    from mxtreme.store import recording_kind
+
+    return recording_kind(h5_path)
 
 
 def register_scan(
@@ -263,8 +280,8 @@ def register_scan(
     :func:`mxtreme.scans.mx_setup.write_metadata`, which is what :func:`rebuild_registry` reads back.
 
     :param params: The scan's :class:`~mxtreme.scans.activity_scan.ActivityScanParams`. Only
-        ``exp_id``, ``chip``, ``div``, ``wells`` and ``conditions`` are read, so any object carrying
-        those works.
+        ``chip``, ``div``, ``wells``, ``conditions`` and the batch identity (``batch_id``,
+        ``plate_date``) are read, so any object carrying those works.
     :param registry_path: Path to the registry CSV (typically ``config.registry_path``).
     :type registry_path: str or Path
     :param kind: Which sort of scan these rows describe -- ``"activity_scan"`` or
@@ -276,7 +293,11 @@ def register_scan(
     register(
         {
             well: {
-                "exp_id": params.exp_id,
+                # A scan has no experiment name -- its identity is the batch. The blank exp_id is
+                # what separates scan rows from `experiment` rows in the same tree.
+                "exp_id": getattr(params, "exp_id", ""),
+                "batch_id": getattr(params, "batch_id", ""),
+                "plate_date": getattr(params, "plate_date", ""),
                 "chip": params.chip,
                 "DIV": params.div,
                 # `conditions` is empty or one label per well -- validated by ActivityScanParams.
@@ -291,30 +312,33 @@ def register_scan(
 
 
 def rebuild_registry(config, *, registry_path: str | Path | None = None) -> int:
-    """Rebuild the registry by scanning the managed store: every preprocessed ``.npz`` and every scan.
+    """Rebuild the registry by walking the managed store: every preprocessed ``.npz`` and every raw
+    ``.h5`` in the recordings tree.
 
-    :func:`save_preprocessed` and :func:`register_scan` keep the registry current as data is written,
-    so this is a recovery path: use it when the registry has been lost or has drifted from what is
-    actually on disk.
+    :func:`save_preprocessed`, :func:`register_scan` and :func:`mxtreme.store.ingest_recording` keep
+    the registry current as data is written, so this is a recovery path: use it when the registry has
+    been lost or has drifted from what is actually on disk.
 
-    Each recording's identity and conditions are read from *inside* its ``.npz`` rather than inferred
-    from the directory names, and each row is upserted through :func:`register`, so a rebuilt registry
-    is schema-identical to a live-written one. Rows carry the source file's modification time as their
-    ``timestamp``. Existing rows are updated in place rather than dropped, so recordings whose file is
-    no longer on disk survive a rebuild.
+    Each preprocessed recording's identity and conditions are read from *inside* its ``.npz`` rather
+    than inferred from the directory names, and each row is upserted through :func:`register`, so a
+    rebuilt registry is schema-identical to a live-written one. Rows carry the source file's
+    modification time as their ``timestamp``. Existing rows are updated in place rather than dropped,
+    so recordings whose file is no longer on disk survive a rebuild.
 
-    A scan is rebuilt from the ``/assay/metadata`` blob inside its own ``.h5`` -- the same blob
-    :func:`mxtreme.extract.extract` reads -- rather than from its file name, which cannot be parsed
-    back into fields unambiguously (an ``exp_id`` may itself contain the underscores the name
-    separates fields with). A scan file with no such blob is counted and reported rather than guessed
-    at.
+    A file in the recordings tree is identified from its *path*: the tree's directory names are
+    fixed-format and carry the full identity (batch, plating date, chip, well, DIV) -- see
+    :func:`mxtreme.store.parse_recording_path`. Its ``/assay/metadata`` blob, when readable, supplies
+    the well's condition label; a file whose path does not follow the layout is counted and reported
+    rather than guessed at.
 
     :param config: The :class:`~mxtreme.config.Config` describing the managed store.
     :param registry_path: Override the destination; defaults to ``config.registry_path``.
     :type registry_path: str or Path or None
-    :returns: The number of recordings and scans registered.
+    :returns: The number of recordings and raw files registered.
     :rtype: int
     """
+    from mxtreme.store import parse_recording_path
+
     if registry_path is None:
         registry_path = config.registry_path
 
@@ -335,6 +359,7 @@ def rebuild_registry(config, *, registry_path: str | Path | None = None) -> int:
             register(
                 {well_no: {
                     "exp_id": _value(npz, "exp_id"),
+                    "plate_date": _value(npz, "plate_date") or "",
                     "chip": _value(npz, "chip"),
                     "DIV": _value(npz, "DIV"),
                     "experimental_condition": _value(npz, "exp_condition"),
@@ -344,30 +369,54 @@ def rebuild_registry(config, *, registry_path: str | Path | None = None) -> int:
             )
         n_recordings += 1
 
-    n_scans, n_unreadable = 0, 0
-    for h5_path in sorted(config.scans_dir.glob("*/*/*.h5")):
-        embedded = _embedded_metadata(h5_path)
-        if embedded is None:
-            n_unreadable += 1
+    n_raw, n_unparseable = 0, 0
+    for h5_path in sorted(config.recordings_dir.glob("*/*/*/*/*.h5")):
+        location = parse_recording_path(h5_path, config.recordings_dir)
+        if location is None:
+            n_unparseable += 1
             continue
 
-        register_scan(
-            _ScanIdentity(embedded),
+        register(
+            {location.well: {
+                "exp_id": location.exp_id,
+                "batch_id": location.batch.id,
+                "plate_date": location.plate_date,
+                "chip": location.chip,
+                "DIV": location.div,
+                "experimental_condition": _embedded_condition(h5_path, location.well),
+            }},
             registry_path,
-            kind=scan_kind(h5_path),
+            kind=location.kind,
             timestamp=pd.Timestamp.fromtimestamp(h5_path.stat().st_mtime),
         )
-        n_scans += 1
+        n_raw += 1
 
     print(
-        f"Registry rebuilt from {n_recordings} recording(s) and {n_scans} scan(s) -> {registry_path}"
+        f"Registry rebuilt from {n_recordings} recording(s) and {n_raw} raw file(s) "
+        f"-> {registry_path}"
     )
-    if n_unreadable:
+    if n_unparseable:
         print(
-            f"  {n_unreadable} scan file(s) skipped: no readable /assay/metadata blob inside them, "
-            "so their wells and DIV could not be recovered."
+            f"  {n_unparseable} file(s) skipped: their paths do not follow the recordings-tree "
+            "layout, so their identity could not be recovered."
         )
-    return n_recordings + n_scans
+    return n_recordings + n_raw
+
+
+def _embedded_condition(h5_path: Path, well: int):
+    """One well's condition label from a raw file's ``/assay/metadata`` blob, or ``None``.
+
+    The blob is enrichment, not identity -- the path already names the recording -- so a missing or
+    unreadable blob simply yields no condition.
+    """
+    embedded = _embedded_metadata(h5_path)
+    if embedded is None:
+        return None
+    well_ids = list(embedded.get("Well IDs") or [])
+    conditions = list(embedded.get("Conditions") or [])
+    if well in well_ids and well_ids.index(well) < len(conditions):
+        return conditions[well_ids.index(well)]
+    return None
 
 
 def _embedded_metadata(h5_path: Path) -> dict | None:
@@ -386,22 +435,6 @@ def _embedded_metadata(h5_path: Path) -> dict | None:
         return json.loads(raw.decode("utf-8").strip().replace("'", '"'))
     except (OSError, KeyError, ValueError, IndexError):
         return None
-
-
-class _ScanIdentity:
-    """The fields :func:`register_scan` reads, pulled out of an ``.h5``'s metadata blob.
-
-    A thin adapter rather than a rebuilt :class:`~mxtreme.scans.activity_scan.ActivityScanParams`, so
-    :mod:`mxtreme.io` stays free of any import from :mod:`mxtreme.scans` (which reaches for rig-only
-    modules).
-    """
-
-    def __init__(self, embedded: dict):
-        self.exp_id = embedded["Exp ID"]
-        self.chip = embedded["Chip ID"]
-        self.div = embedded["DIV"]
-        self.wells = list(embedded["Well IDs"])
-        self.conditions = list(embedded.get("Conditions") or [])
 
 
 def repair_spike_order(config, *, dry_run: bool = False) -> list[Path]:

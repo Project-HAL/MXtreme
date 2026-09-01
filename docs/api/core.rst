@@ -34,6 +34,12 @@ Configuration
 .. automodule:: mxtreme.config
    :members:
 
+Managed store
+-------------
+
+.. automodule:: mxtreme.store
+   :members:
+
 Path resolution
 ---------------
 

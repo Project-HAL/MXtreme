@@ -9,13 +9,14 @@ each hop.
    mxtreme.scans.activity_scan.run_activity_scan()   (on the rig; optional)
         │
         ▼
-   scans/…/*_activity_scan.raw.h5  +  registry.csv
+   recordings/…/*_activity_scan.raw.h5  +  registry.csv
         │                                          ◄── managed store begins here
         │  mxtreme.scans.electrode_selection.select_electrodes()
         ▼
    the network-scan electrode list a recording is then made with
         ⋮
-   raw .raw.h5                (a recording: yours by explicit path, or a scan MXtreme ran)
+   raw .raw.h5                (a recording: a scan MXtreme ran, an .h5 ingested by
+        │                      mxtreme.store.ingest_recording, or yours by explicit path)
         │
         │  mxtreme.extract.extract()
         ▼
@@ -39,11 +40,11 @@ each hop.
    analysis/reports/*.pdf
 ```
 
-Everything in that diagram except the raw recording lives inside the **managed store**, a single
-directory tree the package owns. Raw `.h5` files MXtreme did not produce are deliberately *outside*
-it — you point at those by explicit path, and MXtreme never writes near them. An activity scan is
-different: MXtreme wrote it, so it is an output and goes in the store like any other.
-See [Configuration](configuration.md).
+Everything in that diagram lives inside the **managed store**, a single directory tree the package
+owns. A scan MXtreme ran is an output and goes into the store's `recordings/` tree automatically; a
+raw `.h5` recorded outside MXtreme either joins that tree through
+{func}`mxtreme.store.ingest_recording` or stays wherever it is, pointed at by explicit path — MXtreme
+never writes near a file it was not given. See [Configuration](configuration.md).
 
 ## Stage 0 — Scan (rig only, optional)
 
@@ -57,15 +58,18 @@ from mxtreme.scans import activity_scan
 
 config = Config.from_toml("mxtreme.toml")
 params = activity_scan.ActivityScanParams(
-    exp_id="May2025_Wave", chip="M07459", plate_date=250512, div=14, wells=[0, 1]
+    batch="fall2026_batch1_DRG_M1", chip="M07459", plate_date=250512, div=14, wells=[0, 1]
 )
 result = activity_scan.run_activity_scan(params, config)   # -> result.h5_path
 ```
 
-Two things land: the `.h5` under `config.scans_dir/<exp_id>/<chip>/`, and one `activity_scan` row per
-scanned well in `registry.csv`. The row is written even when a scan stops early, so a short scan is
-still findable. Setting `ActivityScanParams.save_path` sends the `.h5` somewhere else instead and
-skips registration — a row pointing outside the store could never be resolved back.
+Two things land: the `.h5` in the recordings tree at
+`recordings/plating_<date>_<batch>/chip_<M1|M2>_<chip>/well_<w>/DIV_<div>/` — one file per well,
+with a multi-well scan recorded whole and then split ({func}`mxtreme.store.split_by_well`) — and one
+`activity_scan` row per scanned well in `registry.csv`. The row is written even when a scan stops
+early, so a short scan is still findable. Setting `ActivityScanParams.save_path` sends the `.h5`
+somewhere else instead, unsplit, and skips registration — a row pointing outside the store could
+never be resolved back.
 
 The scan then feeds {func}`mxtreme.scans.electrode_selection.select_electrodes`, which turns it into
 the electrode list the actual network-scan recording is made with. That recording is what Stage 1

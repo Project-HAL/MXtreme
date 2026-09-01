@@ -187,11 +187,16 @@ def test_rebuild_registry_preserves_rows_without_npz(make_well, tmp_path):
 # --- activity scans -------------------------------------------------------------------------------
 
 
-class _FakeScanParams:
-    """The five fields ``register_scan`` reads, without importing the rig-side scan module."""
+BATCH = "fall2026_batch1_DRG_M1"
 
-    def __init__(self, wells=(0, 1), conditions=(), exp_id="scanExp", chip="C1", div=3):
-        self.exp_id, self.chip, self.div = exp_id, chip, div
+
+class _FakeScanParams:
+    """The fields ``register_scan`` reads, without importing the rig-side scan module."""
+
+    def __init__(self, wells=(0, 1), conditions=(), chip="C1", div=3,
+                 batch_id=BATCH, plate_date=250512):
+        self.chip, self.div = chip, div
+        self.batch_id, self.plate_date = batch_id, plate_date
         self.wells, self.conditions = list(wells), list(conditions)
 
 
@@ -206,6 +211,10 @@ def test_register_scan_writes_one_row_per_well(tmp_path):
     assert set(df["kind"]) == {"activity_scan"}
     assert list(df["conditions"]) == ["ctrl", "drug"]
     assert (df["div"] == 3).all()
+    # A scan's identity is its batch; the exp_id column stays blank for scan rows.
+    assert (df["batch_id"] == BATCH).all()
+    assert (df["plate_date"] == 250512).all()
+    assert df["exp_id"].isna().all() or (df["exp_id"] == "").all()
 
 
 def test_scan_and_recording_coexist_for_the_same_culture(make_well, tmp_path):
@@ -216,8 +225,7 @@ def test_scan_and_recording_coexist_for_the_same_culture(make_well, tmp_path):
     well = _clean_well(make_well)
     io.save_preprocessed(tmp_path, well, registry_path=registry)
     io.register_scan(
-        _FakeScanParams(wells=(well["well"],), exp_id=well["exp_id"], chip=well["chip"],
-                        div=well["DIV"]),
+        _FakeScanParams(wells=(well["well"],), chip=well["chip"], div=well["DIV"]),
         registry,
     )
 
@@ -241,52 +249,102 @@ def test_register_backfills_kind_on_an_older_registry(tmp_path):
     df = pd.read_csv(registry)
     assert len(df) == 2
     assert df.loc[df["exp_id"] == "old", "kind"].item() == "preprocessed"
-    assert df.loc[df["exp_id"] == "scanExp", "kind"].item() == "activity_scan"
+    assert df.loc[df["batch_id"] == BATCH, "kind"].item() == "activity_scan"
 
 
-def _store_with_scan(tmp_path, wells=(0, 1), metadata=True):
-    """Write a scan .h5 into a managed store, carrying the /assay/metadata blob MaxLab writes."""
+def _store_with_scan(tmp_path, wells=(0, 1), metadata=True, kind="activity_scan"):
+    """Write per-well raw .h5 files into a managed store's recordings tree.
+
+    Each file sits in its own ``well_<w>/DIV_<div>/`` directory, as :func:`mxtreme.store.split_by_well`
+    would have left it. The metadata blob (when written) carries the full well list, as MaxLab wrote
+    it into the combined recording -- condition recovery must index into it by well.
+    """
     import h5py
 
+    from mxtreme import store
     from mxtreme.config import Config
 
     config = Config(data_root=tmp_path)
     params = _FakeScanParams(wells=wells, conditions=("ctrl", "drug")[: len(wells)])
-    h5_path = (
-        config.scans_dir / params.exp_id / params.chip
-        / f"DIV{params.div}_250512_{params.chip}_{params.exp_id}_activity_scan.raw.h5"
-    )
-    h5_path.parent.mkdir(parents=True, exist_ok=True)
+    paths = []
+    for well in params.wells:
+        stem = store.recording_stem(BATCH, params.plate_date, params.chip, well, params.div)
+        h5_path = store.recording_dir(
+            config, BATCH, params.plate_date, params.chip, well, params.div
+        ) / f"{stem}_{kind}.raw.h5"
+        h5_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with h5py.File(h5_path, "w") as f:
-        if metadata:
-            blob = str({
-                "Exp ID": params.exp_id, "Chip ID": params.chip, "Plate date": 250512,
-                "DIV": params.div, "Well IDs": list(params.wells),
-                "Conditions": list(params.conditions),
-            })
-            f.create_dataset("/assay/metadata", data=np.array([blob.encode("utf-8")]))
-    return config, h5_path
+        with h5py.File(h5_path, "w") as f:
+            if metadata:
+                blob = str({
+                    "Exp ID": BATCH, "Batch ID": BATCH, "Chip ID": params.chip,
+                    "Plate date": params.plate_date, "DIV": params.div,
+                    "Well IDs": list(params.wells), "Conditions": list(params.conditions),
+                })
+                f.create_dataset("/assay/metadata", data=np.array([blob.encode("utf-8")]))
+        paths.append(h5_path)
+    return config, paths
 
 
-def test_rebuild_registry_recovers_scans_from_their_embedded_metadata(tmp_path):
+def test_rebuild_registry_recovers_raw_files_from_their_paths(tmp_path):
     import pandas as pd
 
     config, _ = _store_with_scan(tmp_path)
-    assert io.rebuild_registry(config) == 1  # one scan, no recordings
+    assert io.rebuild_registry(config) == 2  # one file per well, no recordings
 
-    df = pd.read_csv(config.registry_path)
+    df = pd.read_csv(config.registry_path).sort_values("well").reset_index(drop=True)
     assert list(df["well"]) == [0, 1]
     assert set(df["kind"]) == {"activity_scan"}
+    assert (df["batch_id"] == BATCH).all()
+    assert (df["plate_date"] == 250512).all()
+    # Conditions come from the embedded blob, indexed by well within the original well list.
     assert list(df["conditions"]) == ["ctrl", "drug"]
 
 
-def test_rebuild_registry_skips_a_scan_with_no_embedded_metadata(tmp_path, capsys):
-    """Wells and DIV cannot be recovered from the file name alone, so the scan is reported, not guessed."""
-    config, _ = _store_with_scan(tmp_path, metadata=False)
+def test_rebuild_registry_registers_a_raw_file_with_no_embedded_metadata(tmp_path):
+    """The path alone carries the identity now; a missing blob only costs the condition label."""
+    import pandas as pd
 
-    assert io.rebuild_registry(config) == 0
-    assert "1 scan file(s) skipped" in capsys.readouterr().out
+    config, _ = _store_with_scan(tmp_path, wells=(0,), metadata=False)
+
+    assert io.rebuild_registry(config) == 1
+    row = pd.read_csv(config.registry_path).iloc[0]
+    assert row["kind"] == "activity_scan"
+    assert row["batch_id"] == BATCH
+    assert pd.isna(row["conditions"]) or row["conditions"] == ""
+
+
+def test_rebuild_registry_reports_a_file_outside_the_layout(tmp_path, capsys):
+    """A file whose path does not follow the recordings layout is counted, not guessed at."""
+    config, _ = _store_with_scan(tmp_path, wells=(0,))
+    stray = config.recordings_dir / "misc" / "a" / "b" / "c" / "stray.raw.h5"
+    stray.parent.mkdir(parents=True)
+    stray.touch()
+
+    assert io.rebuild_registry(config) == 1
+    assert "1 file(s) skipped" in capsys.readouterr().out
+
+
+def test_rebuild_registry_recovers_an_ingested_experiment(tmp_path):
+    """An experiment file's exp_id comes back from its name tail, alongside its batch identity."""
+    import h5py
+    import pandas as pd
+
+    from mxtreme import store
+    from mxtreme.config import Config
+
+    config = Config(data_root=tmp_path)
+    stem = store.recording_stem(BATCH, 250512, "C1", 0, 3)
+    h5_path = store.recording_dir(config, BATCH, 250512, "C1", 0, 3) / f"{stem}_burst_game_v2.raw.h5"
+    h5_path.parent.mkdir(parents=True)
+    with h5py.File(h5_path, "w"):
+        pass
+
+    assert io.rebuild_registry(config) == 1
+    row = pd.read_csv(config.registry_path).iloc[0]
+    assert row["kind"] == "experiment"
+    assert row["exp_id"] == "burst_game_v2"
+    assert row["batch_id"] == BATCH
 
 
 def test_rebuild_registry_counts_recordings_and_scans_together(make_well, tmp_path):

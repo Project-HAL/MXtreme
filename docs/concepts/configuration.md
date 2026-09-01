@@ -9,8 +9,14 @@ later stage reads back from there. The structure is as follows:
 
 ```
 <data_root>/
-├── scans/                         activity-scan .h5, as written on the rig
-│   └── <exp_id>/<chip>/DIV<d>_<plate_date>_<chip>_<exp_id>_activity_scan.raw.h5
+├── recordings/                    raw .h5 — scans and ingested experiments, one file per well
+│   └── plating_<plate_date>_<batch_id>/
+│       └── chip_<M1|M2>_<chip>/
+│           └── well_<N>/
+│               └── DIV_<d>/
+│                   ├── plating_…_chip_<chip>_well_<N>_DIV_<d>_activity_scan.raw.h5
+│                   ├── plating_…_chip_<chip>_well_<N>_DIV_<d>_network_scan.raw.h5
+│                   └── plating_…_chip_<chip>_well_<N>_DIV_<d>_<exp_id>.raw.h5
 ├── preprocessed/                  cleaned .npz, one per well per recording
 │   └── <exp_id>/<chip>/well<N>/DIV<d>_<plate_date>_<chip>_<exp_id>_well<N>_exp_data.npz
 ├── burst_data/                    per-recording burst CSVs + per-experiment burst logs
@@ -18,13 +24,30 @@ later stage reads back from there. The structure is as follows:
 ├── analysis/                      per-culture summary CSVs, plots, PDF reports
 │   ├── <category>/<exp_id>/<chip>/well<N>/<culture_id>_<name>.csv
 │   └── reports/<slug>_report.pdf
-└── registry.csv                   index of every scan and recording in the store
+└── registry.csv                   index of every raw file and recording in the store
 ```
 
-An activity scan has no `well<N>` level: one `.h5` holds every well it recorded.
+The recordings tree is keyed by **plating batch** — one plating event, named at the bench — and every
+file in it holds exactly one well, so one culture's whole history sits in one directory. A multi-well
+recording (a MaxTwo) is recorded into a single `.h5` and split per well on the way in
+({func}`mxtreme.store.split_by_well`).
 
-Raw `.h5` recordings acquired **outside** MXtreme are not resolved through the store — you point at
-those by explicit path. A scan MXtreme ran itself is an output, and does live in the store.
+A scan MXtreme ran itself lands there automatically. A raw `.h5` acquired **outside** MXtreme joins
+the same tree through {func}`mxtreme.store.ingest_recording`, which files and registers it under an
+`exp_id` you supply — the free-string tail of its file name.
+
+## Batches
+
+A *batch id* names one plating event, following a fixed convention:
+
+```
+<semester><year>_batch<n>_<cell_type>_<M1|M2>      e.g.  fall2026_batch1_DRG_M1
+```
+
+{class}`mxtreme.store.Batch` generates and validates them — construct one at the start of a batch
+(`Batch(semester="fall", year=2026, number=1, cell_type="DRG", system="M1")`), or pass the id string
+anywhere a `batch` is accepted and it is parsed and validated on the way in. Every new activity or
+network scan headed for the store requires one, as does every ingest.
 
 ## `mxtreme.toml`
 
@@ -57,7 +80,7 @@ subtree:
 
 | Property | Directory |
 |---|---|
-| {attr}`~mxtreme.config.Config.scans_dir` | `data_root/scans` |
+| {attr}`~mxtreme.config.Config.recordings_dir` | `data_root/recordings` |
 | {attr}`~mxtreme.config.Config.preprocessed_dir` | `data_root/preprocessed` |
 | {attr}`~mxtreme.config.Config.burst_data_dir` | `data_root/burst_data` |
 | {attr}`~mxtreme.config.Config.analysis_dir` | `data_root/analysis` |
@@ -118,37 +141,34 @@ machine. Move the store, edit one line of TOML, and every path follows.
 ## The registry
 
 `registry.csv` indexes what is in the store. It is upserted on **every** `.npz` write by
-{func}`mxtreme.io.register`, called from {func}`~mxtreme.io.save_preprocessed`, and on every activity
-scan by {func}`mxtreme.io.register_scan`.
+{func}`mxtreme.io.register` (called from {func}`~mxtreme.io.save_preprocessed`), on every scan by
+{func}`mxtreme.io.register_scan`, and on every ingest by {func}`mxtreme.store.ingest_recording`.
 
-Rows are keyed by `(exp_id, chip, well, div, kind)`:
+Rows are keyed by `(exp_id, batch_id, chip, well, div, kind)`:
 
 | Column | |
 |---|---|
-| `exp_id`, `chip`, `well`, `div` | which culture, on which day |
-| `kind` | `preprocessed` for a cleaned recording, `activity_scan` for a scan |
+| `exp_id` | the experiment's name — blank for scans, which have none |
+| `batch_id`, `plate_date` | which plating batch — blank for rows from before the recordings tree |
+| `chip`, `well`, `div` | which culture, on which day |
+| `kind` | `preprocessed`, `activity_scan`, `network_scan`, or `experiment` (an ingested raw file) |
 | `conditions` | the well's experimental condition, when it has one |
 | `timestamp` | when the row was written |
 
 `kind` is part of the key, so a scan and the recordings later preprocessed from the same well and DIV
-are separate rows rather than one overwriting the other:
-
-```
-exp_id,chip,well,div,kind,conditions,timestamp
-May2025_Wave,M07459,0,14,activity_scan,,2026-08-27T09:14:02
-May2025_Wave,M07459,0,14,preprocessed,"[2, 0]",2026-08-27T11:40:57
-```
+are separate rows rather than one overwriting the other; `batch_id` is part of it because a chip is
+re-plated across batches, so `(chip, well, div)` alone recurs batch after batch.
 
 A scan is registered once per well it recorded, so "what do I have for this culture" stays a single
 query over a single table. Path resolution ({mod}`mxtreme.paths`) reads only the `preprocessed` rows —
-a scan is a raw `.h5` with no cleaned `.npz` behind it, so counting those rows would resolve to files
-that do not exist. A registry written before scans were indexed has no `kind` column; it is read as
-all-`preprocessed` and gains the column on its next write.
+a raw `.h5` has no cleaned `.npz` behind it, so counting those rows would resolve to files that do
+not exist. An older registry (no `kind`, or no `batch_id`/`plate_date`) is migrated on read and gains
+the columns on its next write.
 
 If the registry is deleted or drifts out of sync with the files on disk,
-{func}`mxtreme.io.rebuild_registry` reconstructs it by scanning the store — both the preprocessed
-`.npz` files and the scans — and returns how many it found. Both are rebuilt from inside the file
-itself: recordings from the `.npz`, scans from the `/assay/metadata` blob in the `.h5` that
-{func}`mxtreme.extract.extract` also reads. File names are never parsed back into fields, since an
-`exp_id` may contain the same underscores the name separates fields with. A scan with no such blob is
+{func}`mxtreme.io.rebuild_registry` reconstructs it by walking the store — the preprocessed `.npz`
+files and the recordings tree — and returns how many it found. A recording is rebuilt from inside its
+`.npz`; a raw file's identity is read back from its *path*, since the recordings tree's fixed-format
+directory names carry the batch, plating date, chip, well and DIV in full (its `/assay/metadata`
+blob, when readable, supplies the condition label). A file whose path does not follow the layout is
 reported rather than guessed at.
