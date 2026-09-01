@@ -84,6 +84,48 @@ def test_plate_date_is_validated():
         store.recording_stem(BATCH, 26081, "M07460", 0, 1)
 
 
+# --- listing platings -----------------------------------------------------------------------------
+
+
+def test_list_platings_reads_the_tree_back_newest_first(tmp_path):
+    config = Config(data_root=tmp_path)
+    for plate_date, batch in [(260810, BATCH), (270115, "spring2027_batch2_iPSC_M2")]:
+        (config.recordings_dir / store.plating_dirname(batch, plate_date)).mkdir(parents=True)
+
+    platings = store.list_platings(config)
+    assert [(p.batch.id, p.plate_date) for p in platings] == [
+        ("spring2027_batch2_iPSC_M2", 270115),
+        (BATCH, 260810),
+    ]
+    assert all(p.path.is_dir() for p in platings)
+
+
+def test_list_platings_skips_what_does_not_follow_the_convention(tmp_path):
+    config = Config(data_root=tmp_path)
+    config.recordings_dir.mkdir(parents=True)
+    (config.recordings_dir / "misc").mkdir()  # a stray folder
+    (config.recordings_dir / "plating_260810_notabatchid").mkdir()  # plating-shaped, bad batch id
+    (config.recordings_dir / f"plating_260810_{BATCH}").touch()  # right name, not a directory
+
+    assert store.list_platings(config) == []
+
+
+def test_list_platings_survives_a_missing_recordings_dir(tmp_path):
+    assert store.list_platings(Config(data_root=tmp_path / "nowhere")) == []
+
+
+def test_plating_chips_lists_the_chip_directories(tmp_path):
+    config = Config(data_root=tmp_path)
+    plating_dir = config.recordings_dir / store.plating_dirname(BATCH, 260810)
+    for name in ["chip_M1_M07460", "chip_M1_M07123"]:
+        (plating_dir / name).mkdir(parents=True)
+    (plating_dir / "notes").mkdir()  # a stray folder
+    (plating_dir / "chip_M1_M99999").touch()  # chip-shaped, not a directory
+
+    [plating] = store.list_platings(config)
+    assert plating.chips() == ["M07123", "M07460"]
+
+
 # --- splitting a multi-well file ------------------------------------------------------------------
 
 

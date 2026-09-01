@@ -156,7 +156,7 @@ def test_channel_activity_summary_columns(store):
     config, cid_a, _ = store
     cpath = resolve_paths(cid_a, config)
     df = activity.channel_activity_summary(cpath, config.analysis_dir, show_plot=False)
-    for col in ("culture_id", "div", "phase", "mean_fr_hz", "median_isi_sec", "mean_amp_uv", "pct_active_chan"):
+    for col in ("culture_id", "div", "phase", "mean_fr_hz", "median_isi_msec", "mean_amp_uv", "pct_active_chan"):
         assert col in df.columns
     assert set(df["div"]) == {7, 8}
     assert set(df["phase"]) == {"full"}
