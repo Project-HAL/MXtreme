@@ -34,14 +34,13 @@ jobs:
         with:
           path: docs/_build/html
 
-  # Inert until the repo is public and Pages is enabled:
-  #   1. Settings -> Pages -> Source = "GitHub Actions"
-  #   2. Settings -> Secrets and variables -> Actions -> Variables -> PUBLISH_DOCS = true
-  # Until then this job is *skipped*, not failed, while `build` still verifies the docs on every PR
-  # and leaves the rendered site downloadable as a workflow artifact.
+  # Publishes to https://project-hal.github.io/MXtreme/ on every merge to `main`. The one piece of
+  # setup that lives outside this file is Settings -> Pages -> Source = "GitHub Actions".
+  # On pull requests this job is *skipped*, not failed, while `build` still verifies the docs and
+  # leaves the rendered site downloadable as a workflow artifact.
   deploy:
     needs: build
-    if: github.ref == 'refs/heads/main' && vars.PUBLISH_DOCS == 'true'
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       pages: write

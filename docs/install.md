@@ -3,25 +3,29 @@
 ## Requirements
 
 - **Python 3.12+**
-- For development: **[uv](https://docs.astral.sh/uv/)**, which manages the environment and a
-  committed lock file so every contributor works against an identical dependency stack.
+- **[uv](https://docs.astral.sh/uv/)**, which manages the environment and a committed lock file so
+  everyone works against an identical dependency stack.
 
-End users installing the published package need only pip.
-
-## Users
-
-```bash
-pip install mxtreme
-```
-
-```python
-import mxtreme
-print(mxtreme.__version__)
-```
+MXtreme is not yet published to PyPI, so cloning the repository is the only supported install — see
+[Developers](#developers) below.
 
 matplotlib and seaborn are **required**, not optional — they are imported at module level by the
 recording, bursting, visualization, and analysis modules, so an install without them cannot import
 the package.
+
+% TODO(pypi): restore this section once mxtreme is published to PyPI.
+% Release plan and background: mxtreme-claude/claude_configs/mxt_management_and_use.md
+%
+% ## Users
+%
+% ```bash
+% pip install mxtreme
+% ```
+%
+% ```python
+% import mxtreme
+% print(mxtreme.__version__)
+% ```
 
 ## Developers
 

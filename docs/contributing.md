@@ -123,19 +123,16 @@ lock file with `uv sync --locked` (a stale `uv.lock` fails the build rather than
 re-resolving), runs the strict Sphinx build, and uploads the rendered site as a workflow artifact —
 so you can download and preview the built HTML from any PR's run summary.
 
-**`deploy`** publishes to GitHub Pages. It is gated on `vars.PUBLISH_DOCS == 'true'` and is therefore
-*skipped* — not failed — until that variable is set.
+**`deploy`** publishes to GitHub Pages. It runs only on `main`, so it is *skipped* — not failed — on
+pull requests.
 
-### Enabling the published site
+### The published site
 
-GitHub Pages requires a public repository (or a Team/Enterprise plan). Once the repository is public:
+The site is live at <https://project-hal.github.io/MXtreme/>. Every merge to `main` rebuilds and
+redeploys it automatically — there is nothing to publish by hand and no version to bump.
 
-1. **Settings → Pages → Source** = "GitHub Actions"
-2. **Settings → Secrets and variables → Actions → Variables → New repository variable** →
-   `PUBLISH_DOCS` = `true`
-
-The next push to `main` publishes to <https://project-hal.github.io/MXtreme/>, and every later merge
-to `main` updates it automatically. No workflow file edit is needed.
+The only piece of setup that lives outside the repository is **Settings → Pages → Source** =
+"GitHub Actions". If `deploy` ever fails with a Pages error, check that first.
 
 ## Code changes
 
