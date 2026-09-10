@@ -36,3 +36,9 @@ Rig setup
 
 .. automodule:: mxtreme.scans.mx_setup
    :members:
+
+Region selection
+----------------
+
+.. automodule:: mxtreme.scans.region_selection
+   :members:

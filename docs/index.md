@@ -30,6 +30,8 @@ quickstart
 
 concepts/data-flow
 concepts/configuration
+concepts/associative-dry-run
+concepts/associative-experiment-day
 ```
 
 ```{toctree}

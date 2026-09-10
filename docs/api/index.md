@@ -12,4 +12,6 @@ bursting
 analysis
 plotting
 scans
+stimulation
+experiments
 ```

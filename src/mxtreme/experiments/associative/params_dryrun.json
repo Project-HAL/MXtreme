@@ -1,0 +1,103 @@
+{
+  "_batch": "For a saline-filled chip: everything short, one of each kind of presentation, so the recording can be checked with `report`. Run `select --centers` (no scan, no baseline) to fill regions and rec_electrodes. Run once as is, then again with dt_cs_us 20 to exercise the unit-switching path, and once with t_stim 600, encode_pattern [PAIR], encode_cycles 1 to see that a full-length sequence loads.",
+  "batch": "fall2026_batch1_iPSC_M1",
+  "chip": "M07140",
+  "plate_date": 260122,
+  "div": 1,
+  "well": 0,
+  "exp_id": "dryrun",
+  "description": "dry run on saline: does every presentation fire where and when it should",
+  "save_path": null,
+  "_rec_electrodes": "Filled in by `select`. Every electrode to record; the regions' patches plus a spread over the rest.",
+  "rec_electrodes": null,
+  "_regions": "Centres in um, x along the long axis (0-3832), y along the short (0-2082). Filled in by `select`; then keep them fixed for the culture.",
+  "regions": {},
+  "_amplitudes_mv": "Per role, mV PER PHASE; peak to peak is twice this. Ronchi et al. 2019 characterised 40-240 mV peak to peak (20-120 per phase) on these arrays, so the ladder stays in that range and max_amplitude_mv refuses anything above 150 per phase unless raised deliberately.",
+  "amplitudes_mv": {
+    "US": 80.0,
+    "CS": 80.0,
+    "NS": 80.0
+  },
+  "min_region_separation_um": 1000.0,
+  "region_radius_um": 150.0,
+  "_stim_site": "focal: an inner x inner driven block on drive_dac, with a ring return_radius electrodes out on return_dac carrying the inverted pulse, which confines the field (Ronchi et al. 2019). The default spans 87.5 um of driven electrodes with the ring at 150 um, i.e. the stimulation site fills the region whose response is measured (region_radius_um). Widen it with inner_gap, not inner: the chip has 32 stimulation units and three regions share them, so a focal site costs inner^2 + 4 and a 3x3 focal site (39 units) will not route. return_radius must reach outside the driven block. grid: {shape, size, gap}, one DAC per role from region_dacs, no return ring, so 3x3 fits (27 units) if you would rather have nine driven points than spatial charge balance.",
+  "stim_site": {
+    "shape": "focal",
+    "inner": 2,
+    "inner_gap": 4,
+    "return_radius": 6,
+    "return_points": "corners"
+  },
+  "region_dacs": {
+    "US": 0,
+    "CS": 1,
+    "NS": 2
+  },
+  "drive_dac": 0,
+  "return_dac": 1,
+  "_stim_phase_us": "Biphasic, charge balanced. 100 us per phase is enough and keeps the artifact short; anodic-first was the more effective order in voltage mode (Ronchi et al. 2019).",
+  "stim_phase_us": 100.0,
+  "pulse_polarity": "anodic-first",
+  "_pulse_hz": "A presentation is t_stim (training) or t_probe (probe) seconds of pulse events at pulse_hz. pulses_per_burst 1 is a single pulse per event; 11 at burst_hz 20 is a Jimbo-style tetanus.",
+  "pulse_hz": 1.0,
+  "pulses_per_burst": 1,
+  "burst_hz": 20.0,
+  "t_stim": 20,
+  "t_probe": 10,
+  "dt_cs_us": 0.0,
+  "_mode": "conditioning, or calibration: single pulses at every calibration amplitude and polarity, per region.",
+  "mode": "conditioning",
+  "_pre_min": "Minutes. probe_iti, encode_iti, encode_cycle_rest, calibration_iti, t_stim, t_probe are seconds; dt_cs_us and the windows are ms.",
+  "pre_min": 1,
+  "_probe_roles": "Each probe is t_probe seconds at pulse_hz (20 pulses); probe_reps of each role per block gives 60 probe pulses per role to estimate a response probability from. Retrieval probes all three roles so a US-alone change in excitability is not read as learning. Every probe is also a little extinction, so keep probe pulses small next to the paired ones.",
+  "probe_roles": [
+    "US",
+    "CS",
+    "NS"
+  ],
+  "probe_reps": 1,
+  "probe_iti": 20,
+  "_encode_pattern": "encode_cycles cycles of encode_pattern (encode_iti apart) then encode_cycle_rest seconds of nothing. Sized for a four-hour first session that should teach the culture something if anything will: three cycles of 10 min pairing, 10 min pairing, 10 min NS at 0.33 Hz, 5 min rest; 60 min and 1200 paired pulses. Cut encode_cycles or a retrieval block for a shorter run, not t_stim. encode_iti must cover t_stim; probe_iti must cover t_probe plus the response windows.",
+  "encode_pattern": [
+    "PAIR",
+    "NS"
+  ],
+  "encode_iti": 30,
+  "encode_cycles": 2,
+  "encode_cycle_rest": 10,
+  "decay_min": 0.5,
+  "num_retrievals": 1,
+  "retrieval_roles": [
+    "US",
+    "CS",
+    "NS"
+  ],
+  "retrieval_interval_min": 1,
+  "post_min": 1,
+  "seed": 1,
+  "calibration_amplitudes_mv": [
+    20,
+    40,
+    60,
+    80,
+    100,
+    120
+  ],
+  "calibration_polarities": [
+    "anodic-first",
+    "cathodic-first"
+  ],
+  "calibration_reps": 2,
+  "calibration_iti": 3,
+  "max_amplitude_mv": 150.0,
+  "check_reps": 20,
+  "check_iti": 5.0,
+  "crosstalk_warn": 0.3,
+  "burst_warn": 0.2,
+  "_pulse_window_ms": "Counted after every pulse of a presentation and summed: the readout. response_windows_ms is optional; without it the windows are base/during/after sized by t_probe.",
+  "pulse_window_ms": [
+    5.0,
+    50.0
+  ],
+  "response_windows_ms": null
+}
