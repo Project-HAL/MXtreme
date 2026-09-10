@@ -33,6 +33,7 @@ docs = [
 # network = ["scikit-learn>=1.3"]   # for the planned analysis/network.py (PCA, functional connectivity)
 
 [project.urls]
+Documentation = "https://project-hal.github.io/MXtreme/"
 Repository = "https://github.com/Project-HAL/MXtreme"
 
 [tool.setuptools.dynamic]

@@ -4,7 +4,15 @@
 ## Requirements
 
 - **Python 3.12+**
-- **[uv](https://docs.astral.sh/uv/)** for development (environment + dependency management). End users installing the published package only need pip.
+- **[uv](https://docs.astral.sh/uv/)** for environment and dependency management.
+
+## Installation
+
+MXtreme is not yet published to PyPI, so cloning this repository is the only supported install —
+see [Development setup](#development-setup) below.
+
+<!-- TODO(pypi): restore this section once mxtreme is published to PyPI.
+     Release plan and background: mxtreme-claude/claude_configs/mxt_management_and_use.md
 
 ## Installation (users)
 
@@ -16,6 +24,8 @@ pip install mxtreme
 import mxtreme
 # ...
 ```
+
+-->
 
 ## Development setup
 
