@@ -1,5 +1,8 @@
 ![MXtreme Logo](img/MXtreme_logo.png)
 
+## Documentation
+
+https://project-hal.github.io/MXtreme/
 
 ## Requirements
 
