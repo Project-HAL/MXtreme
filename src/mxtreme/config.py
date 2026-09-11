@@ -57,8 +57,14 @@ class Config:
         """Path to the CSV index of what has been processed."""
         return self.data_root / "registry.csv"
 
+    @property
+    def transactions_path(self) -> Path:
+        """Path to the append-only log of decisions made about the data (a culture marked dead,
+        a chip's device kind) -- see :mod:`mxtreme.transactions`."""
+        return self.data_root / "transactions.jsonl"
+
     @classmethod
-    def from_toml(cls, path: str | Path) -> "Config":
+    def from_toml(cls, path: str | Path) -> Config:
         """Build a :class:`Config` from a TOML file.
 
         The file must contain a ``[data]`` table with a ``root`` key pointing at the managed store::

@@ -40,6 +40,12 @@ Managed store
 .. automodule:: mxtreme.store
    :members:
 
+Transaction log
+---------------
+
+.. automodule:: mxtreme.transactions
+   :members:
+
 Path resolution
 ---------------
 
