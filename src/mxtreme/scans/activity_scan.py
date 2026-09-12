@@ -805,7 +805,7 @@ def _register_scan(
         return
 
     try:
-        io.register_scan(params, registry_path)
+        io.register_scan(params, registry_path, well_files=result.well_files)
         on_progress(f"Registered wells {params.wells} in {registry_path}")
     except (OSError, ValueError) as exc:  # ValueError covers a registry CSV pandas cannot parse
         on_progress(

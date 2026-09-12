@@ -147,10 +147,20 @@ def extract(filepath: str, metadata: dict | None = None, wells: list | int | Non
             h5_object = f["wells"]["well{0:0>3}".format(well)]["rec{0:0>4}".format(0)]
             groups = h5_object["groups"]
             if not groups.keys():
+                if len(well_data["data"]) == 0:
+                    raise ValueError(
+                        f"{filepath} holds no data for well {well}: no raw frames and no spikes. "
+                        "An empty or aborted recording cannot be extracted."
+                    )
                 print(f"Warning: No raw data for {filepath} for well no {well}")
                 well_data["raw_start"] = np.min(well_data["data"]["frameno"])
             else:
                 group0 = groups[next(iter(groups))]
+                if group0["frame_nos"].shape[0] == 0:
+                    raise ValueError(
+                        f"{filepath} holds no data for well {well}: the recording has 0 frames. "
+                        "An empty or aborted recording cannot be extracted."
+                    )
                 well_data["raw_start"] = int(group0["frame_nos"][0])
 
             # Event data (stimulation start/stop markers, etc.)

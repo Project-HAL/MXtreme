@@ -149,6 +149,52 @@ def get_active_electrodes(data: dict):
 
     return data
 
+#: Electrode pitch and array size shared by every MaxWell HD-MEA well: 26,400 electrodes on a
+#: 17.5 µm grid, 220 columns by 120 rows.
+ELECTRODE_PITCH_UM = 17.5
+ARRAY_COLUMNS = 220
+ARRAY_ROWS = 120
+
+
+def electrode_summary(well_data: dict) -> pd.DataFrame:
+    """Per-electrode statistics of one well of an activity scan, on the array's grid.
+
+    The same numbers :func:`activity_scan_results` draws, returned as a table so a front end can
+    draw them its own way: one row per electrode the scan routed, with its grid position and
+
+    - ``firing_rate`` -- spikes per second over the scan's recording length (every spike counted,
+      as in the firing-rate panel);
+    - ``amplitude_90`` -- the 90th percentile of the electrode's spike amplitudes, in µV;
+    - ``active`` -- whether it passed :func:`get_active_electrodes`. Requires that function to have
+      run; without it every electrode is reported inactive.
+
+    :param well_data: One well's dict from :func:`load_activity_scan`.
+    :returns: Columns ``electrode``, ``col``, ``row``, ``x``, ``y``, ``firing_rate``,
+        ``amplitude_90``, ``active``, one row per routed electrode, sorted by electrode.
+    """
+    spike_data = well_data['spike_data']
+    mapping = well_data['mapping'].drop_duplicates('electrode')
+    rec_len = float(well_data['rec_length_sec'])
+    lsb = float(well_data['lsb'])
+
+    grouped = spike_data.groupby('electrode')['amplitude']
+    stats = pd.DataFrame({
+        'firing_rate': grouped.size() / rec_len,
+        'amplitude_90': grouped.apply(lambda a: float(np.abs(np.percentile(a, 90)) * lsb * 1e6)),
+    })
+
+    df = mapping[['electrode', 'x', 'y']].merge(stats, left_on='electrode', right_index=True, how='left')
+    df[['firing_rate', 'amplitude_90']] = df[['firing_rate', 'amplitude_90']].fillna(0.0)
+    df['col'] = (df['x'] / ELECTRODE_PITCH_UM).round().astype(int)
+    df['row'] = (df['y'] / ELECTRODE_PITCH_UM).round().astype(int)
+    active = well_data.get('active_electrodes')
+    active_set = set(active['electrode']) if active is not None and len(active) else set()
+    df['active'] = df['electrode'].isin(active_set)
+    return df.sort_values('electrode').reset_index(drop=True)[
+        ['electrode', 'col', 'row', 'x', 'y', 'firing_rate', 'amplitude_90', 'active']
+    ]
+
+
 def activity_scan_results(data: dict, savepath: str, savefilename: str = None):
     """Plot per-well activity-scan summaries: firing rate, spike amplitude, and active electrodes.
 

@@ -130,6 +130,20 @@ def save_preprocessed(
         registry_path = datastore.parent / "registry.csv"
     register({well_no: well}, registry_path)
 
+    from mxtreme import transactions
+
+    transactions.record(
+        transactions.transactions_path_for(registry_path),
+        "preprocessed.saved",
+        batch_id=well.get("batch_id") or None,
+        plate_date=plate_date,
+        exp_id=exp_id,
+        chip=chip,
+        well=well_no,
+        div=div,
+        data={"path": str(out_path), "source": str(well.get("path_to_h5") or "")},
+    )
+
     return out_path
 
 
@@ -268,7 +282,12 @@ def scan_kind(h5_path: str | Path) -> str:
 
 
 def register_scan(
-    params, registry_path: str | Path, *, kind: str = "activity_scan", timestamp=None
+    params,
+    registry_path: str | Path,
+    *,
+    kind: str = "activity_scan",
+    timestamp=None,
+    well_files: dict[int, str | Path] | None = None,
 ) -> None:
     """Upsert one scan row per scanned well into the registry CSV.
 
@@ -288,6 +307,8 @@ def register_scan(
         ``"network_scan"``, see :data:`REGISTRY_KINDS`.
     :type kind: str
     :param timestamp: Value for the rows' ``timestamp`` column; defaults to now.
+    :param well_files: ``{well: path}`` of the file each well landed in, for the transaction log's
+        ``<kind>.registered`` record of each well. Optional; the record is written either way.
     """
     conditions = list(params.conditions)
     register(
@@ -309,6 +330,23 @@ def register_scan(
         kind=kind,
         timestamp=timestamp,
     )
+
+    from mxtreme import transactions
+
+    log_path = transactions.transactions_path_for(registry_path)
+    for well in params.wells:
+        path = None if well_files is None else well_files.get(well)
+        transactions.record(
+            log_path,
+            f"{kind}.registered",
+            batch_id=getattr(params, "batch_id", "") or None,
+            plate_date=getattr(params, "plate_date", None) or None,
+            exp_id=getattr(params, "exp_id", ""),
+            chip=params.chip,
+            well=well,
+            div=params.div,
+            data={"path": "" if path is None else str(path)},
+        )
 
 
 def rebuild_registry(config, *, registry_path: str | Path | None = None) -> int:
@@ -400,6 +438,21 @@ def rebuild_registry(config, *, registry_path: str | Path | None = None) -> int:
             f"  {n_unparseable} file(s) skipped: their paths do not follow the recordings-tree "
             "layout, so their identity could not be recovered."
         )
+
+    from mxtreme import transactions
+
+    # One record for the rebuild, not one per row: the rows describe files that were journaled
+    # when they were written; the event here is that the index was reconstructed.
+    transactions.record(
+        transactions.transactions_path_for(registry_path),
+        "registry.rebuilt",
+        data={
+            "registry": str(registry_path),
+            "n_recordings": n_recordings,
+            "n_raw": n_raw,
+            "n_unparseable": n_unparseable,
+        },
+    )
     return n_recordings + n_raw
 
 
@@ -478,12 +531,35 @@ def repair_spike_order(config, *, dry_run: bool = False) -> list[Path]:
             np.savez_compressed(fh, **contents)
         os.replace(tmp_path, npz_path)
 
+        from mxtreme import transactions
+
+        transactions.record(
+            config,
+            "preprocessed.repaired",
+            exp_id=_scalar(contents.get("exp_id")),
+            plate_date=_scalar(contents.get("plate_date")),
+            chip=_scalar(contents.get("chip")),
+            well=_scalar(contents.get("well")),
+            div=_scalar(contents.get("DIV")),
+            data={"path": str(npz_path)},
+        )
+
     verb = "would repair" if dry_run else "repaired"
     print(f"Spike order: scanned {n_scanned} recording(s), {verb} {len(repaired)}")
     return repaired
 
 
 # --- burst outputs ------------------------------------------------------------------------------
+
+
+def _scalar(value):
+    """A scalar out of an ``.npz`` field, which comes back as a 0-d or 1-element array."""
+    if value is None:
+        return None
+    try:
+        return np.asarray(value).reshape(-1)[0].item()
+    except (IndexError, ValueError, AttributeError):
+        return value
 
 
 def _burst_csv_path(datastore: Path, recording) -> Path:
@@ -529,6 +605,19 @@ def save_burst_data(burst_set, datastore, recording, *, overwrite: bool = True) 
 
     burst_set.to_dataframe().to_csv(out_path, index=False)
     print(f"Burst data saved to: {out_path}")
+
+    from mxtreme import transactions
+
+    transactions.record(
+        transactions.transactions_path_for(datastore),
+        "bursts.saved",
+        exp_id=recording.exp_id,
+        plate_date=getattr(recording, "plate_date", None),
+        chip=recording.chip,
+        well=recording.well,
+        div=recording.DIV,
+        data={"path": str(out_path), "n_bursts": len(burst_set)},
+    )
     return out_path
 
 

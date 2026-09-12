@@ -509,4 +509,20 @@ def generate_report(
             _section_cultures(pdf, cultures, analysis_dir, phase)
 
     print(f"Report written to: {output_path}")
+
+    from mxtreme import transactions
+
+    for c in cultures:
+        transactions.record(
+            config,
+            "report.written",
+            exp_id=c.culture_id.exp_id,
+            chip=c.culture_id.chip,
+            well=c.culture_id.well,
+            data={
+                "path": str(output_path),
+                "divs": sorted(int(d) for d in c.recordings),
+                "sections": list(sections),
+            },
+        )
     return output_path
