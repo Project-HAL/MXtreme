@@ -60,6 +60,7 @@ OPS: dict[str, str] = {
     "preprocessed.repaired": "recording",  # data: {"path"}; spike order fixed in place
     "bursts.saved": "recording",  # data: {"path", "n_bursts"}
     "report.written": "culture",  # data: {"path", "divs", "sections"}; one per culture in it
+    "recording.removed": "recording",  # data: {"path", "kind", "trashed_to"|"purged", "derived", ...}
     "registry.rebuilt": "store",  # data: {"registry", "n_recordings", "n_raw", "n_unparseable"}
     "batch.renamed": "batch",  # data: {"old", "new"}; recorded against the new id
 }

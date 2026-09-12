@@ -29,9 +29,9 @@ them -- so ``import mxtreme`` (which re-exports :class:`Batch`) stays fast and r
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
 
 #: Semesters a batch id may name, in calendar order.
 SEMESTERS = ("spring", "summer", "fall", "winter")
@@ -477,6 +477,221 @@ def _ensure_metadata_blob(h5_path: Path, metadata: dict) -> None:
         f.require_group("assay").create_dataset(
             "metadata", data=np.array([str(metadata).encode("utf-8")])
         )
+
+
+# --- removing a recording -------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Removal:
+    """What :func:`remove_recording` removed -- or, with ``dry_run``, would remove.
+
+    :param recording: The raw ``.h5`` the removal was about.
+    :param location: Its identity, read from its place in the tree.
+    :param files: Every file removed, the recording first, then what was derived from it.
+    :param trashed_to: The directory the files were moved into, or ``None`` when purged (or dry run).
+    :param registry_rows: Registry rows dropped.
+    :param burst_log_rows: Rows dropped from the batch's burst log.
+    :param pruned_dirs: Directories left empty by the removal and removed too.
+    """
+
+    recording: Path
+    location: RecordingLocation
+    files: tuple[Path, ...]
+    trashed_to: Path | None
+    registry_rows: int
+    burst_log_rows: int
+    pruned_dirs: tuple[Path, ...]
+
+
+def derived_files(config, h5_path: str | Path) -> list[Path]:
+    """The files elsewhere in the store that were computed from one raw recording.
+
+    An activity scan's derivatives are its electrode selection (the figures and the electrode
+    list in ``electrode_selection/`` beside it). A network scan's, or an ingested experiment's,
+    are the preprocessed ``.npz`` and the burst CSV for that well and DIV -- under the batch id for
+    a scan (the pipeline files a scan by its batch id, see :func:`mxtreme.scans.activity_scan`),
+    under the experiment name for an experiment. Analysis summaries and reports are per culture
+    across DIVs, and are left alone: they are rebuilt from what remains.
+
+    :returns: The files that exist, in a stable order. Empty if the path is not in the tree.
+    """
+    h5_path = Path(h5_path)
+    location = parse_recording_path(h5_path, config.recordings_dir)
+    if location is None:
+        return []
+    out: list[Path] = []
+    if location.kind == "activity_scan":
+        selection = h5_path.parent / "electrode_selection"
+        if selection.is_dir():
+            out.extend(sorted(p for p in selection.iterdir() if p.is_file() and f"well{location.well}" in p.name))
+        return out
+    exp = location.exp_id or location.batch.id
+    well_tail = Path(location.chip) / f"well{location.well}"
+    for root, pattern in (
+        (config.preprocessed_dir / exp / well_tail, f"DIV{location.div}_*exp_data.npz"),
+        (config.burst_data_dir / exp / well_tail, f"DIV{location.div}_*burst_data.csv"),
+    ):
+        if root.is_dir():
+            out.extend(sorted(root.glob(pattern)))
+    return out
+
+
+def _drop_burst_log_rows(config, exp: str, chip: str, well: int, div: int, *, dry_run: bool) -> int:
+    """Drop one recording's rows from the batch's burst log; return how many."""
+    log_path = config.burst_data_dir / f"{exp}_burst_log.csv"
+    if not log_path.is_file():
+        return 0
+    import pandas as pd
+
+    df = pd.read_csv(log_path)
+    if df.empty or not {"chip", "well", "DIV"} <= set(df.columns):
+        return 0
+    mask = (df["chip"].astype(str) == str(chip)) & (df["well"].astype(str) == str(well)) & (df["DIV"].astype(str) == str(div))
+    n = int(mask.sum())
+    if n and not dry_run:
+        df[~mask].to_csv(log_path, index=False)
+    return n
+
+
+def remove_recording(
+    h5_path: str | Path,
+    config,
+    *,
+    derived: bool = True,
+    purge: bool = False,
+    dry_run: bool = False,
+    reason: str = "",
+    actor: str | None = None,
+    on_progress: Callable[[str], None] = print,
+) -> Removal:
+    """Take one raw recording out of the managed store, cleanly.
+
+    Deleting the file alone leaves a store that lies: registry rows for a recording that is gone,
+    a preprocessed ``.npz`` and burst table computed from it, a burst-log row counting its bursts.
+    This removes all of that together -- the recording, what was derived from it
+    (:func:`derived_files`, unless ``derived=False``), their registry rows and burst-log rows --
+    and journals the removal (``recording.removed`` in :mod:`mxtreme.transactions`).
+
+    Nothing is destroyed by default: the files are *moved* into
+    :attr:`~mxtreme.config.Config.trash_dir`, under a directory named for the moment and the
+    recording, keeping their paths relative to the store, so a removal can be undone by moving
+    them back and re-registering (:func:`mxtreme.io.rebuild_registry`). ``purge=True`` deletes
+    them instead. Directories the removal leaves empty (the DIV directory, an emptied
+    ``electrode_selection/``) are removed too, so the tree does not show a day that has nothing.
+
+    The typical use is an aborted or empty scan -- a network scan with no frames, a sweep stopped
+    on its first recording -- that would otherwise sit in the tree forever, registered, and fail
+    every analysis pointed at it.
+
+    :param h5_path: The recording, inside ``config.recordings_dir``.
+    :param config: The :class:`~mxtreme.config.Config` describing the managed store.
+    :param derived: Also remove what was computed from the recording. ``False`` leaves those files
+        and their registry rows in place -- they then describe a recording that is gone.
+    :param purge: Delete outright instead of moving to the trash.
+    :param dry_run: Work out what would be removed and report it, touching nothing.
+    :param reason: Why, for the journal.
+    :param actor: Who, for the journal; the OS user when ``None``.
+    :param on_progress: Called with each progress line.
+    :returns: What was (or would be) removed.
+    :raises ValueError: If the path is not a file inside the recordings tree, or does not follow
+        its layout.
+    """
+    import shutil
+    from datetime import datetime
+
+    from mxtreme import io, transactions
+
+    h5_path = Path(h5_path).resolve()
+    recordings_dir = Path(config.recordings_dir).resolve()
+    if recordings_dir not in h5_path.parents:
+        raise ValueError(f"{h5_path} is not inside the recordings tree ({recordings_dir}); nothing removed.")
+    if not h5_path.is_file():
+        raise ValueError(f"{h5_path} is not a file; nothing removed.")
+    location = parse_recording_path(h5_path, recordings_dir)
+    if location is None:
+        raise ValueError(f"{h5_path} does not follow the recordings-tree layout, so its identity is unknown; nothing removed.")
+
+    files = [h5_path] + (derived_files(config, h5_path) if derived else [])
+    exp = location.exp_id or location.batch.id
+    verb = "Would remove" if dry_run else "Removing"
+    for f in files:
+        on_progress(f"{verb} {f}")
+
+    trash_root = None
+    if not dry_run:
+        if purge:
+            for f in files:
+                f.unlink()
+        else:
+            stamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
+            trash_root = Path(config.trash_dir) / f"{stamp}_{h5_path.name.removesuffix('.raw.h5').removesuffix('.h5')}"
+            data_root = Path(config.data_root).resolve()
+            for f in files:
+                dest = trash_root / f.relative_to(data_root)
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(f), str(dest))
+            on_progress(f"Moved to {trash_root}")
+
+    # The registry: the recording's own rows, and its preprocessed rows when those files went.
+    registry_rows = 0
+    if not dry_run:
+        registry_rows += io.unregister(
+            config.registry_path, chip=location.chip, well=location.well, div=location.div,
+            kind=location.kind, exp_id=location.exp_id, batch_id=location.batch.id,
+        )
+        if derived and location.kind != "activity_scan":
+            registry_rows += io.unregister(
+                config.registry_path, chip=location.chip, well=location.well, div=location.div,
+                kind="preprocessed", exp_id=exp,
+            )
+    burst_log_rows = 0
+    if derived and location.kind != "activity_scan":
+        burst_log_rows = _drop_burst_log_rows(config, exp, location.chip, location.well, location.div, dry_run=dry_run)
+
+    pruned: list[Path] = []
+    if not dry_run:
+        for d in (h5_path.parent / "electrode_selection", h5_path.parent):
+            if d.is_dir() and not any(d.iterdir()):
+                d.rmdir()
+                pruned.append(d)
+
+    removal = Removal(
+        recording=h5_path,
+        location=location,
+        files=tuple(files),
+        trashed_to=trash_root,
+        registry_rows=registry_rows,
+        burst_log_rows=burst_log_rows,
+        pruned_dirs=tuple(pruned),
+    )
+    if not dry_run:
+        transactions.record(
+            config,
+            "recording.removed",
+            batch_id=location.batch,
+            plate_date=location.plate_date,
+            exp_id=location.exp_id,
+            chip=location.chip,
+            well=location.well,
+            div=location.div,
+            actor=actor,
+            note=reason,
+            data={
+                "path": str(h5_path),
+                "kind": location.kind,
+                "trashed_to": None if trash_root is None else str(trash_root),
+                "purged": bool(purge),
+                "derived": [str(f) for f in files[1:]],
+                "registry_rows": registry_rows,
+                "burst_log_rows": burst_log_rows,
+            },
+        )
+        on_progress(
+            f"Removed {h5_path.name}: {len(files)} file(s), {registry_rows} registry row(s), "
+            f"{burst_log_rows} burst-log row(s)."
+        )
+    return removal
 
 
 # --- ingesting an exogenous recording -------------------------------------------------------------
