@@ -410,6 +410,20 @@ def backfill(config, *, on_progress=print) -> int:
 
     from mxtreme.store import chip_dir
 
+    def _when(value) -> str:
+        """A registry or burst-log timestamp as ISO 8601; a stamp that does not parse is 'now'."""
+        if value is None or value == "":
+            return _now()
+        try:
+            stamp = (
+                pd.Timestamp(float(value), unit="s")
+                if str(value).replace(".", "", 1).isdigit()
+                else pd.Timestamp(value)
+            )
+            return stamp.isoformat(timespec="seconds")
+        except (ValueError, TypeError, OverflowError):
+            return _now()
+
     existing = {(t.op, t.batch_id or t.exp_id, str(t.chip), t.well, t.div) for t in iter_transactions(config)}
     added = 0
 
@@ -462,7 +476,7 @@ def backfill(config, *, on_progress=print) -> int:
                 actor="",
                 note=BACKFILL_NOTE,
                 data={"path": path},
-                time=str(row.get("timestamp") or _now()),
+                time=_when(row.get("timestamp")),
             )
             existing.add(key)
             added += 1
@@ -490,7 +504,7 @@ def backfill(config, *, on_progress=print) -> int:
                 actor="",
                 note=BACKFILL_NOTE,
                 data={"path": str(matches[-1]) if matches else "", "n_bursts": n_bursts},
-                time=str(row.get("features_computed_at") or row.get("detection_completed_at") or _now()),
+                time=_when(row.get("features_computed_at") or row.get("detection_completed_at")),
             )
             existing.add(key)
             added += 1
