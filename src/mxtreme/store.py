@@ -611,4 +611,19 @@ def ingest_recording(
     )
     on_progress(f"Registered wells {sorted(written)} in {config.registry_path}")
 
+    from mxtreme import transactions
+
+    for well, dest in written.items():
+        transactions.record(
+            config,
+            "recording.ingested",
+            batch_id=batch,
+            plate_date=plate_date,
+            exp_id=exp_id,
+            chip=chip,
+            well=well,
+            div=div,
+            data={"source": str(h5_path), "path": str(dest), "moved": bool(move)},
+        )
+
     return written

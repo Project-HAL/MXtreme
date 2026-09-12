@@ -24,7 +24,8 @@ later stage reads back from there. The structure is as follows:
 ├── analysis/                      per-culture summary CSVs, plots, PDF reports
 │   ├── <category>/<exp_id>/<chip>/well<N>/<culture_id>_<name>.csv
 │   └── reports/<slug>_report.pdf
-└── registry.csv                   index of every raw file and recording in the store
+├── registry.csv                   index of every raw file and recording in the store
+└── transactions.jsonl             append-only journal of everything that changed the store
 ```
 
 The recordings tree is keyed by **plating batch** — one plating event, named at the bench — and every
@@ -85,6 +86,7 @@ subtree:
 | {attr}`~mxtreme.config.Config.burst_data_dir` | `data_root/burst_data` |
 | {attr}`~mxtreme.config.Config.analysis_dir` | `data_root/analysis` |
 | {attr}`~mxtreme.config.Config.registry_path` | `data_root/registry.csv` |
+| {attr}`~mxtreme.config.Config.transactions_path` | `data_root/transactions.jsonl` |
 
 These are what you hand to the functions that write.
 
@@ -172,3 +174,30 @@ files and the recordings tree — and returns how many it found. A recording is 
 directory names carry the batch, plating date, chip, well and DIV in full (its `/assay/metadata`
 blob, when readable, supplies the condition label). A file whose path does not follow the layout is
 reported rather than guessed at.
+
+## The transaction log
+
+`transactions.jsonl` is the store's journal: one JSON record per line, appended and never
+rewritten, for everything that changed the store and every decision made about the data
+({mod}`mxtreme.transactions`). The registry says *what is there*; the log says *what happened,
+when, and by whom*.
+
+MXtreme writes to it itself, from the function that made the change, right after the change is on
+disk: a scan registered (`activity_scan.registered`, `network_scan.registered`, one per well), an
+outside recording ingested (`recording.ingested`), a well preprocessed (`preprocessed.saved`), its
+spike order repaired (`preprocessed.repaired`), bursts detected (`bursts.saved`), a report written
+(`report.written`, one per culture in it), the registry rebuilt (`registry.rebuilt`). A front end
+records people's decisions in the same file: `culture.mark_dead` / `culture.mark_alive`,
+`batch.mark_dead` / `batch.mark_alive`, `chip.set_device`, `note`. The full vocabulary is
+{data}`mxtreme.transactions.OPS`.
+
+Every record carries as much identity as the writer had — `batch_id`, `plate_date`, `exp_id`,
+`chip`, `well`, `div` — plus `actor` (the OS user, for MXtreme's own entries), a `note` and
+op-specific `data` (paths written, counts). One culture's history is
+{func}`mxtreme.transactions.for_culture`; the alive/dead state of the decision records is a fold,
+{func}`~mxtreme.transactions.batch_states` / {func}`~mxtreme.transactions.culture_states` /
+{func}`~mxtreme.transactions.is_dead`, computed on read.
+
+Nothing is edited or deleted; a correction is another line. A store that predates the log gets a
+history once from its registry and burst logs with {func}`mxtreme.transactions.backfill`, which
+skips what is already journaled and marks what it adds as back-filled.
