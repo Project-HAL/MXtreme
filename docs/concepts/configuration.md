@@ -24,6 +24,7 @@ later stage reads back from there. The structure is as follows:
 ├── analysis/                      per-culture summary CSVs, plots, PDF reports
 │   ├── <category>/<exp_id>/<chip>/well<N>/<culture_id>_<name>.csv
 │   └── reports/<slug>_report.pdf
+├── trash/                         what remove_recording took out, at its store-relative path
 ├── registry.csv                   index of every raw file and recording in the store
 └── transactions.jsonl             append-only journal of everything that changed the store
 ```
@@ -86,6 +87,7 @@ subtree:
 | {attr}`~mxtreme.config.Config.burst_data_dir` | `data_root/burst_data` |
 | {attr}`~mxtreme.config.Config.analysis_dir` | `data_root/analysis` |
 | {attr}`~mxtreme.config.Config.registry_path` | `data_root/registry.csv` |
+| {attr}`~mxtreme.config.Config.trash_dir` | `data_root/trash` |
 | {attr}`~mxtreme.config.Config.transactions_path` | `data_root/transactions.jsonl` |
 
 These are what you hand to the functions that write.
@@ -201,3 +203,18 @@ op-specific `data` (paths written, counts). One culture's history is
 Nothing is edited or deleted; a correction is another line. A store that predates the log gets a
 history once from its registry and burst logs with {func}`mxtreme.transactions.backfill`, which
 skips what is already journaled and marks what it adds as back-filled.
+
+## Removing a recording
+
+Deleting a raw file by hand leaves the store lying: registry rows for a recording that is gone, a
+preprocessed `.npz` and burst table computed from it, a burst-log row counting its bursts.
+{func}`mxtreme.store.remove_recording` takes all of that out together — the recording, what was
+derived from it ({func}`mxtreme.store.derived_files`: an activity scan's electrode-selection
+outputs; a network scan's or experiment's `.npz` and burst CSV), their registry rows and burst-log
+rows — prunes the DIV directory if that emptied it, and journals a `recording.removed`.
+
+Nothing is destroyed by default: the files are moved under `trash/<when>_<recording>/` at their
+store-relative paths, so a removal is undone by moving them back and running
+{func}`mxtreme.io.rebuild_registry`. Pass `purge=True` to delete outright, `dry_run=True` to see
+what would go, `derived=False` to keep the derivatives. The usual reason is an aborted or empty
+scan that would otherwise sit in the tree forever and fail every analysis pointed at it.

@@ -263,6 +263,45 @@ def register(
     df.to_csv(registry_path, index=False)
 
 
+def unregister(
+    registry_path: str | Path,
+    *,
+    chip: str,
+    well: int,
+    div: int,
+    kind: str,
+    exp_id: str | None = None,
+    batch_id: str | None = None,
+) -> int:
+    """Drop the registry rows for one recording, and return how many went.
+
+    The inverse of :func:`register` for one key. ``exp_id`` and ``batch_id`` narrow the match when
+    given; left ``None``, any value matches -- a preprocessed row written by an older flow has a
+    blank ``batch_id`` even though its recording sits in the batch-keyed tree, so the caller that
+    knows only the batch cannot always require it.
+
+    :returns: The number of rows removed. Zero if the registry does not exist or had no such row.
+    """
+    registry_path = Path(registry_path)
+    df = _read_registry(registry_path)
+    if df.empty:
+        return 0
+    mask = (
+        (df["chip"].astype(str) == str(chip))
+        & (df["well"].astype(str) == str(well))
+        & (df["div"].astype(str) == str(div))
+        & (df["kind"].astype(str) == str(kind))
+    )
+    if exp_id is not None:
+        mask &= df["exp_id"].astype(str) == str(exp_id)
+    if batch_id is not None:
+        mask &= df["batch_id"].astype(str) == str(batch_id)
+    n = int(mask.sum())
+    if n:
+        df[~mask].to_csv(registry_path, index=False)
+    return n
+
+
 # --- scans ----------------------------------------------------------------------------------------
 
 

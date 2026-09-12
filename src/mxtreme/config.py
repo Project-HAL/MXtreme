@@ -58,6 +58,12 @@ class Config:
         return self.data_root / "registry.csv"
 
     @property
+    def trash_dir(self) -> Path:
+        """Where :func:`mxtreme.store.remove_recording` moves what it removes, so a removal can be
+        undone by hand: ``trash/<when>_<recording>/<path relative to the store>``."""
+        return self.data_root / "trash"
+
+    @property
     def transactions_path(self) -> Path:
         """Path to the append-only log of decisions made about the data (a culture marked dead,
         a chip's device kind) -- see :mod:`mxtreme.transactions`."""
