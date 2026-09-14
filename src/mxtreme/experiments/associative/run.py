@@ -28,7 +28,7 @@ import csv
 import json
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from mxtreme.experiments.associative import protocol
@@ -51,6 +51,7 @@ class RunResult:
     stopped_early: bool
     protocol_copy: Path | None = None  # in ``work``, when one was given
     fired_copy: Path | None = None
+    phases: list[RunResult] = field(default_factory=list)  # every phase's result, in order
 
 
 #: What the MaxLab server's system type means, in the batch id's terms.
@@ -115,6 +116,14 @@ def execute_schedule(
             sleep(min(_POLL_SEC, remaining))
 
     block_start = 0.0
+    try:
+        return _walk(blocks, fire, mark, wait_until, clock, t0, fired, block_start, on_progress)
+    except KeyboardInterrupt:
+        on_progress("interrupted: closing this recording; no later phase will start")
+        return fired, True
+
+
+def _walk(blocks, fire, mark, wait_until, clock, t0, fired, block_start, on_progress):
     for block in blocks:
         if not wait_until(block_start):
             return fired, True
@@ -152,48 +161,94 @@ def raw_channels(params: AssociativeParams, regions, config) -> list[int]:
     return sorted(set(config.get_channels_for_electrodes(electrodes)))
 
 
+def expand_phases(params: AssociativeParams, spec) -> list[str]:
+    """The phases a ``run`` records, in order, from what was asked for.
+
+    ``spec`` is a phase name, a list of them, or a comma-separated string, and may use two
+    shorthands: ``"session"`` is the whole conditioning session -- ``baseline``, every
+    ``encode_<k>``, ``retrieval`` -- and ``"encode"`` is every encode cycle. ``None`` means the
+    parameters' own ``phase``.
+    """
+    if spec is None:
+        spec = [params.phase]
+    if isinstance(spec, str):
+        spec = spec.split(",")
+    encode = [f"encode_{k}" for k in range(1, params.encode_cycles + 1)] if params.encode_pattern else []
+    out: list[str] = []
+    for item in spec:
+        item = item.strip()
+        if item == "session":
+            out += ["baseline", *encode, "retrieval"]
+        elif item == "encode":
+            out += encode
+        elif item:
+            out.append(item)
+    if len(out) > 1 and "all" in out:
+        raise ValueError("'all' is one recording of the whole session and cannot be combined with phases")
+    return out or ["all"]
+
+
 def run(
     params: AssociativeParams,
     config=None,
     *,
+    phases=None,
     work: str | Path | None = None,
     on_progress: ProgressFn = print,
     should_stop: StopFn | None = None,
 ) -> RunResult:
-    """Run the protocol on the rig and record it.
+    """Run the protocol on the rig and record it: one recording, or one per phase.
+
+    The rig is set up once -- device check, routing, the sequences -- and then each phase is its
+    own recording, opened, written with its own protocol, run and closed before the next starts.
+    ``phases=["session"]`` records a whole conditioning session as separate files without anyone
+    at the keyboard between them; a single phase, or the default ``params.phase``, is one file.
 
     :param params: With ``regions``, ``rec_electrodes`` and ``amplitudes_mv`` set.
     :param config: The :class:`~mxtreme.config.Config` naming the store, unless ``params.save_path``
         says where to write instead.
-    :param work: A directory outside the store for a copy of the protocol and the fire-time table.
-        Optional; the recording carries everything :mod:`.report` needs without it.
+    :param phases: See :func:`expand_phases`; ``None`` is ``params.phase``.
+    :param work: A directory outside the store for a copy of each protocol and fire-time table.
+        Optional; the recordings carry everything :mod:`.report` needs without it.
     :param should_stop: Polled while waiting; return ``True`` to end the run early. The recording
-        is closed properly either way.
+        being made is closed properly and no later phase starts.
+    :returns: The last phase's result; every phase's is in its ``phases`` list.
     :raises ModuleNotFoundError: If ``maxlab`` is not installed (this is not the rig).
-    :raises RuntimeError: If the protocol cannot be written into the recording and there is no
-        ``work`` directory to keep it in. Raised before recording starts, so nothing is lost.
+    :raises RuntimeError: If a protocol cannot be written into its recording and there is no
+        ``work`` directory to keep it in. Raised before that recording starts, so nothing is lost.
     """
-    from mxtreme import io
     from mxtreme.scans import mx_setup
     from mxtreme.scans.activity_scan import _require_maxlab
     from mxtreme.stimulation import sequences
 
     mx = _require_maxlab()
-    params.validate(for_run=True)
+    names = expand_phases(params, phases)
+    per_phase = [replace(params, phase=name) for name in names]
+    for p in per_phase:
+        p.validate(for_run=True)
     registry_path = config.registry_path if config is not None and params.save_path is None else None
-    params = params.resolved(config)
-    Path(params.save_path).mkdir(parents=True, exist_ok=True)
+    per_phase = [p.resolved(config) for p in per_phase]
+    Path(per_phase[0].save_path).mkdir(parents=True, exist_ok=True)
     well = params.well
 
-    blocks, stimuli = protocol.build_schedule(params)
+    # Every sequence any phase fires, built once; the regions are the same for all of them.
+    schedules = {p.phase: protocol.build_schedule(p) for p in per_phase}
+    stimuli: dict[str, protocol.Stimulus] = {}
+    for _blocks, mine in schedules.values():
+        stimuli.update(mine)
     regions = protocol.regions_for(params)
     on_progress(
         "=== Associative run ==="
         + (f" ({params.mode})" if params.mode != "conditioning" else "")
-        + (f" phase {params.phase}" if params.phase != "all" else "")
-        + f" -> {params.file_name}.raw.h5"
+        + (
+            f": {len(per_phase)} recordings, " + ", ".join(names)
+            if len(per_phase) > 1
+            else (f" phase {names[0]}" if names[0] != "all" else "")
+        )
     )
-    on_progress(protocol.summary(blocks, stimuli, params.stim_phase_us))
+    for p in per_phase:
+        on_progress(f"--- {p.file_name}.raw.h5")
+        on_progress(protocol.summary(schedules[p.phase][0], schedules[p.phase][1], params.stim_phase_us))
     for spec in regions.values():
         on_progress(
             f"  {spec.role}: centre {spec.center_um} um, {len(spec.drive_electrodes)} driven on dac {spec.drive_dac}"
@@ -205,7 +260,7 @@ def run(
             + f", {len(spec.rec_electrodes)} recording electrodes, {spec.amplitude_mv} mV"
         )
 
-    # --- the chip ---
+    # --- the chip, once ---
     on_progress(f"Device: {check_device(params.batch, mx)}, matching batch {params.batch_id}")
     on_progress("Initializing chip...")
     mx.initialize()
@@ -258,7 +313,69 @@ def run(
     mx.offset()
     time.sleep(mx.Timing.waitInMX2Offset)
 
-    # --- the recording ---
+    def fire(token):
+        registered[token].send()
+
+    def mark(label):
+        sequences.mark(well, f"{label} {well}")
+
+    # --- one recording per phase ---
+    results: list[RunResult] = []
+    for k, p in enumerate(per_phase):
+        if len(per_phase) > 1:
+            on_progress(f"\n=== {p.phase} ({k + 1} of {len(per_phase)}) ===")
+        blocks, mine = schedules[p.phase]
+        result = _record_phase(
+            p,
+            blocks,
+            mine,
+            regions,
+            units,
+            routed,
+            mx,
+            mx_setup,
+            fire,
+            mark,
+            registry_path,
+            work,
+            on_progress,
+            should_stop,
+        )
+        results.append(result)
+        if result.stopped_early:
+            on_progress(f"stopped during {p.phase}; {len(per_phase) - k - 1} phase(s) not recorded")
+            break
+    results[-1].phases = results
+    if len(results) > 1:
+        on_progress(
+            f"session: {len(results)} recordings\n  "
+            + "\n  ".join(str(r.h5_path) for r in results)
+            + "\n  read them together: report "
+            + " ".join(str(r.h5_path) for r in results)
+        )
+    return results[-1]
+
+
+def _record_phase(
+    params,
+    blocks,
+    stimuli,
+    regions,
+    units,
+    routed,
+    mx,
+    mx_setup,
+    fire,
+    mark,
+    registry_path,
+    work,
+    on_progress,
+    should_stop,
+) -> RunResult:
+    """Open one recording, write its metadata and protocol into it, run its schedule, close it."""
+    from mxtreme import io
+
+    well = params.well
     s = mx.Saving()
     s.open_directory(params.save_path)
     s.start_file(params.file_name)
@@ -294,13 +411,6 @@ def run(
     started_at = time.time()
     s.start_recording([well])
     on_progress(f"recording to {params.h5_path}")
-
-    def fire(token):
-        registered[token].send()
-
-    def mark(label):
-        sequences.mark(well, f"{label} {well}")
-
     try:
         fired, stopped = execute_schedule(
             blocks, fire, mark, should_stop=should_stop, on_progress=on_progress

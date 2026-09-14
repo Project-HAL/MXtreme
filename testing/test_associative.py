@@ -489,3 +489,149 @@ def test_check_device_refuses_a_batch_for_the_other_system():
     assert run.check_device("fall2026_batch1_iPSC_M2", FakeMx("1")) == "MaxTwo"
     with pytest.raises(RuntimeError, match="says M1"):
         run.check_device("fall2026_batch1_iPSC_M1", FakeMx("1"))
+
+
+def test_expand_phases_knows_the_session_and_encode_shorthands():
+    from mxtreme.experiments.associative.run import expand_phases
+
+    p = _params(encode_cycles=3)
+    assert expand_phases(p, None) == ["all"]
+    assert expand_phases(p, "session") == ["baseline", "encode_1", "encode_2", "encode_3", "retrieval"]
+    assert expand_phases(p, "encode") == ["encode_1", "encode_2", "encode_3"]
+    assert expand_phases(p, "baseline, encode_2") == ["baseline", "encode_2"]
+    assert expand_phases(p, ["retrieval"]) == ["retrieval"]
+    with pytest.raises(ValueError, match="cannot be combined"):
+        expand_phases(p, "all,retrieval")
+
+
+def test_a_keyboard_interrupt_mid_schedule_is_a_clean_stop():
+    from mxtreme.experiments.associative.run import execute_schedule
+
+    blocks = [
+        protocol.Block(
+            "a", 2.0, [protocol.Presentation(0.0, "x", ["US"]), protocol.Presentation(1.0, "y", ["CS"])]
+        )
+    ]
+    fired_tokens = []
+
+    def fire(token):
+        fired_tokens.append(token)
+        if token == "x":
+            raise KeyboardInterrupt
+
+    now = [0.0]
+    fired, stopped = execute_schedule(
+        blocks,
+        fire,
+        lambda _label: None,
+        clock=lambda: now[0],
+        sleep=lambda dt: now.__setitem__(0, now[0] + dt),
+        on_progress=lambda _m: None,
+    )
+    assert stopped and fired == [] and fired_tokens == ["x"]
+
+
+def test_a_session_run_sets_the_rig_up_once_and_opens_one_recording_per_phase(monkeypatch, tmp_path):
+    """Walks ``run`` against a fake maxlab: no hardware, but the real setup/record/close order."""
+    import types
+    from unittest import mock
+
+    before = set(sys.modules)
+    for name in (
+        "maxlab",
+        "maxlab.saving",
+        "maxlab.system",
+        "maxlab.chip",
+        "maxlab.util",
+        "maxlab.characterize",
+    ):
+        monkeypatch.setitem(sys.modules, name, mock.MagicMock())
+    try:
+        from mxtreme.experiments.associative import run as R
+
+        p = _params(encode_cycles=2, save_path=str(tmp_path), exp_id="t")
+        opened, inits, closed = [], [], []
+
+        class Saving:
+            def open_directory(self, d):
+                pass
+
+            def start_file(self, name):
+                opened.append(name)
+
+            def group_delete_all(self):
+                pass
+
+            def group_define(self, *a):
+                pass
+
+            def write_assay_property(self, k, v):
+                return "Ok"
+
+            def start_recording(self, w):
+                pass
+
+            def stop_recording(self):
+                pass
+
+            def stop_file(self):
+                closed.append(len(opened))
+
+        class Timing:
+            waitInit = waitInMX2Offset = waitAfterRecording = 0
+
+        class Core:
+            def enable_stimulation_power(self, b):
+                return "cmd"
+
+        mx = types.SimpleNamespace(
+            Saving=Saving,
+            Timing=Timing,
+            Core=Core,
+            initialize=lambda: inits.append(1),
+            send=lambda c: "Ok",
+            clear_events=lambda: None,
+            activate=lambda w: None,
+            offset=lambda: None,
+        )
+        cfg = types.SimpleNamespace(
+            get_channels=lambda: [1], get_channels_for_electrodes=lambda e: [0] * len(e)
+        )
+        units = {
+            f"{r}_{k}": [i]
+            for i, (r, k) in enumerate((r, k) for r in ("US", "CS", "NS") for k in ("drive", "return"))
+        }
+        with (
+            mock.patch("mxtreme.scans.activity_scan._require_maxlab", return_value=mx),
+            mock.patch("mxtreme.experiments.associative.run.check_device", return_value="MaxOne"),
+            mock.patch(
+                "mxtreme.stimulation.sequences.init_well_regions",
+                return_value=(types.SimpleNamespace(get_config=lambda: cfg), units),
+            ),
+            mock.patch(
+                "mxtreme.stimulation.sequences.build_region_sequence",
+                return_value=(types.SimpleNamespace(send=lambda: None), 1.0),
+            ),
+            mock.patch("mxtreme.stimulation.sequences.mark"),
+            mock.patch("mxtreme.scans.mx_setup.write_metadata"),
+            mock.patch("mxtreme.scans.mx_setup.write_exp_description"),
+            mock.patch("mxtreme.scans.mx_setup.write_stim_electrodes"),
+            mock.patch(
+                "mxtreme.scans.activity_scan._saved_file", side_effect=lambda params, t: params.h5_path
+            ),
+            mock.patch("mxtreme.experiments.associative.run.execute_schedule", return_value=([], False)),
+        ):
+            result = R.run(p, phases="session", on_progress=lambda m: None)
+        assert inits == [1]  # the chip once
+        assert [n.rsplit("_t_", 1)[1] for n in opened] == ["baseline", "encode_1", "encode_2", "retrieval"]
+        assert closed == [1, 2, 3, 4]  # each file closed before the next opens
+        assert [r.h5_path.name.rsplit("_t_", 1)[1] for r in result.phases] == [
+            "baseline.raw.h5",
+            "encode_1.raw.h5",
+            "encode_2.raw.h5",
+            "retrieval.raw.h5",
+        ]
+    finally:
+        # Modules imported under the fake maxlab must not outlive this test.
+        for name in set(sys.modules) - before:
+            sys.modules.pop(name, None)

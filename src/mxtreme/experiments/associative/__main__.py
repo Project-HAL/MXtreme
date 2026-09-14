@@ -104,7 +104,9 @@ def main(argv=None) -> None:
     )
     r.add_argument(
         "--phase",
-        help="record one phase of a conditioning session: baseline, encode_1..encode_N, retrieval",
+        help="which recordings to make: 'session' (baseline, every encode cycle, retrieval, each its "
+        "own file, no one at the keyboard between), 'encode' (every cycle), one phase name, or a "
+        "comma-separated list; default one recording of the whole schedule",
     )
 
     t = sub.add_parser("report", help="read a recording back")
@@ -158,14 +160,12 @@ def main(argv=None) -> None:
 
         if args.mode:
             params.mode = args.mode
-        if args.phase:
-            params.phase = args.phase
         config = None
         if args.config:
             from mxtreme.config import Config
 
             config = Config.from_toml(args.config)
-        run(params, config, work=args.work)
+        run(params, config, phases=args.phase, work=args.work)
     elif args.command == "report":
         from mxtreme.experiments.associative.report import report
 
