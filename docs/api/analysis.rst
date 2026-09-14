@@ -9,6 +9,12 @@ Activity
 .. automodule:: mxtreme.analysis.activity
    :members:
 
+Network
+-------
+
+.. automodule:: mxtreme.analysis.network
+   :members:
+
 Spatial
 -------
 

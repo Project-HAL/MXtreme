@@ -4,7 +4,7 @@ Each topic module exposes a culture-level function (operates on one ``CulturePat
 per-DIV CSV under ``config.analysis_dir``) and, where meaningful, a population-level function that
 reads those CSVs back:
 
-    from mxtreme.analysis import activity, spatial, stimulation, performance
+    from mxtreme.analysis import activity, network, spatial, stimulation, performance
 
 The high-level entry point assembles a multi-section PDF report for a single culture or a group:
 
@@ -14,11 +14,12 @@ Importing this package pulls in matplotlib (every submodule plots), so only impo
 to run analyses/plots -- not on the fast ``import mxtreme`` path.
 """
 
-from mxtreme.analysis import activity, performance, spatial, stimulation
+from mxtreme.analysis import activity, network, performance, spatial, stimulation
 from mxtreme.analysis.report import DEFAULT_SECTIONS, generate_report
 
 __all__ = [
     "activity",
+    "network",
     "performance",
     "spatial",
     "stimulation",
