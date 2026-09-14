@@ -4,6 +4,7 @@ select    choose the regions from a scan and a baseline; writes a parameter file
 preview   draw what a parameter file will do
 run       do it, on the rig
 report    read a recording back against what was meant to happen
+compare   calibration runs side by side: which stimulation pattern to condition through
 """
 
 from __future__ import annotations
@@ -35,32 +36,48 @@ def main(argv=None) -> None:
         help="override one parameter, repeatable; e.g. --set dt_cs_us=20",
     )
     p.add_argument("--config-file", dest="cfg", help="a .cfg to draw routed electrodes from")
+    p.add_argument(
+        "--config",
+        metavar="TOML",
+        help="mxtreme.toml: also print exactly where a run with these parameters would write",
+    )
     p.add_argument("-o", "--out", help="png; otherwise a window")
 
-    s = sub.add_parser("select", help="choose the regions")
+    s = sub.add_parser("select", help="choose the regions, offline, from a baseline recording")
     s.add_argument("--params", default=os.path.join(HERE, "params_default.json"))
-    s.add_argument("--out", required=True, help="directory for the parameter file, record and figure")
-    g = s.add_mutually_exclusive_group()
-    g.add_argument(
-        "--activity-scan", metavar="H5", help="a scan: where the culture fires, for the candidates"
+    s.add_argument(
+        "--out",
+        required=True,
+        help="where to write the parameter file and figures; outside the managed store",
     )
-    g.add_argument("--scan-npz", metavar="NPZ", help="a preprocessed recording of one well instead of a scan")
-    g.add_argument("--scan-with", metavar="TOML", help="run an activity scan now, into this store")
-    g.add_argument("--centers", metavar="'x,y;x,y;...'", help="skip the scan: candidate centres in um")
+    s.add_argument(
+        "--set",
+        dest="overrides",
+        action="append",
+        metavar="KEY=VALUE",
+        help="override one parameter before choosing, repeatable; set the culture's batch, chip, "
+        "plate_date, div and well here, so the parameter file carries them",
+    )
+    s.add_argument(
+        "--baseline",
+        metavar="H5_OR_NPZ",
+        help="the network scan of the culture's active set: candidates, coupling and routing",
+    )
+    s.add_argument(
+        "--activity-scan",
+        metavar="H5",
+        help="optional: add the scan's active electrodes inside the chosen regions to the routing",
+    )
+    s.add_argument(
+        "--centers",
+        metavar="'x,y;x,y;...'",
+        help="place the regions by hand, in um, instead of choosing them from the baseline",
+    )
     s.add_argument(
         "--electrodes",
         metavar="CFG_OR_H5_OR_NPZ",
-        help="with --centers: reuse this file's electrode set for the routing, instead of inventing one",
+        help="with --centers and no baseline: take the routing from this file",
     )
-    b = s.add_mutually_exclusive_group()
-    b.add_argument(
-        "--baseline",
-        metavar="H5_OR_NPZ",
-        help="one continuous unstimulated recording with the candidates routed, for the "
-        "coupling; a multi-round scan is refused",
-    )
-    b.add_argument("--record-baseline", metavar="TOML", help="record one now, into this store")
-    s.add_argument("--baseline-sec", type=int, default=300)
     s.add_argument("--candidates", type=int, default=4)
     s.add_argument("--separation", type=float, help="override min_region_separation_um")
     s.add_argument("--min-active", type=int, help="absolute active-electrode floor per patch")
@@ -68,6 +85,11 @@ def main(argv=None) -> None:
     r = sub.add_parser("run", help="run on the rig")
     r.add_argument("--params", required=True, help="the file select wrote, amplitudes filled in")
     r.add_argument("--config", help="mxtreme.toml naming the store; not needed when params has save_path")
+    r.add_argument(
+        "--work",
+        metavar="DIR",
+        help="outside the store: a copy of the protocol and the fire-time table go here",
+    )
     r.add_argument(
         "--set",
         dest="overrides",
@@ -80,12 +102,26 @@ def main(argv=None) -> None:
         choices=["conditioning", "calibration", "connectivity"],
         help="override the file's mode; calibration and connectivity are the two short gates",
     )
+    r.add_argument(
+        "--phase",
+        help="record one phase of a conditioning session: baseline, encode_1..encode_N, retrieval",
+    )
 
     t = sub.add_parser("report", help="read a recording back")
-    t.add_argument("h5")
-    t.add_argument("--protocol", required=True, help="the _protocol.json run wrote")
-    t.add_argument("-o", "--out", help="png")
-    t.add_argument("--csv", help="write every per-presentation count here, for checking by hand")
+    t.add_argument("h5", nargs="+", help="one recording, or every recording of a split session")
+    t.add_argument("--protocol", help="a _protocol.json, for one recording; by default read from inside it")
+    t.add_argument("-o", "--out", help="draw the figure here; nothing is drawn without it")
+    t.add_argument(
+        "--csv",
+        help="per-presentation counts, for checking by hand; default <recording>_readout.csv beside it",
+    )
+
+    c = sub.add_parser(
+        "compare",
+        help="set calibration runs of the same regions side by side, one per stimulation pattern",
+    )
+    c.add_argument("h5", nargs="+", help="two or more calibration recordings")
+    c.add_argument("-o", "--out", help="draw local and remote response against amplitude here")
 
     args = parser.parse_args(argv)
     params = AssociativeParams.from_json(args.params) if hasattr(args, "params") else None
@@ -95,6 +131,13 @@ def main(argv=None) -> None:
     if args.command == "preview":
         from mxtreme.experiments.associative.preview import preview
 
+        if args.config or params.save_path:
+            from mxtreme.experiments.associative.preview import destination
+
+            print("a run with these parameters would write:")
+            for key, value in destination(params, args.config).items():
+                print(f"  {key:<12} {value}")
+            print()
         preview(params, args.out, args.cfg, show=args.out is None)
     elif args.command == "select":
         from mxtreme.experiments.associative.select import select
@@ -102,14 +145,10 @@ def main(argv=None) -> None:
         select(
             params,
             args.out,
+            baseline=args.baseline,
             activity_scan=args.activity_scan,
-            scan_npz=args.scan_npz,
-            scan_with=args.scan_with,
             centers=args.centers,
             electrodes=args.electrodes,
-            baseline=args.baseline,
-            record_baseline=args.record_baseline,
-            baseline_sec=args.baseline_sec,
             candidates=args.candidates,
             separation=args.separation,
             min_active=args.min_active,
@@ -119,16 +158,22 @@ def main(argv=None) -> None:
 
         if args.mode:
             params.mode = args.mode
+        if args.phase:
+            params.phase = args.phase
         config = None
         if args.config:
             from mxtreme.config import Config
 
             config = Config.from_toml(args.config)
-        run(params, config)
+        run(params, config, work=args.work)
     elif args.command == "report":
         from mxtreme.experiments.associative.report import report
 
         report(args.h5, args.protocol, args.out, out_csv=args.csv)
+    elif args.command == "compare":
+        from mxtreme.experiments.associative.report import compare
+
+        compare(args.h5, args.out)
 
 
 if __name__ == "__main__":

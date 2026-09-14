@@ -1,25 +1,34 @@
-"""Choosing where the three regions go: from a scan to a parameter file with ``regions`` and
-``rec_electrodes`` filled in, and a picture of every decision on the way.
+"""Choosing where the three regions go, offline, from a baseline recording.
 
-The steps, each of which can take its input from a file so the whole thing can be re-run or tried
-offline:
+``select`` touches no hardware and writes nothing into the managed store. It reads recordings the
+scans already made and writes a parameter file, and a picture of every decision, into a directory
+you name. The parameter file is what every later run points at.
 
-1. an activity scan (``activity_scan``), or any unstimulated preprocessed recording of the well
-   (``scan_npz``), or ``scan_with`` to run a scan now, or ``centers`` to name candidates by hand.
-   A scan is the right input here and only here: it says where the culture is firing, which is a
-   per-electrode question its separate rounds can each answer;
-2. candidate patches: the densest ``candidates`` patches at least ``min_region_separation_um``
-   apart (:func:`mxtreme.scans.region_selection.rank_patches`);
-3. a baseline: ``baseline`` (a recording with the candidates routed and no stimulation) or
-   ``record_baseline`` to record one now, at most five minutes. This must be **one continuous
-   recording**, not a scan: coupling is a question about two patches at the same moment, and a
-   scan's rounds never observed two different electrode subsets together. Passing a multi-round
-   file is refused rather than silently answered from its first round;
-4. coupling and roles: correlation outside network bursts and burst-order consistency, the
-   least-coupled near-equilateral triple whose two conditioned sites are matched in coupling to
-   the readout, US at the vertex equidistant from the other two, and CS versus NS decided by
-   the seed's parity so it alternates across cultures rather than following the data
-   (:func:`mxtreme.scans.region_selection.assign_roles`).
+The input is the culture's **baseline**: one continuous recording of its active set, which is
+exactly what a network scan is (``braintrix-cli``'s *Network scan*, or
+:func:`mxtreme.scans.network_scan.run_network_scan`). From it:
+
+1. candidate patches: the densest ``candidates`` patches at least ``min_region_separation_um``
+   apart (:func:`mxtreme.scans.region_selection.rank_patches`), counting the baseline's active
+   electrodes;
+2. coupling between the candidates: correlation with network bursts left out, and how
+   consistently one enters the bursts before another;
+3. roles: the least-coupled, near-equilateral triple whose two conditioned sites are matched in
+   coupling to the readout, US at the vertex equidistant from the other two, and CS versus NS
+   decided by the seed's parity so it alternates across cultures
+   (:func:`mxtreme.scans.region_selection.assign_roles`);
+4. the stimulation sites: each driven block is moved by up to 70 um so that its electrodes sit on
+   electrodes the activity scan (or, failing that, the baseline) recorded spikes from
+   (:func:`place_site`). A region is dense, but the four driven electrodes are particular
+   electrodes, and one over glass stimulates nothing;
+5. the experiment's routing: every electrode the baseline recorded, with the three chosen regions
+   first. Standard electrode selection keeps electrodes at least 100 um apart, which leaves only a
+   handful inside a region; given the **activity scan** as well, every electrode it found active
+   inside a chosen region is added, so the readout is counted on as many electrodes as the culture
+   offers there.
+
+``centers`` places the three regions by hand instead, which is what a saline dry run does: a
+silent baseline has nothing to rank or correlate, so it only supplies the routing.
 """
 
 from __future__ import annotations
@@ -33,7 +42,20 @@ import numpy as np
 from mxtreme.experiments.associative import display, protocol
 from mxtreme.experiments.associative.params import ROLES, AssociativeParams
 
-BASELINE_SEC_MAX = 300
+
+def _stem(params: AssociativeParams) -> str:
+    """The file-name stem select writes under: the store's own
+    ``plating_<date>_<batch>_chip_<chip>_well_<w>_DIV_<d>`` plus the experiment id, so the
+    parameter file and figures sort and read alongside the recordings they belong to. Falls back
+    to a short name when there is no batch to build the stem from."""
+    if not params.batch:
+        return f"{params.exp_id}_{params.chip or 'chip'}_well{params.well}"
+    from mxtreme import store
+
+    return (
+        store.recording_stem(params.batch, params.plate_date, params.chip, params.well, params.div)
+        + f"_{params.exp_id}"
+    )
 
 
 def parse_centers(text: str) -> list[tuple[float, float]]:
@@ -57,46 +79,17 @@ def _load_scan(path, well):
     return region_selection.active_electrodes(data[well])
 
 
-def _run_scan(params: AssociativeParams, toml_path: str):
-    from mxtreme.config import Config
-    from mxtreme.scans import activity_scan
-
-    scan = activity_scan.ActivityScanParams(
-        batch=params.batch,
-        chip=params.chip,
-        plate_date=params.plate_date,
-        div=params.div,
-        wells=[params.well],
-        description="activity scan for associative region selection",
-    )
-    result = activity_scan.run_activity_scan(scan, Config.from_toml(toml_path))
-    activity_scan.ensure_record_time(result.h5_path)
-    return str(result.h5_path)
-
-
-def _record_baseline(params: AssociativeParams, electrodes, seconds, toml_path: str):
-    from mxtreme.config import Config
-    from mxtreme.scans import network_scan
-
-    scan = network_scan.NetworkScanParams(
-        recording_electrodes={params.well: electrodes},
-        batch=params.batch,
-        chip=params.chip,
-        plate_date=params.plate_date,
-        div=params.div,
-        rec_length_sec=int(seconds),
-        pad_to_max=False,
-        description="baseline for associative region selection: candidate patches, no stimulation",
-    )
-    return str(network_scan.run_network_scan(scan, Config.from_toml(toml_path)).h5_path)
-
-
 def electrodes_from(path: str, well: int = 0) -> list[int]:
     """The electrodes a previous run recorded, from whatever names them.
 
     Accepts a MaxLab ``.cfg``, a raw ``.raw.h5``, or an MXtreme-preprocessed ``.npz``. This is how
-    a run with no activity scan gets a sensible routing: reuse the electrode set some earlier test
-    or scan already used on this chip, rather than inventing one.
+    a run with no activity scan gets a sensible routing: reuse an electrode set some earlier test
+    or scan already used, rather than inventing one.
+
+    Only the electrode *numbers* are read. They are positions on the 220 x 120 array, laid out
+    the same on every MaxOne and MaxTwo, so a set taken from another chip names the same places on
+    this one; the chip the file came from is never consulted. What can differ between chips is
+    which electrodes route, and routing is solved afresh on the real chip when a run starts.
 
     :param path: The ``.cfg``, ``.h5`` or ``.npz``.
     :param well: Well number, for a multi-well ``.h5``.
@@ -130,61 +123,163 @@ def _lattice(used: set[int], budget: int) -> list[int]:
         step += 1
 
 
+def electrode_activity(well_data) -> dict[int, tuple[float, float]]:
+    """``{electrode: (rate_hz, amplitude_uv)}`` for every active electrode of a scan or baseline,
+    each rate over the electrode's own recorded time (see
+    :func:`mxtreme.scans.region_selection.active_electrodes`)."""
+    from mxtreme.scans import region_selection
+
+    active = well_data.get("active_electrodes")
+    if active is None or not len(active):
+        return {}
+    visits = region_selection.scan_visits(well_data)
+    seconds = float(well_data["rec_length_sec"])
+    lsb = float(well_data["lsb"])
+    out = {}
+    for electrode, group in active.groupby("electrode"):
+        rate = len(group) / (max(1, int(visits.get(electrode, 1))) * seconds)
+        amplitude = abs(float(np.percentile(group["amplitude"], 90)) * lsb * 1e6)
+        out[int(electrode)] = (float(rate), amplitude)
+    return out
+
+
+def place_site(centre_um, site: dict, activity: dict, max_shift_um: float = 70.0) -> dict:
+    """Move a stimulation site, by at most ``max_shift_um``, so its driven electrodes sit on
+    electrodes that have recorded spikes.
+
+    A region is chosen for how many active electrodes it holds, but the driven block is a few
+    electrodes at fixed spacing around the region's centre, and nothing so far asked whether those
+    particular electrodes have a neuron under them. A driven electrode with no recorded spikes may
+    be over glass, and a site of four such electrodes can deliver every pulse of the day to nothing.
+    Calibration would find that out, at the cost of a reselection; this asks first.
+
+    Every shift of up to ``max_shift_um`` along each axis is tried, in whole electrodes. The score
+    is how many driven electrodes are active, then the smallest shift, then the summed firing
+    rate: a site that already sits on activity does not move, and one that has to move goes no
+    further than it must, since the region it sits in was chosen where it is for a reason. The
+    recording region moves with the site, which is what keeps the ring centred on what is measured.
+
+    :param activity: From :func:`electrode_activity`; empty means nothing is known and the site
+        stays where it is.
+    :returns: ``{"center_um", "shift_um", "driven": {electrode: (rate, amplitude) or None},
+        "active", "of"}``.
+    """
+    steps = int(max_shift_um // protocol.PITCH_UM)
+    best = None
+    for dy in range(-steps, steps + 1):
+        for dx in range(-steps, steps + 1):
+            candidate = (centre_um[0] + dx * protocol.PITCH_UM, centre_um[1] + dy * protocol.PITCH_UM)
+            try:
+                drive, _ring = protocol.stim_site(candidate, site)
+            except ValueError:
+                continue
+            hits = {e: activity.get(e) for e in drive}
+            score = (
+                sum(1 for v in hits.values() if v),
+                -(dx * dx + dy * dy),
+                sum(v[0] for v in hits.values() if v),
+            )
+            if best is None or score > best[0]:
+                best = (score, candidate, hits, (dx, dy))
+    _score, centre, hits, (dx, dy) = best
+    return {
+        "center_um": (float(centre[0]), float(centre[1])),
+        "shift_um": float(((dx * protocol.PITCH_UM) ** 2 + (dy * protocol.PITCH_UM) ** 2) ** 0.5),
+        "driven": hits,
+        "active": sum(1 for v in hits.values() if v),
+        "of": len(hits),
+    }
+
+
+def _experiment_routing(pool, roles, radius, scan_data, budget):
+    """Recording electrodes for the experiment: the chosen regions' electrodes first -- the
+    baseline's, plus the activity scan's active ones when given -- then the rest of the baseline's
+    set, cut to the routing budget.
+
+    :returns: ``(electrodes, {role: electrodes inside it})``.
+    """
+    region_sets = {}
+    for role, centre in roles.items():
+        inside = set(protocol.within(pool, centre, radius))
+        if scan_data is not None:
+            active = scan_data["active_electrodes"]["electrode"].unique().tolist()
+            inside |= set(protocol.within(active, centre, radius))
+        region_sets[role] = sorted(inside)
+    first = [e for role in ROLES for e in region_sets[role]]
+    rest = [e for e in pool if e not in set(first)]
+    ordered = list(dict.fromkeys(first + rest))
+    return sorted(ordered[:budget]), region_sets
+
+
 def select(
     params: AssociativeParams,
     out_dir: str,
     *,
+    baseline=None,
     activity_scan=None,
-    scan_npz=None,
-    scan_with=None,
     centers=None,
     electrodes=None,
-    baseline=None,
-    record_baseline=None,
-    baseline_sec=BASELINE_SEC_MAX,
     candidates=4,
     separation=None,
     min_active=None,
     on_progress=print,
 ) -> tuple[AssociativeParams, str]:
-    """Choose the regions and write ``<out_dir>/params_<chip>_well<w>.json``.
+    """Choose the regions and write ``<out_dir>/<stem>_params.json``, where the stem is the store's
+    ``plating_..._DIV_<d>`` name plus ``exp_id``.
 
-    :returns: The parameters with ``regions``, ``rec_electrodes`` and (if overridden)
-        ``min_region_separation_um`` set, and the path they were written to.
+    :param out_dir: Where to write. Required, and meant to be outside the managed store: nothing
+        written here is experimental data, and all of it can be regenerated.
+    :param baseline: The culture's baseline recording (``.raw.h5`` or ``.npz``): candidates,
+        coupling and the routing come from it.
+    :param activity_scan: Optional ``.raw.h5`` activity scan: its active electrodes inside the
+        chosen regions are added to the routing.
+    :param centers: ``'x,y;x,y;...'`` in um: place the regions by hand instead of from the baseline.
+    :param electrodes: A ``.cfg``/``.h5``/``.npz`` to take the routing from when there is no
+        baseline.
+    :returns: The parameters with ``regions`` and ``rec_electrodes`` set, and the file path.
     """
     from mxtreme.scans import region_selection
 
+    if not out_dir:
+        raise ValueError("select needs an output directory, outside the managed store")
     os.makedirs(out_dir, exist_ok=True)
     radius = params.region_radius_um
     if separation is not None:
         params = replace(params, min_region_separation_um=float(separation))
     separation = params.min_region_separation_um
-    seconds = min(baseline_sec, BASELINE_SEC_MAX)
     well = params.well
 
-    # --- 1, 2: candidates ---
-    well_data, ranked, scan_path = None, [], None
+    # --- the baseline ---
+    base, silent = None, True
+    if baseline:
+        base = region_selection.load_recording(baseline, well)
+        spikes = base["spike_data"]
+        rate = len(spikes) / max(base["rec_length_sec"], 1e-9)
+        silent = rate < 1.0
+        on_progress(
+            f"baseline {os.path.basename(str(baseline))}: {base['mapping']['electrode'].nunique()} electrodes "
+            f"recorded, {base['active_electrodes']['electrode'].nunique()} active (>= 0.1 Hz, 90th-percentile "
+            f"amplitude >= 20 uV), {len(spikes)} spikes in {base['rec_length_sec']:.0f} s"
+            + ("; silent, so it supplies the routing only" if silent else "")
+        )
+
+    # --- 1: candidates ---
+    ranked = []
     if centers:
         centres = parse_centers(centers)
         if len(centres) < 3:
             raise ValueError("centers needs at least three")
     else:
-        if scan_npz:
-            well_data = region_selection.active_electrodes(region_selection.well_data_from_npz(scan_npz))
-            scan_path = scan_npz
-        else:
-            scan_path = activity_scan or (_run_scan(params, scan_with) if scan_with else None)
-            if scan_path is None:
-                raise ValueError("give an activity scan, a scan npz, a store to scan into, or centers")
-            well_data = _load_scan(scan_path, well)
-        active = well_data["active_electrodes"]["electrode"].nunique()
-        recorded = well_data["mapping"]["electrode"].nunique()
-        on_progress(
-            f"scan {os.path.basename(scan_path)}: {recorded} electrodes recorded, {active} active "
-            f"(>= 0.1 Hz and 90th-percentile amplitude >= 20 uV)"
-        )
+        if base is None:
+            raise ValueError(
+                "give a baseline recording to choose from, or centers to place the regions by hand"
+            )
+        if silent:
+            raise ValueError(
+                "the baseline is silent, so there is nothing to choose patches from; give centers"
+            )
         ranked = region_selection.rank_patches(
-            well_data, n=candidates, min_separation_um=separation, radius_um=radius, min_active=min_active
+            base, n=candidates, min_separation_um=separation, radius_um=radius, min_active=min_active
         )
         centres = [r["center_um"] for r in ranked if r["status"] == "chosen"]
         rule = (
@@ -204,76 +299,60 @@ def select(
                 )
                 shown += 1
         if len(centres) < 3:
-            png = os.path.join(out_dir, f"regions_{params.chip}_well{well}_rejected.png")
-            _draw_rejection(well_data, ranked, radius, png, separation)
+            png = os.path.join(out_dir, f"{_stem(params)}_regions_rejected.png")
+            _draw_rejection(base, ranked, radius, png, separation)
             raise ValueError(
                 f"only {len(centres)} patch(es) qualify at {separation:.0f} um separation; see {png}. "
                 f"Lower the separation or region_radius_um, or give centers."
             )
     on_progress("candidates (um): " + ", ".join(f"({x:.0f}, {y:.0f})" for x, y in centres))
 
-    # Recording electrodes: the patches, then a spread over the rest.
-    if well_data is not None:
-        sets = region_selection.recording_electrodes(well_data, centres, radius)
-        density = region_selection.patch_density(well_data, centres, radius)
+    # --- the pool the routing is drawn from ---
+    if base is not None:
+        pool = sorted(base["mapping"]["electrode"].astype(int).unique().tolist())
+    elif electrodes:
+        pool = electrodes_from(electrodes, well)
+        on_progress(f"routing from {os.path.basename(str(electrodes))}: {len(pool)} electrodes")
     else:
-        # No scan, so nothing says which electrodes are worth recording. Reuse the set some
-        # earlier run on this chip used when one is named, and only fall back to a synthetic
-        # lattice when nothing is.
-        if electrodes:
-            pool = electrodes_from(electrodes, well)
-            on_progress(f"routing from {os.path.basename(str(electrodes))}: {len(pool)} electrodes")
-        else:
-            pool = list(range(protocol.NUM_ELECTRODES))
-            on_progress(
-                "no scan and no electrode set given: routing every electrode near each "
-                "centre, then a synthetic lattice over the rest. Pass electrodes=<cfg|h5|npz> "
-                "to reuse a real routing instead."
-            )
-        sets = {f"patch_{k}": protocol.within(pool, c, radius) for k, c in enumerate(centres)}
-        used = {e for s in sets.values() for e in s}
-        budget = 1020 - 32 - len(used)
-        rest = [e for e in pool if e not in used]
-        sets["global"] = rest[:budget] if electrodes else _lattice(used, budget)
-        density = [len(sets[f"patch_{k}"]) for k in range(len(centres))]
-    patches = {f"patch_{k}": sets[f"patch_{k}"] for k in range(len(centres))}
-    rec_electrodes = sorted({e for s in sets.values() for e in s})
-    on_progress(
-        f"routing {len(rec_electrodes)} electrodes: " + ", ".join(f"{k} {len(v)}" for k, v in sets.items())
+        pool = None
+        on_progress(
+            "no baseline and no electrode set: routing every electrode near each centre, then a "
+            "synthetic lattice. Pass a baseline, or electrodes=<cfg|h5|npz>, to use a real routing."
+        )
+    patches = {
+        f"patch_{k}": protocol.within(pool if pool is not None else range(protocol.NUM_ELECTRODES), c, radius)
+        for k, c in enumerate(centres)
+    }
+    density = (
+        region_selection.patch_density(base, centres, radius)
+        if base is not None and not silent
+        else [len(v) for v in patches.values()]
     )
 
-    # --- 3, 4: baseline, coupling, roles ---
+    # --- 2: coupling ---
     names = list(patches)
     matrix = np.full((len(names), len(names)), np.nan)
     corr_raw = lag_ms = lead = None
-    bursts, used = [], 0
-    baseline_path = baseline
-    if record_baseline:
-        baseline_path = _record_baseline(params, rec_electrodes, seconds, record_baseline)
-    baseline_data = None
-    if baseline_path:
-        frames, elecs, fps = region_selection.baseline_spikes(baseline_path, well)
+    bursts, used, baseline_data = [], 0, None
+    if base is not None and not silent:
+        spikes = base["spike_data"]
+        frames = spikes["frameno"].to_numpy().astype(np.int64)
+        elecs = spikes["electrode"].to_numpy().astype(int)
+        fps = float(base["samp_rate"])
         baseline_data = (frames, elecs, fps)
-        # A patch whose electrodes were not recorded in the baseline has no coupling to measure,
-        # and everything downstream would quietly be nan. Say so instead.
         seen = {int(e) for e in np.unique(elecs)}
-        empty = {name: len(set(map(int, elecs_)) & seen) for name, elecs_ in patches.items()}
-        thin = {name: n for name, n in empty.items() if n < 3}
+        thin = {name: len(set(map(int, v)) & seen) for name, v in patches.items()}
+        thin = {name: n for name, n in thin.items() if n < 3}
         if thin:
             raise ValueError(
-                f"in {os.path.basename(baseline_path)}, patch(es) {thin} have fewer than three "
-                "electrodes carrying spikes. The baseline must be recorded with the candidate "
-                "patches routed; a recording of a different electrode set cannot judge them."
+                f"in {os.path.basename(str(baseline))}, patch(es) {thin} have fewer than three electrodes "
+                "carrying spikes, so their coupling cannot be measured. Move them, or widen region_radius_um."
             )
         bursts = region_selection.network_bursts(frames, fps)
         _, corr_raw = region_selection.region_correlations(frames, elecs, patches, fps)
         names, outside = region_selection.region_correlations(frames, elecs, patches, fps, exclude=bursts)
         _, lag_ms, lead, used = region_selection.burst_onset_lags(frames, elecs, patches, fps, bursts)
-        span = (frames.max() - frames.min()) / fps if len(frames) else 0.0
-        on_progress(
-            f"baseline {os.path.basename(baseline_path)}: {len(frames)} spikes at {fps:.0f} Hz, "
-            f"{len(bursts)} network bursts in {span:.0f} s, {used} with two or more patches taking part"
-        )
+        on_progress(f"{len(bursts)} network bursts, {used} with two or more patches taking part")
 
         def show(title, m, fmt="{:7.2f}"):
             on_progress(title)
@@ -289,22 +368,22 @@ def select(
         show("median lead of row over column at burst onset, ms:", lag_ms, "{:7.1f}")
         matrix = region_selection.coupling(outside, lead)
         show("coupling = max(|correlation outside bursts|, |2 * order - 1|):", matrix)
-        coupling_png = os.path.join(out_dir, f"coupling_{params.chip}_well{well}.png")
+        coupling_png = os.path.join(out_dir, f"{_stem(params)}_coupling.png")
         _draw_coupling(
             baseline_data, patches, centres, bursts, corr_raw, outside, lead, lag_ms, matrix, coupling_png
         )
         on_progress(f"coupling diagnostics: {coupling_png}")
     else:
-        on_progress("no baseline: roles from geometry and density alone")
+        on_progress("no coupling to measure: roles from geometry alone")
 
+    # --- 3: roles ---
     counterbalance = params.seed % 2
     roles = region_selection.assign_roles(centres, matrix, density, counterbalance=counterbalance)
     tri_ratio, sides = region_selection.triangle([roles[r] for r in ROLES])
     on_progress(
         "roles: among triples with shortest/longest side >= 0.6, the least coupled, then the one whose "
         "two conditioned sites are best matched in coupling to US; US at the vertex equidistant from "
-        f"the other two; which of those is CS is counterbalanced by seed (seed {params.seed} -> "
-        f"{counterbalance}):"
+        f"the other two; which of those is CS is counterbalanced by seed (seed {params.seed} -> {counterbalance}):"
     )
     for role, centre in roles.items():
         k = centres.index(centre)
@@ -315,41 +394,88 @@ def select(
         f"  triangle US-CS {sides[0]:.0f} um, CS-NS {sides[1]:.0f} um, US-NS {sides[2]:.0f} um "
         f"(shortest/longest {tri_ratio:.2f})"
     )
-
-    # Shared bursts are the one connectivity signal available before any stimulation: two patches
-    # that never take part in the same burst may simply not be connected, and decorrelation alone
-    # cannot tell that apart from independence. The stimulation check (mode "connectivity") is what
-    # settles it, so this is a pointer rather than a refusal.
     if baseline_data is not None and bursts:
-        _, onsets = region_selection.burst_onsets(
-            baseline_data[0], baseline_data[1], patches, baseline_data[2], bursts
-        )
+        _, onsets = region_selection.burst_onsets(*baseline_data[:2], patches, baseline_data[2], bursts)
         index = {c: k for k, c in enumerate(centres)}
         for a, b in (("US", "CS"), ("US", "NS"), ("CS", "NS")):
             i, j = index[roles[a]], index[roles[b]]
             shared = int(np.sum(~np.isnan(onsets[:, i]) & ~np.isnan(onsets[:, j])))
             if shared < max(5, 0.2 * len(bursts)):
                 on_progress(
-                    f"  note: {a} and {b} took part in the same network burst only {shared} of "
-                    f"{len(bursts)} times. They may not be well connected; run the connectivity "
-                    f"check (mode 'connectivity') before conditioning."
+                    f"  note: {a} and {b} took part in the same network burst only {shared} of {len(bursts)} "
+                    f"times. They may not be well connected; the connectivity check will say."
                 )
 
-    # --- 5: the parameter file, the record, the picture ---
+    # --- 4: the stimulation sites, on electrodes that have shown spikes ---
+    scan_data = _load_scan(activity_scan, well) if activity_scan else None
+    activity = electrode_activity(scan_data) if scan_data is not None else {}
+    if not activity and base is not None and not silent:
+        activity = electrode_activity(base)
+    placements = {}
+    if activity:
+        on_progress(
+            f"stimulation sites: each driven block moved by up to 70 um so its electrodes sit on ones "
+            f"the {'activity scan' if scan_data is not None else 'baseline'} recorded spikes from:"
+        )
+        for role in ROLES:
+            placed = place_site(roles[role], params.stim_site, activity)
+            placements[role] = placed
+            roles[role] = placed["center_um"]
+            cells = ", ".join(
+                f"e{e} {v[0]:.1f} Hz {v[1]:.0f} uV" if v else f"e{e} silent"
+                for e, v in placed["driven"].items()
+            )
+            on_progress(
+                f"  {role:<4} {placed['active']} of {placed['of']} driven electrodes active"
+                f" (moved {placed['shift_um']:.0f} um): {cells}"
+            )
+            if placed["active"] == 0:
+                on_progress(
+                    f"  WARNING: no driven electrode of {role} sits on an electrode with recorded spikes. "
+                    f"Its pulses may reach nothing; expect calibration to say so. Consider --centers."
+                )
+        # Moving the sites can only shorten the sides; the separation rule still has to hold.
+        protocol.regions_for(replace(params, regions={r: list(c) for r, c in roles.items()}), [])
+    else:
+        on_progress(
+            "stimulation sites: no per-electrode activity to place the driven blocks on (silent baseline, "
+            "no activity scan), so they sit at the region centres as given."
+        )
+
+    # --- 5: the experiment's routing ---
+    stim_units = protocol.site_footprint(params.stim_site)["units"] * len(ROLES)
+    budget = 1020 - stim_units
+    if pool is None:
+        every = list(range(protocol.NUM_ELECTRODES))
+        near = sorted({e for c in roles.values() for e in protocol.within(every, c, radius)})
+        pool = near + _lattice(set(near), budget - len(near))
+    rec_electrodes, region_sets = _experiment_routing(pool, roles, radius, scan_data, budget)
+    on_progress(
+        f"experiment routing: {len(rec_electrodes)} electrodes plus {stim_units} stimulation; in the regions "
+        + ", ".join(f"{r} {len(v)}" for r, v in region_sets.items())
+        + (
+            f" (the activity scan added {sum(len(v) for v in region_sets.values()) - sum(len(protocol.within(pool, roles[r], radius)) for r in ROLES)})"
+            if scan_data is not None
+            else ""
+        )
+    )
+
+    # --- the parameter file, the record, the picture ---
     chosen = replace(
         params,
         regions={r: [float(c[0]), float(c[1])] for r, c in roles.items()},
         rec_electrodes=rec_electrodes,
     )
-    params_path = os.path.join(out_dir, f"params_{params.chip}_well{well}.json")
+    params_path = os.path.join(out_dir, f"{_stem(params)}_params.json")
     chosen.to_json(params_path)
     record = {
         "well": well,
-        "scan": scan_path,
-        "baseline": baseline_path,
+        "baseline": str(baseline) if baseline else None,
+        "activity_scan": str(activity_scan) if activity_scan else None,
         "candidates_um": centres,
         "density": density,
         "patch_electrodes": patches,
+        "region_electrodes": region_sets,
         "coupling": {
             "names": names,
             "matrix": np.nan_to_num(matrix, nan=-9).tolist(),
@@ -360,14 +486,33 @@ def select(
             "bursts_used": used,
         },
         "roles": {r: list(c) for r, c in roles.items()},
+        "sites": {
+            r: {
+                "shift_um": p["shift_um"],
+                "active_driven": p["active"],
+                "driven": {str(e): (list(v) if v else None) for e, v in p["driven"].items()},
+            }
+            for r, p in placements.items()
+        },
         "triangle_um": sides,
         "triangle_ratio": tri_ratio,
         "params": params_path,
     }
-    with open(os.path.join(out_dir, f"regions_{params.chip}_well{well}.json"), "w") as f:
+    with open(os.path.join(out_dir, f"{_stem(params)}_regions.json"), "w") as f:
         json.dump(record, f, indent=2)
-    png = os.path.join(out_dir, f"regions_{params.chip}_well{well}.png")
-    _draw_decision(chosen, well_data, ranked, centres, names, matrix, lead, baseline_path, radius, png)
+    png = os.path.join(out_dir, f"{_stem(params)}_regions.png")
+    _draw_decision(
+        chosen,
+        base if not silent else None,
+        ranked,
+        centres,
+        names,
+        matrix,
+        lead,
+        baseline if not silent else None,
+        radius,
+        png,
+    )
     on_progress(f"wrote {params_path}\n      {png}")
     return chosen, params_path
 
@@ -657,7 +802,7 @@ def _draw_decision(params, well_data, ranked, centres, names, matrix, lead, base
         _draw_scan(ax_scan, well_data, ranked, radius, fig)
         _draw_ranking(ax_rank, ranked, radius)
     else:
-        ax_scan.text(0.5, 0.5, "no scan: centres given by hand", ha="center", transform=ax_scan.transAxes)
+        ax_scan.text(0.5, 0.5, "centres given by hand", ha="center", transform=ax_scan.transAxes)
         ax_rank.axis("off")
     routed = np.array([protocol.electrode_xy(e) for e in params.rec_electrodes])
     specs = {r: s.as_dict() for r, s in regions.items()}

@@ -14,6 +14,7 @@ and US together with US delayed by ``dt_cs_us``. Each kind of presentation is on
 named by token:
 
     probe_us, probe_cs, probe_ns        one region alone, ``t_probe`` long
+    checkpoint_cs, checkpoint_ns        one region alone mid-encode, ``encode_probe_sec`` long
     stim_cs_us, stim_ns, ...            training presentations, ``t_stim`` long
     stim_us_a100_ac, ...                  calibration: one region, one amplitude, one polarity
 
@@ -24,12 +25,20 @@ The run is a list of blocks. In conditioning mode:
     pre          ``pre_min`` of nothing
     baseline     every ``probe_roles`` alone, ``probe_reps`` times, ``probe_iti`` apart
     encode       ``encode_cycles`` cycles of: ``encode_pattern`` presentations ``encode_iti``
-                 apart, then ``encode_cycle_rest`` of nothing
+                 apart, then ``encode_cycle_rest`` of nothing, then a checkpoint of
+                 ``encode_probe_roles`` probed alone (none after the last cycle, which the
+                 retrieval blocks follow)
     decay        ``decay_min`` of nothing
     retrieval_1  ``retrieval_roles`` alone, ``probe_reps`` times
     rest_1       ``retrieval_interval_min`` of nothing
     ...          up to ``num_retrievals``
     post         ``post_min`` of nothing
+
+``phase`` cuts that into separate recordings, each read back before the next: ``baseline`` is
+pre and the baseline probes; ``encode_<k>`` is a minute of quiet then cycle k (its trains, rest
+and checkpoint); ``retrieval`` is decay, the retrievals and post. Every cycle is built whatever
+the phase, so the seeded shuffles agree and the phases together deliver exactly the ``all``
+schedule.
 
 The encode block is where the culture is meant to learn, and the in vitro literature says that
 takes tens of minutes of intermittent stimulation, not a few presentations: 0.2-0.33 Hz for 10 min
@@ -88,17 +97,30 @@ def nearest_electrode(x_um: float, y_um: float) -> int:
     return electrode_at(col, row)
 
 
+def _offsets(size: int, step: int) -> list[int]:
+    """Column (or row) offsets of a ``size``-wide line of electrodes ``step`` apart, as nearly
+    centred on 0 as whole electrodes allow.
+
+    An odd size centres exactly. An even size cannot put an electrode on its own centre, so its
+    centre falls half a step off; rounding every offset the same way (down) keeps the spacing
+    exact and the error to at most half an electrode, rather than laying the whole line out on one
+    side of 0.
+    """
+    import math
+
+    return [math.floor((i - (size - 1) / 2) * step) for i in range(size)]
+
+
 def stim_grid(center_um, size: int, gap: int) -> list[int]:
     """A size x size grid of electrodes around a point, ``gap`` empty electrodes between
-    neighbours, centred on the nearest electrode (an even size extends one step less to the right
-    and down than to the left and up).
+    neighbours, as nearly centred on the nearest electrode as whole electrodes allow (see
+    :func:`_offsets`).
 
     :raises ValueError: If any corner falls off the array.
     """
     centre = nearest_electrode(*center_um)
     col0, row0 = centre % COLS, centre // COLS
-    step = gap + 1
-    offsets = [(i - size // 2) * step for i in range(size)]
+    offsets = _offsets(size, gap + 1)
     grid = []
     for dy in offsets:
         for dx in offsets:
@@ -115,15 +137,22 @@ def stim_site(center_um, site: dict) -> tuple[list[int], list[int]]:
     ``grid`` (``{"shape": "grid", "size": 3, "gap": 2}``): a size x size grid, all driven with the
     same pulse; no return.
 
-    ``focal`` (``{"shape": "focal", "inner": 2, "inner_gap": 0, "return_radius": 3,
+    ``focal`` (``{"shape": "focal", "inner": 2, "inner_gap": 4, "return_radius": 6,
     "return_points": "corners"}``): an inner x inner block of driven electrodes (``inner_gap``
     empty electrodes between them), ringed by return electrodes that get the same pulse inverted.
     Seen from further away than the ring the charges cancel, so the field is confined to the site
-    (Ronchi et al. 2019). ``"corners"`` puts one return electrode at each corner of the square
-    ``return_radius`` electrodes out; ``"corners+edges"`` adds the four edge midpoints. Adjacent
-    electrodes can land on the same stimulation unit, which routing refuses; ``inner_gap`` 1 is the
-    first thing to try then.
+    (Ronchi et al. 2019).
+
+    The ring is laid out around the driven block itself, a whole number of electrodes beyond its
+    edge on every side, so it is symmetric about the block however the block falls on the grid.
+    ``return_radius`` is the ring's distance from the site's centre along each axis, in
+    electrodes, rounded outward to the nearest symmetric position. ``"corners"`` puts one return
+    electrode at each corner; ``"corners+edges"`` adds the four edge midpoints, which sit half an
+    electrode off centre when the block's span is odd. Adjacent electrodes can land on the same
+    stimulation unit, which routing refuses; widen ``inner_gap`` then.
     """
+    import math
+
     shape = site.get("shape", "grid")
     if shape == "grid":
         return stim_grid(center_um, int(site.get("size", 3)), int(site.get("gap", 2))), []
@@ -131,16 +160,25 @@ def stim_site(center_um, site: dict) -> tuple[list[int], list[int]]:
         raise ValueError(f"stim_site shape must be 'grid' or 'focal', not {shape!r}")
 
     inner = int(site.get("inner", 2))
-    inner_gap = int(site.get("inner_gap", 0))
-    radius = int(site.get("return_radius", 3))
-    if radius <= (inner // 2) * (inner_gap + 1):
-        raise ValueError("stim_site return_radius must reach outside the inner block")
-    drive = stim_grid(center_um, inner, inner_gap)
+    step = int(site.get("inner_gap", 0)) + 1
+    radius = float(site.get("return_radius", 3))
+    offsets = _offsets(inner, step)
+    half_span = (offsets[-1] - offsets[0]) / 2
+    if radius <= half_span:
+        raise ValueError(
+            f"stim_site return_radius {radius} does not reach outside the driven block, whose "
+            f"electrodes reach {half_span} from its centre"
+        )
+    margin = max(1, math.ceil(radius - half_span))
+
+    drive = stim_grid(center_um, inner, step - 1)
     centre = nearest_electrode(*center_um)
     col0, row0 = centre % COLS, centre // COLS
-    points = [(-radius, -radius), (radius, -radius), (-radius, radius), (radius, radius)]
+    lo, hi = offsets[0] - margin, offsets[-1] + margin
+    points = [(lo, lo), (hi, lo), (lo, hi), (hi, hi)]
     if site.get("return_points", "corners") == "corners+edges":
-        points += [(0, -radius), (0, radius), (-radius, 0), (radius, 0)]
+        mid = math.floor((offsets[0] + offsets[-1]) / 2)
+        points += [(mid, lo), (mid, hi), (lo, mid), (hi, mid)]
     ring = []
     for dx, dy in points:
         electrode = electrode_at(col0 + dx, row0 + dy)
@@ -156,14 +194,17 @@ STIM_UNITS = 32
 
 
 def site_footprint(site: dict) -> dict:
-    """How large a stimulation site is, and what it costs.
+    """How large a stimulation site is, what it costs, and whether it is balanced.
 
     The point of the numbers is to be compared with ``region_radius_um``, the radius over which
     the region's response is *measured*. A site much smaller than that stimulates a point and
     measures a disc, which is a mismatch if the three sites are meant to be regions rather than
-    single neurons.
+    single neurons. ``ring_offset_um`` is how far the ring's centre is from the driven block's,
+    which should be 0: an off-centre ring puts a return electrode beside one driven electrode and
+    far from the opposite one.
 
-    :returns: ``{"driven_span_um", "ring_radius_um", "driven", "return", "units"}``.
+    :returns: ``{"driven_span_um", "ring_radius_um", "ring_offset_um", "driven", "return",
+        "units"}``, with the ring radius measured from the driven block's centre to a corner.
     """
     drive, ring = stim_site((1750.0, 1000.0), site)
     xy = [electrode_xy(e) for e in drive]
@@ -171,10 +212,17 @@ def site_footprint(site: dict) -> dict:
         max(p[0] for p in xy) - min(p[0] for p in xy),
         max(p[1] for p in xy) - min(p[1] for p in xy),
     )
-    ring_um = separation_um(electrode_xy(ring[0]), (1750.0, 1000.0)) if ring else 0.0
+    block = (sum(p[0] for p in xy) / len(xy), sum(p[1] for p in xy) / len(xy))
+    ring_um = offset_um = 0.0
+    if ring:
+        corners = [electrode_xy(e) for e in ring[:4]]
+        ring_centre = (sum(p[0] for p in corners) / 4, sum(p[1] for p in corners) / 4)
+        ring_um = separation_um(corners[0], block)
+        offset_um = separation_um(ring_centre, block)
     return {
         "driven_span_um": span,
         "ring_radius_um": ring_um,
+        "ring_offset_um": offset_um,
         "driven": len(drive),
         "return": len(ring),
         "units": len(drive) + len(ring),
@@ -350,7 +398,8 @@ def stimulus_for(
 ) -> Stimulus:
     """One presentation to ``roles``.
 
-    ``kind`` picks the train length: ``"stim"`` is ``t_stim``, ``"probe"`` is ``t_probe``. The
+    ``kind`` picks the train length: ``"stim"`` is ``t_stim``, ``"probe"`` is ``t_probe``,
+    ``"checkpoint"`` is ``encode_probe_sec``. The
     pairing puts US ``dt_cs_us`` after CS; a negative ``dt_cs_us`` puts US first (a CS pulse
     inside a US burst, as in Chiappalone et al. 2008). ``polarity`` defaults to the parameters'
     and goes into the token only when ``tag_polarity`` is set.
@@ -361,7 +410,7 @@ def stimulus_for(
         if kind == "check":
             num_events = 1  # one pulse, so the response to it is unambiguous
         else:
-            length = params.t_probe if kind == "probe" else params.t_stim
+            length = {"probe": params.t_probe, "checkpoint": params.encode_probe_sec}.get(kind, params.t_stim)
             num_events = max(1, round(length * params.pulse_hz))
     delays = {role: 0.0 for role in roles}
     if list(roles) == ["CS", "US"]:
@@ -438,10 +487,17 @@ def build_schedule(params: AssociativeParams) -> tuple[list[Block], dict[str, St
         for item in dict.fromkeys(params.encode_pattern):
             stim = stimulus_for(params, roles_of(item), "stim")
             stimuli[stim.token] = stim
+        if params.encode_pattern and params.encode_cycles > 1:
+            for role in dict.fromkeys(params.encode_probe_roles):
+                check = stimulus_for(params, [role], "checkpoint")
+                stimuli[check.token] = check
 
         # A presentation must be over, and its windows closed, before the next one starts.
         probe_tail = (
-            max(max(s.duration_sec for s in stimuli.values() if s.token.startswith("probe")), reach)
+            max(
+                max(s.duration_sec for s in stimuli.values() if s.token.startswith(("probe", "checkpoint"))),
+                reach,
+            )
             + pulse_end
         )
         stim_tail = (
@@ -452,36 +508,59 @@ def build_schedule(params: AssociativeParams) -> tuple[list[Block], dict[str, St
             + pulse_end
         )
         if params.probe_iti < probe_tail:
+            longest = max(
+                (s for s in stimuli.values() if s.token.startswith(("probe", "checkpoint"))),
+                key=lambda s: s.duration_sec,
+            )
             raise ValueError(
-                f"probe_iti = {params.probe_iti}s is shorter than a probe plus its response windows ({probe_tail:.1f}s)"
+                f"probe_iti = {params.probe_iti}s is shorter than {longest.token} plus its response "
+                f"windows ({probe_tail:.1f}s)"
             )
         if params.encode_pattern and params.encode_iti < stim_tail:
             raise ValueError(
                 f"encode_iti = {params.encode_iti}s is shorter than a training presentation plus its response windows ({stim_tail:.1f}s)"
             )
 
-        blocks.append(
-            _probe_block(
-                "baseline", params.probe_roles, params.probe_reps, params.probe_iti, rng, stimuli, probe_tail
-            )
+        baseline = _probe_block(
+            "baseline", params.probe_roles, params.probe_reps, params.probe_iti, rng, stimuli, probe_tail
         )
 
+        # The encode block, cycle by cycle. Every cycle is built whatever the phase, so the seeded
+        # shuffles come out the same and a session split over several recordings delivers
+        # exactly what one recording would.
+        cycles: list[Block] = []
         if params.encode_pattern:
-            encode = Block("encode", 0.0)
-            t = 0.0
             for cycle in range(params.encode_cycles):
+                block = Block("encode", 0.0)
+                t = 0.0
                 for item in params.encode_pattern:
                     stim = stimuli[token_for(roles_of(item), "stim")]
-                    encode.presentations.append(Presentation(t, stim.token, stim.roles))
+                    block.presentations.append(Presentation(t, stim.token, stim.roles))
                     t += params.encode_iti
-                if cycle < params.encode_cycles - 1:
+                if cycle == params.encode_cycles - 1:
+                    # The last cycle has no checkpoint: decay and the first retrieval follow it.
+                    block.duration_sec = t - params.encode_iti + stim_tail
+                else:
                     t += params.encode_cycle_rest
-            encode.duration_sec = t - params.encode_iti + stim_tail
-            blocks.append(encode)
+                    # A checkpoint: each role alone, unpaired, after the cycle's rest. The
+                    # retrieval blocks say where the association ended up; these say how fast it
+                    # got there, which is the difference between a result and a curve. They sit
+                    # after the rest so the network is settled rather than still ringing from the
+                    # last train.
+                    for _ in range(params.encode_probe_reps):
+                        order = list(params.encode_probe_roles)
+                        rng.shuffle(order)
+                        for role in order:
+                            stim = stimuli[token_for(roles_of(role), "checkpoint")]
+                            block.presentations.append(Presentation(t, stim.token, stim.roles))
+                            t += params.probe_iti
+                    # Ends where the next cycle's first train would start.
+                    block.duration_sec = t
+                cycles.append(block)
 
-        blocks.append(Block("decay", params.decay_min * 60.0))
+        retrievals: list[Block] = [Block("decay", params.decay_min * 60.0)]
         for k in range(1, params.num_retrievals + 1):
-            blocks.append(
+            retrievals.append(
                 _probe_block(
                     f"retrieval_{k}",
                     params.retrieval_roles,
@@ -493,7 +572,30 @@ def build_schedule(params: AssociativeParams) -> tuple[list[Block], dict[str, St
                 )
             )
             if k < params.num_retrievals:
-                blocks.append(Block(f"rest_{k}", params.retrieval_interval_min * 60.0))
+                retrievals.append(Block(f"rest_{k}", params.retrieval_interval_min * 60.0))
+
+        if params.phase == "all":
+            blocks.append(baseline)
+            if cycles:
+                encode = Block("encode", 0.0)
+                offset = 0.0
+                for block in cycles:
+                    encode.presentations += [
+                        Presentation(offset + p.t_sec, p.token, p.roles) for p in block.presentations
+                    ]
+                    offset += block.duration_sec
+                encode.duration_sec = offset
+                blocks.append(encode)
+            blocks += retrievals
+        elif params.phase == "baseline":
+            blocks.append(baseline)
+            return blocks, _used(stimuli, blocks)
+        elif params.phase == "retrieval":
+            blocks = retrievals
+        else:
+            k = int(params.phase.removeprefix("encode_"))
+            blocks = [Block("lead", params.phase_lead_min * 60.0), cycles[k - 1]]
+            return blocks, _used(stimuli, blocks)
 
     elif params.mode == "connectivity":
         # One pulse per region at its chosen amplitude, many times, interleaved: how much does
@@ -540,7 +642,13 @@ def build_schedule(params: AssociativeParams) -> tuple[list[Block], dict[str, St
             blocks.append(block)
 
     blocks.append(Block("post", params.post_min * 60.0))
-    return blocks, stimuli
+    return blocks, (_used(stimuli, blocks) if params.phase != "all" else stimuli)
+
+
+def _used(stimuli: dict[str, Stimulus], blocks: list[Block]) -> dict[str, Stimulus]:
+    """Only the stimuli these blocks fire, so a phase builds no sequence it will not use."""
+    tokens = {p.token for b in blocks for p in b.presentations}
+    return {t: s for t, s in stimuli.items() if t in tokens}
 
 
 def block_starts_sec(blocks: list[Block]) -> list[float]:
@@ -581,9 +689,19 @@ def summary(blocks: list[Block], stimuli: dict[str, Stimulus], phase_us: float |
     """The run in numbers: each block, and how much of the encode block is stimulation."""
     lines = [f"{total_minutes(blocks):.1f} min in total"]
     for block, start in zip(blocks, block_starts_sec(blocks)):
-        lines.append(
-            f"  {start / 60:7.1f} min  {block.label:<14} {block.duration_sec / 60:6.1f} min  {len(block.presentations)} presentation(s)"
+        # Pulses, not presentations: one training presentation is a ten-minute train of hundreds
+        # of pulses, one probe a minute of twenty, and counting presentations makes the block that
+        # stimulates most look like the one that stimulates least.
+        pulses = sum(
+            stimuli[p.token].num_events * stimuli[p.token].pulses_per_burst for p in block.presentations
         )
+        on = sum(stimuli[p.token].duration_sec for p in block.presentations)
+        detail = (
+            f"  {len(block.presentations)} presentation(s), {pulses} pulses, stimulating {on / 60:.1f} min"
+            if block.presentations
+            else "  quiet"
+        )
+        lines.append(f"  {start / 60:7.1f} min  {block.label:<14} {block.duration_sec / 60:6.1f} min{detail}")
     for block in blocks:
         if block.label != "encode" or not block.presentations:
             continue

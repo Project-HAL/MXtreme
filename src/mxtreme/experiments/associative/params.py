@@ -18,6 +18,7 @@ from mxtreme import store
 ROLES = ("US", "CS", "NS")
 PAIR = "PAIR"
 MODES = ("conditioning", "calibration", "connectivity")
+RAW_TRACES = ("none", "regions", "all")
 
 
 @dataclass
@@ -32,6 +33,12 @@ class AssociativeParams:
     :param div: Days *in vitro* on the day of the run.
     :param well: The well. One culture per run.
     :param exp_id: Names the recording's file tail and registry row, e.g. ``"assoc"``.
+    :param phase: Which part of a conditioning run this recording is: ``"all"`` in one recording,
+        or ``"baseline"``, ``"encode_1"`` ... ``"encode_<encode_cycles>"``, ``"retrieval"`` as
+        separate recordings, each read back and judged before the next starts. The phases together
+        deliver exactly the ``"all"`` schedule; a phase's name is appended to the file name.
+    :param phase_lead_min: Minutes of quiet at the start of an encode phase's recording, so the
+        network has settled and the first train has a window before it.
     :param description: Free text written into the file.
     :param save_path: Where to record. ``None`` means the managed store, via the ``Config`` given
         to :meth:`resolved`.
@@ -43,6 +50,9 @@ class AssociativeParams:
     :param amplitudes_mv: Per role, **mV per phase**, from a calibration run. Peak to peak is
         twice this, which is the number stimulation papers usually quote: 80 here is 160 mV
         peak to peak.
+    :param amplitudes_source: Where ``amplitudes_mv`` came from -- the calibration recording's
+        name, as its report prints it. ``"default"`` means nobody calibrated, and a connectivity or
+        conditioning run refuses to start on it.
     :param min_region_separation_um: :mod:`.select` refuses closer centres.
     :param region_radius_um: Recording electrodes within this of a centre belong to the region.
     :param stim_site: ``{"shape": "grid", "size", "gap"}`` or ``{"shape": "focal", "inner",
@@ -75,6 +85,16 @@ class AssociativeParams:
     :param encode_iti: Seconds between training presentations; must cover ``t_stim``.
     :param encode_cycles: Times the pattern runs.
     :param encode_cycle_rest: Seconds of nothing after each cycle.
+    :param encode_probe_roles: Roles probed alone after each cycle's rest, to watch the association
+        form rather than only see where it ended up. Empty for no checkpoints. Every probe is also
+        a little extinction, so this is deliberately fewer roles and fewer repeats than a probe
+        block.
+    :param encode_probe_reps: Checkpoint probes of each role.
+    :param encode_probe_sec: Length of a checkpoint probe, against ``t_probe`` for a probe block's.
+        Shorter on purpose: a checkpoint is an unpaired CS presentation in the middle of
+        acquisition, which is what extinction is, so it buys its measurement with as few pulses as
+        it can. The report counts per pulse, so a short checkpoint is still comparable with a full
+        probe block.
     :param decay_min: Minutes of nothing after encoding.
     :param num_retrievals: Retrieval probe blocks.
     :param retrieval_roles: Roles probed in each.
@@ -96,6 +116,12 @@ class AssociativeParams:
         stimulus reaches this fraction of that region's own local response.
     :param burst_warn: Connectivity mode: warn when this fraction of pulses is followed by a
         network burst, which means the stimulus is driving the whole culture rather than a site.
+    :param raw_traces: Which channels' raw voltage traces the recording keeps. ``"none"`` keeps
+        spikes only, which is all the readout uses and costs roughly a megabyte a minute;
+        ``"regions"`` adds the traces of the three regions' recording and stimulation electrodes,
+        enough to see the stimulation artifact; ``"all"`` keeps every channel, around 4 kB per
+        channel-second compressed on a MaxTwo and twice that on a MaxOne -- tens of gigabytes
+        for a four-hour run. Spikes are always kept, for every routed channel.
     :param pulse_window_ms: Counted after every pulse for the readout: ``[start, end]``.
     :param response_windows_ms: Optional ``{label: [start, end]}`` around a presentation; by
         default base/during/after sized by ``t_probe``.
@@ -107,12 +133,15 @@ class AssociativeParams:
     div: int = 0
     well: int = 0
     exp_id: str = "assoc"
+    phase: str = "all"
+    phase_lead_min: float = 1.0
     description: str = "associative conditioning: US+CS paired and NS alone; every region probed alone before, after, and after rests"
     save_path: str | None = None
 
     rec_electrodes: list[int] | None = None
     regions: dict[str, list[float]] = field(default_factory=dict)
     amplitudes_mv: dict[str, float] = field(default_factory=lambda: {r: 80.0 for r in ROLES})
+    amplitudes_source: str = "default"
     min_region_separation_um: float = 1000.0
     region_radius_um: float = 150.0
     stim_site: dict = field(
@@ -146,6 +175,9 @@ class AssociativeParams:
     encode_iti: float = 660.0
     encode_cycles: int = 3
     encode_cycle_rest: float = 300.0
+    encode_probe_roles: list[str] = field(default_factory=lambda: ["CS", "NS"])
+    encode_probe_reps: int = 1
+    encode_probe_sec: float = 30.0
     decay_min: float = 10.0
     num_retrievals: int = 3
     retrieval_roles: list[str] = field(default_factory=lambda: list(ROLES))
@@ -161,6 +193,7 @@ class AssociativeParams:
     check_iti: float = 5.0
     crosstalk_warn: float = 0.3
     burst_warn: float = 0.2
+    raw_traces: str = "none"
     pulse_window_ms: list[float] = field(default_factory=lambda: [5.0, 50.0])
     response_windows_ms: dict[str, list[float]] | None = None
 
@@ -227,13 +260,19 @@ class AssociativeParams:
         return store.Batch.parse(self.batch).id if self.batch else ""
 
     @property
+    def run_id(self) -> str:
+        """``exp_id``, plus the phase when the run is one phase of a conditioning session."""
+        return self.exp_id if self.phase == "all" else f"{self.exp_id}_{self.phase}"
+
+    @property
     def file_name(self) -> str:
-        """``plating_<date>_<batch>_chip_<chip>_well_<w>_DIV_<div>_<exp_id>``, the store's stem."""
+        """``plating_<date>_<batch>_chip_<chip>_well_<w>_DIV_<div>_<exp_id>[_<phase>]``, the
+        store's stem."""
         if not self.batch:
             raise ValueError("batch is unset, so the recording cannot be named")
         return (
             store.recording_stem(self.batch, self.plate_date, self.chip, self.well, self.div)
-            + f"_{self.exp_id}"
+            + f"_{self.run_id}"
         )
 
     @property
@@ -255,7 +294,7 @@ class AssociativeParams:
 
     def as_metadata(self) -> dict:
         return {
-            "Exp ID": self.exp_id,
+            "Exp ID": self.run_id,
             "Batch ID": self.batch_id,
             "Chip ID": self.chip,
             "Plate date": self.plate_date,
@@ -270,6 +309,8 @@ class AssociativeParams:
         """Refuse what cannot work. With ``for_run``, also require what the rig needs."""
         if self.mode not in MODES:
             raise ValueError(f"mode must be one of {MODES}, not {self.mode!r}")
+        if self.raw_traces not in RAW_TRACES:
+            raise ValueError(f"raw_traces must be one of {RAW_TRACES}, not {self.raw_traces!r}")
         if self.pulse_polarity not in ("anodic-first", "cathodic-first"):
             raise ValueError(
                 f"pulse_polarity must be anodic-first or cathodic-first, not {self.pulse_polarity!r}"
@@ -277,7 +318,11 @@ class AssociativeParams:
         for item in self.encode_pattern:
             if item.upper() not in ROLES + (PAIR,):
                 raise ValueError(f"encode_pattern has {item!r}; use US, CS, NS or PAIR")
-        for name, roles in (("probe_roles", self.probe_roles), ("retrieval_roles", self.retrieval_roles)):
+        for name, roles in (
+            ("probe_roles", self.probe_roles),
+            ("retrieval_roles", self.retrieval_roles),
+            ("encode_probe_roles", self.encode_probe_roles),
+        ):
             for role in roles:
                 if role not in ROLES:
                     raise ValueError(f"{name} has {role!r}")
@@ -299,6 +344,16 @@ class AssociativeParams:
             )
         if self.t_probe <= 0 or self.t_stim <= 0 or self.pulse_hz <= 0:
             raise ValueError("t_probe, t_stim and pulse_hz must be positive")
+        if self.phase != "all":
+            if self.mode != "conditioning":
+                raise ValueError(f"phase {self.phase!r} only applies to conditioning, not {self.mode}")
+            cycle = self.phase.removeprefix("encode_")
+            in_range = cycle.isdigit() and 1 <= int(cycle) <= self.encode_cycles
+            if self.phase not in ("baseline", "retrieval") and not in_range:
+                raise ValueError(
+                    f"phase must be all, baseline, encode_1..encode_{self.encode_cycles} or retrieval, "
+                    f"not {self.phase!r}"
+                )
         # Amplitude is the one parameter that can damage hardware, so it is checked wherever a
         # parameter file is read rather than only before a run.
         asked = list(self.amplitudes_mv.values()) + list(self.calibration_amplitudes_mv)
@@ -319,3 +374,10 @@ class AssociativeParams:
                 raise ValueError(f"regions has no centre for {missing}: run `select` first")
             if set(self.amplitudes_mv) != set(ROLES):
                 raise ValueError("amplitudes_mv needs US, CS and NS")
+            if self.mode != "calibration" and self.amplitudes_source == "default":
+                raise ValueError(
+                    "amplitudes_mv are uncalibrated (amplitudes_source is 'default'). Run calibration, "
+                    "copy the amplitudes_mv line its report prints into the parameter file, and set "
+                    "amplitudes_source to the calibration recording's name -- or, for a saline dry "
+                    "run, --set amplitudes_source=saline"
+                )

@@ -18,10 +18,20 @@ Two short runs gate the long one, and both report back before a culture is commi
 much stimulating each region alone drives the other two. Sites that turn out not to be
 independent, or not connected at all, are worth knowing about before four hours of conditioning.
 
-    python -m mxtreme.experiments.associative preview  --params params.json
-    python -m mxtreme.experiments.associative select   --params params.json --scan-npz ... --out ...
-    python -m mxtreme.experiments.associative run      --params <the file select wrote> --mode calibration
-    python -m mxtreme.experiments.associative run      --params <same, amplitudes filled in> --mode connectivity
-    python -m mxtreme.experiments.associative run      --params <same> --config mxtreme.toml
-    python -m mxtreme.experiments.associative report   <recording>.raw.h5 --protocol <run dir>/..._protocol.json
+    # after braintrix-cli's activity scan and network scan (the baseline) of the culture:
+    python -m mxtreme.experiments.associative select   --params params_default.json --out <work dir> \
+        --baseline <..._network_scan.raw.h5> --activity-scan <..._activity_scan.raw.h5> --set batch=... ...
+    python -m mxtreme.experiments.associative preview  --params <the file select wrote> --config mxtreme.toml
+    python -m mxtreme.experiments.associative run      --params <same> --config mxtreme.toml --mode calibration
+    python -m mxtreme.experiments.associative compare  <calibration>.raw.h5 <calibration, other pattern>.raw.h5
+    python -m mxtreme.experiments.associative run      --params <same, amplitudes filled in> --config mxtreme.toml --mode connectivity
+    python -m mxtreme.experiments.associative run      --params <same> --config mxtreme.toml --phase baseline
+    python -m mxtreme.experiments.associative run      --params <same> --config mxtreme.toml --phase encode_1  # ... encode_4
+    python -m mxtreme.experiments.associative run      --params <same> --config mxtreme.toml --phase retrieval
+    python -m mxtreme.experiments.associative report   <every recording of the session>.raw.h5 -o <work dir>/session.png
+
+The store gets the recordings and nothing else; each carries its own protocol, so ``report`` needs
+only the files. A conditioning session is one recording per phase -- baseline, each encode cycle,
+retrieval -- each read back before the next starts, and read together as one at the end. ``select``'s parameter file and figures, and every report, go in a work directory
+outside it. docs/concepts/associative-experiment-day.md is the full procedure.
 """

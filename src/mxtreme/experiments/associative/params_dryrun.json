@@ -18,9 +18,11 @@
     "CS": 80.0,
     "NS": 80.0
   },
+  "_amplitudes_source": "Saline: nothing to calibrate, so the default amplitudes stand and this says so. On a culture, the calibration report prints the value to put here.",
+  "amplitudes_source": "saline",
   "min_region_separation_um": 1000.0,
   "region_radius_um": 150.0,
-  "_stim_site": "focal: an inner x inner driven block on drive_dac, with a ring return_radius electrodes out on return_dac carrying the inverted pulse, which confines the field (Ronchi et al. 2019). The default spans 87.5 um of driven electrodes with the ring at 150 um, i.e. the stimulation site fills the region whose response is measured (region_radius_um). Widen it with inner_gap, not inner: the chip has 32 stimulation units and three regions share them, so a focal site costs inner^2 + 4 and a 3x3 focal site (39 units) will not route. return_radius must reach outside the driven block. grid: {shape, size, gap}, one DAC per role from region_dacs, no return ring, so 3x3 fits (27 units) if you would rather have nine driven points than spatial charge balance.",
+  "_stim_site": "focal: an inner x inner driven block on drive_dac, ringed by return electrodes on return_dac carrying the inverted pulse, which confines the field (Ronchi et al. 2019). The ring is laid out around the block itself, so it is centred on it whatever the spacing. The default drives four electrodes spanning 87.5 um with the ring 161 um from their centre, just outside region_radius_um, so a region's count is the driven block's response. Widen it with inner_gap, not inner: the chip has 32 stimulation units shared by three regions, a focal site costs inner^2 + 4, and a 3x3 focal site (39 units) will not route. grid: {shape, size, gap}, one DAC per role from region_dacs, no return ring, so 3x3 fits (27 units) if nine driven points matter more than spatial balance.",
   "stim_site": {
     "shape": "focal",
     "inner": 2,
@@ -65,6 +67,12 @@
   "encode_iti": 30,
   "encode_cycles": 2,
   "encode_cycle_rest": 10,
+  "encode_probe_roles": [
+    "CS",
+    "NS"
+  ],
+  "encode_probe_reps": 1,
+  "encode_probe_sec": 5,
   "decay_min": 0.5,
   "num_retrievals": 1,
   "retrieval_roles": [
@@ -94,6 +102,8 @@
   "check_iti": 5.0,
   "crosstalk_warn": 0.3,
   "burst_warn": 0.2,
+  "_raw_traces": "spikes are always kept, for every routed channel. raw_traces adds raw voltage: none (spikes only, ~1 MB a minute; the readout needs nothing more), regions (the three regions' recording and stimulation electrodes, enough to see the stimulation artifact), all (every channel: ~4 kB per channel-second on a MaxTwo, twice on a MaxOne, tens of GB for a four-hour run). The dry run keeps region traces because its artifact check is the point of it.",
+  "raw_traces": "regions",
   "_pulse_window_ms": "Counted after every pulse of a presentation and summed: the readout. response_windows_ms is optional; without it the windows are base/during/after sized by t_probe.",
   "pulse_window_ms": [
     5.0,

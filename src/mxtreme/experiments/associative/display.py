@@ -121,13 +121,21 @@ def draw_timeline(
     fired: Iterable[tuple[float, str]] | None = None,
     bursts: Iterable[float] | None = None,
     dt_cs_us_ms: float = 0.0,
+    stimuli: dict[str, protocol.Stimulus] | dict[str, dict] | None = None,
+    recording: str | None = None,
 ):
-    """Rows for US, CS, NS; a tick per presentation; blocks shaded and labelled. ``fired`` are
-    ``(t_sec, token)`` presentations that actually happened, drawn over the plan."""
+    """Rows for US, CS, NS; a bar per presentation; blocks shaded and labelled. ``fired`` are
+    ``(t_sec, token)`` presentations that actually happened, drawn over the plan.
+
+    With ``stimuli`` each presentation is drawn as long as it really is, which is the difference
+    between a one-minute probe and a ten-minute training train: without it they look alike, and a
+    training block of a few long trains reads as less stimulation than a probe block of many short
+    ones when it is in fact far more.
+    """
     starts = list(block_starts) if block_starts is not None else protocol.block_starts_sec(blocks)
     rows = {role: i for i, role in enumerate(reversed(ROLES))}
     ax.set_yticks(list(rows.values()), list(rows.keys()))
-    ax.set_ylim(-0.7, len(rows) - 0.3)
+    ax.set_ylim(-0.9, len(rows) - 0.05)
     ax.set_xlabel("minutes")
     for y in rows.values():
         ax.axhline(y, color="#cccccc", lw=0.6, zorder=1)
@@ -138,7 +146,7 @@ def draw_timeline(
             ax.axvspan(t0, t1, color="#f3f4f6" if i % 2 else "#e5e7eb", zorder=0)
         ax.text(
             (t0 + t1) / 2,
-            len(rows) - 0.45,
+            len(rows) - (0.45 if i % 2 else 0.24),  # staggered: short blocks crowd their labels
             block.label,
             ha="center",
             va="bottom",
@@ -147,15 +155,30 @@ def draw_timeline(
         )
         for p in block.presentations:
             t = (starts[i] + p.t_sec) / 60.0
+            stim = (stimuli or {}).get(p.token)
+            span = (
+                stim["duration_sec"] if isinstance(stim, dict) else getattr(stim, "duration_sec", 0.0)
+            ) / 60.0
             for role in p.roles:
                 offset = dt_cs_us_ms / 60000.0 if (role == "US" and len(p.roles) > 1) else 0.0
+                alpha = 0.5 if fired else 1.0
+                if span:
+                    ax.fill_between(
+                        [t + offset, t + offset + span],
+                        rows[role] - 0.28,
+                        rows[role] + 0.28,
+                        color=ROLE_COLOURS[role],
+                        lw=0,
+                        alpha=0.35 * alpha,
+                        zorder=2,
+                    )
                 ax.plot(
                     [t + offset] * 2,
                     [rows[role] - 0.35, rows[role] + 0.35],
                     color=ROLE_COLOURS[role],
                     lw=1.6,
                     zorder=3,
-                    alpha=0.5 if fired else 1.0,
+                    alpha=alpha,
                 )
     for t, token in fired or []:
         for role in protocol.roles_in(token):
@@ -172,6 +195,19 @@ def draw_timeline(
         ax.axvline(now_sec / 60.0, color="black", lw=1.0, zorder=5)
     total = (starts[-1] + blocks[-1].duration_sec) / 60.0 if blocks else 1.0
     ax.set_xlim(0, max(total, (now_sec or 0) / 60.0) * 1.01)
+    if recording:
+        # The run is one recording from end to end, quiet blocks included: draw the span it
+        # covers, so what is kept is not left to be inferred from where the ticks are.
+        ax.fill_between([0, total], -0.86, -0.74, color="#111827", lw=0, zorder=3)
+        ax.text(
+            total / 2,
+            -0.71,
+            recording,
+            ha="center",
+            va="bottom",
+            fontsize=8,
+            color="#111827",
+        )
 
 
 def draw_waveforms(ax_train, ax_pulse, stim: protocol.Stimulus, params, amplitudes_mv, with_return=False):

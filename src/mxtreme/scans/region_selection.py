@@ -335,6 +335,71 @@ def recording_electrodes(
     return out
 
 
+def well_data_from_h5(h5_path: str, well: int) -> dict:
+    """One continuous raw recording as the per-well dict the selection code reads.
+
+    For a network scan -- the baseline recording of a culture's active set -- used both to place
+    candidate patches and to measure how coupled they are. Refuses a file holding more than one
+    recording, for the reason :func:`baseline_spikes` gives.
+
+    :returns: ``spike_data`` (with ``electrode``), ``mapping``, ``samp_rate``, ``lsb`` and
+        ``rec_length_sec``, as :func:`well_data_from_npz` returns.
+    """
+    import h5py
+    import pandas as pd
+
+    # Read through baseline_spikes first for its refusal of multi-recording files.
+    frames, _electrodes, fps = baseline_spikes(h5_path, well)
+    with h5py.File(h5_path, "r") as f:
+        rec = f[f"/recordings/rec0000/well{well:03d}"]
+        spikes = rec["spikes"][:]
+        mapping = rec["settings/mapping"][:]
+        lsb = float(np.asarray(rec["settings/lsb"][:]).ravel()[0])
+        seconds = None
+        if "start_time" in rec and "stop_time" in rec:
+            # MaxLab stores these as epoch milliseconds.
+            seconds = (
+                float(np.asarray(rec["stop_time"][()]).ravel()[0])
+                - float(np.asarray(rec["start_time"][()]).ravel()[0])
+            ) / 1000.0
+    if not seconds or seconds <= 0:
+        seconds = (float(frames.max()) - float(frames.min())) / fps if len(frames) else 1.0
+
+    electrode_of = dict(zip(mapping["channel"].astype(int), mapping["electrode"].astype(int)))
+    table = pd.DataFrame(
+        {
+            "frameno": spikes["frameno"].astype(np.int64),
+            "channel": spikes["channel"].astype(int),
+            "amplitude": spikes["amplitude"].astype(float),
+        }
+    )
+    table["electrode"] = table["channel"].map(electrode_of)
+    table = table.dropna(subset=["electrode"]).astype({"electrode": int}).sort_values("frameno")
+    return {
+        "spike_data": table,
+        "mapping": pd.DataFrame(
+            {
+                "channel": mapping["channel"].astype(int),
+                "electrode": mapping["electrode"].astype(int),
+                "x": mapping["x"].astype(float),
+                "y": mapping["y"].astype(float),
+            }
+        ),
+        "samp_rate": fps,
+        "lsb": lsb,
+        "rec_length_sec": seconds,
+    }
+
+
+def load_recording(path: str, well: int = 0) -> dict:
+    """A baseline recording, raw ``.h5`` or preprocessed ``.npz``, as the per-well dict, with its
+    active electrodes marked (:func:`active_electrodes`)."""
+    well_data = (
+        well_data_from_npz(str(path)) if str(path).endswith(".npz") else well_data_from_h5(str(path), well)
+    )
+    return active_electrodes(well_data)
+
+
 def baseline_spikes(h5_path: str, well: int) -> tuple[np.ndarray, np.ndarray, float]:
     """Spike times and electrodes from one continuous recording, for the coupling measures.
 

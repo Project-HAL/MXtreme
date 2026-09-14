@@ -3,9 +3,17 @@
 One process, one well: route the electrodes, register one sequence per kind of presentation, open
 the recording, then walk the schedule firing each presentation at its time and marking each
 block's start with an event. The recording lands in the managed store like a scan does and is
-registered as an ``experiment``. Beside it go ``<stem>_protocol.json`` (everything that was
-decided, which :mod:`.report` reads) and ``<stem>_fired.csv`` (when each presentation was actually
-sent).
+registered as an ``experiment``.
+
+**The recording is the only file the run leaves in the store.** Everything needed to read it back
+travels inside it: the protocol (the parameters, which electrodes are US, CS and NS, every
+stimulus and every block) is written to ``/assay/associative_protocol``, the routing is MaxLab's own
+``settings/mapping``, and every presentation is an event with its frame. Given ``work``, a copy of
+the protocol and a table of planned-against-actual fire times go there instead -- conveniences,
+outside the store, that can be regenerated.
+
+By default the recording keeps **spikes only** (``raw_traces="none"``): the readout is spike counts,
+and a four-hour run is then a few hundred megabytes rather than tens of gigabytes.
 
 The timing that matters -- pulses within a presentation, the offset between CS and US in a
 pairing -- is inside each sequence and kept by the hardware. This loop only has to start
@@ -32,13 +40,50 @@ StopFn = Callable[[], bool]
 _POLL_SEC = 0.25
 
 
+#: Where the protocol is written inside a recording; :mod:`.report` reads it from here.
+PROTOCOL_KEY = "associative_protocol"
+
+
 @dataclass
 class RunResult:
     h5_path: Path
-    protocol_path: Path
-    fired_path: Path
     fired: list[tuple[str, str, float, float]]  # (block, token, planned_sec, actual_sec)
     stopped_early: bool
+    protocol_copy: Path | None = None  # in ``work``, when one was given
+    fired_copy: Path | None = None
+
+
+#: What the MaxLab server's system type means, in the batch id's terms.
+_SYSTEM_OF_DEVICE = {"MaxOne": "M1", "MaxTwo": "M2"}
+
+
+def check_device(batch, mx=None) -> str:
+    """Refuse to record when the connected system is not the one the batch id names.
+
+    The ``M1`` / ``M2`` at the end of a batch id decides the ``chip_<M1|M2>_<chip>`` directory a
+    recording is filed under, so a MaxTwo run under an ``_M1`` batch would land in the wrong place
+    and be registered as the wrong system, with nothing to say so. Checked before the chip is
+    touched.
+
+    :param batch: The batch id, or a :class:`mxtreme.store.Batch`.
+    :param mx: The imported ``maxlab`` module; imported here when not given.
+    :raises RuntimeError: On a mismatch, or when no system answers.
+    :returns: The device name, e.g. ``"MaxOne"``.
+    """
+    from mxtreme import store
+    from mxtreme.scans.activity_scan import _connected_device, _require_maxlab
+
+    mx = mx or _require_maxlab()
+    device = _connected_device(mx)
+    expected = store.Batch.parse(batch).system
+    found = _SYSTEM_OF_DEVICE.get(device)
+    if found != expected:
+        raise RuntimeError(
+            f"the connected system is {device} ({found}), but batch {store.Batch.parse(batch).id} "
+            f"says {expected}. The recording would be filed under chip_{expected}_... as the wrong "
+            f"system. Correct the batch id, or connect the right device."
+        )
+    return device
 
 
 def execute_schedule(
@@ -92,10 +137,26 @@ def execute_schedule(
     return fired, False
 
 
+def raw_channels(params: AssociativeParams, regions, config) -> list[int]:
+    """The channels whose raw traces the recording keeps, per ``params.raw_traces``.
+
+    :param regions: ``{role: RegionSpec}``, from :func:`.protocol.regions_for`.
+    :param config: The routed array's ``maxlab`` :class:`Config` (``array.get_config()``), which
+        maps electrodes to the channels they landed on.
+    """
+    if params.raw_traces == "none":
+        return []
+    if params.raw_traces == "all":
+        return list(range(1024))
+    electrodes = sorted({e for spec in regions.values() for e in spec.rec_electrodes + spec.stim_electrodes})
+    return sorted(set(config.get_channels_for_electrodes(electrodes)))
+
+
 def run(
     params: AssociativeParams,
     config=None,
     *,
+    work: str | Path | None = None,
     on_progress: ProgressFn = print,
     should_stop: StopFn | None = None,
 ) -> RunResult:
@@ -104,9 +165,13 @@ def run(
     :param params: With ``regions``, ``rec_electrodes`` and ``amplitudes_mv`` set.
     :param config: The :class:`~mxtreme.config.Config` naming the store, unless ``params.save_path``
         says where to write instead.
+    :param work: A directory outside the store for a copy of the protocol and the fire-time table.
+        Optional; the recording carries everything :mod:`.report` needs without it.
     :param should_stop: Polled while waiting; return ``True`` to end the run early. The recording
         is closed properly either way.
     :raises ModuleNotFoundError: If ``maxlab`` is not installed (this is not the rig).
+    :raises RuntimeError: If the protocol cannot be written into the recording and there is no
+        ``work`` directory to keep it in. Raised before recording starts, so nothing is lost.
     """
     from mxtreme import io
     from mxtreme.scans import mx_setup
@@ -122,7 +187,12 @@ def run(
 
     blocks, stimuli = protocol.build_schedule(params)
     regions = protocol.regions_for(params)
-    on_progress("=== Associative run ===")
+    on_progress(
+        "=== Associative run ==="
+        + (f" ({params.mode})" if params.mode != "conditioning" else "")
+        + (f" phase {params.phase}" if params.phase != "all" else "")
+        + f" -> {params.file_name}.raw.h5"
+    )
     on_progress(protocol.summary(blocks, stimuli, params.stim_phase_us))
     for spec in regions.values():
         on_progress(
@@ -136,6 +206,7 @@ def run(
         )
 
     # --- the chip ---
+    on_progress(f"Device: {check_device(params.batch, mx)}, matching batch {params.batch_id}")
     on_progress("Initializing chip...")
     mx.initialize()
     if mx.send(mx.Core().enable_stimulation_power(True)) != "Ok":
@@ -149,9 +220,8 @@ def run(
         if spec.return_electrodes:
             groups[f"{role}_return"] = spec.return_electrodes
     array, units = sequences.init_well_regions(well, list(params.rec_electrodes), groups)
-    cfg_path = Path(params.save_path) / f"{params.file_name}.cfg"
-    array.save_config(str(cfg_path))
-    on_progress(f"routed; config saved to {cfg_path}")
+    routed = array.get_config()
+    on_progress(f"routed {len(routed.get_channels())} channels")
 
     from mxtreme.stimulation.timeline import RegionUnits
 
@@ -196,17 +266,30 @@ def run(
     mx_setup.write_metadata(s, params.as_metadata())
     mx_setup.write_exp_description(s, params.description)
     mx_setup.write_stim_electrodes(s, [e for spec in regions.values() for e in spec.stim_electrodes])
-    s.group_define(well, f"all_channels_{well}", list(range(1024)))
+    channels = raw_channels(params, regions, routed)
+    if channels:
+        s.group_define(well, f"raw_{params.raw_traces}_{well}", channels)
+    on_progress(f"keeping spikes on every channel and raw traces on {len(channels)} ({params.raw_traces!r})")
 
-    protocol_path = Path(params.save_path) / f"{params.file_name}_protocol.json"
-    with open(protocol_path, "w") as f:
-        json.dump(
-            protocol.schedule_record(
-                params, blocks, stimuli, regions, {"config": str(cfg_path), "units": units}
-            ),
-            f,
-            indent=2,
-        )
+    record = protocol.schedule_record(params, blocks, stimuli, regions, {"units": units})
+    text = json.dumps(record, separators=(",", ":"))
+    reply = s.write_assay_property(PROTOCOL_KEY, text)
+    embedded = str(reply).strip().lower() != "error"
+
+    protocol_copy = fired_copy = None
+    if work is not None:
+        Path(work).mkdir(parents=True, exist_ok=True)
+        protocol_copy = Path(work) / f"{params.file_name}_protocol.json"
+        protocol_copy.write_text(json.dumps(record, indent=2))
+    if not embedded:
+        if protocol_copy is None:
+            s.stop_file()
+            raise RuntimeError(
+                "the protocol could not be written into the recording, and there is no work "
+                "directory to keep it in; without it the recording cannot be read back. Nothing "
+                "was recorded. Re-run with --work <dir>."
+            )
+        on_progress(f"WARNING: the protocol is not inside the recording; keep {protocol_copy}")
 
     started_at = time.time()
     s.start_recording([well])
@@ -228,27 +311,25 @@ def run(
         s.stop_file()
         s.group_delete_all()
 
-    fired_path = Path(params.save_path) / f"{params.file_name}_fired.csv"
-    with open(fired_path, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["block", "token", "planned_sec", "actual_sec"])
-        w.writerows(fired)
-
     from mxtreme.scans.activity_scan import _saved_file
 
     h5_path = _saved_file(params, started_at)
-    # MaxLab does not overwrite: asked for a name that exists it appends _1, _2 and so on. The
-    # protocol and fired files have to follow, or a second run into the same directory would
-    # leave the first recording described by the second run's protocol -- and `report` would
-    # read the wrong schedule without any sign that it had.
     stem = h5_path.name.split(".raw.h5")[0]
     if stem != params.file_name:
-        for path, tail in ((protocol_path, "_protocol.json"), (fired_path, "_fired.csv")):
-            path.rename(path.with_name(f"{stem}{tail}"))
-        protocol_path = protocol_path.with_name(f"{stem}_protocol.json")
-        fired_path = fired_path.with_name(f"{stem}_fired.csv")
+        # MaxLab does not overwrite: asked for a name that exists it appends _1, _2 and so on.
         on_progress(f"note: {params.file_name} was taken, so this run is {stem}")
+
+    if work is not None:
+        # Named after the recording actually written, so a copy can never describe another run.
+        if protocol_copy is not None and stem != params.file_name:
+            protocol_copy = protocol_copy.rename(protocol_copy.with_name(f"{stem}_protocol.json"))
+        fired_copy = Path(work) / f"{stem}_fired.csv"
+        with open(fired_copy, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["block", "token", "planned_sec", "actual_sec"])
+            w.writerows(fired)
+
     if registry_path is not None:
         io.register_scan(params, registry_path, kind="experiment")
     on_progress(f"{'stopped early' if stopped else 'done'}: {len(fired)} presentation(s); {h5_path}")
-    return RunResult(Path(h5_path), protocol_path, fired_path, fired, stopped)
+    return RunResult(Path(h5_path), fired, stopped, protocol_copy, fired_copy)

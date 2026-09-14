@@ -266,25 +266,159 @@ def calibration_table(
 
     :param tokens: ``{token: (role, amplitude_mv, polarity)}``, from the schedule.
     :returns: Rows with ``role``, ``amplitude_mv``, ``polarity``, ``local`` (mean evoked spikes per
-        pulse in the stimulated region), ``pulses`` and ``burst_rate``, sorted by role then
-        amplitude.
+        pulse in the stimulated region), ``remote`` (the mean over the other regions: how far the
+        pulse reaches), ``pulses`` and ``burst_rate``, sorted by role then amplitude.
     """
     rows = []
     for token, (role, amplitude, polarity) in tokens.items():
         values = responses.get(token, {}).get(role)
         if values is None:
             continue
+        others = [float(np.mean(v)) for name, v in responses[token].items() if name != role and len(v)]
         rows.append(
             {
                 "role": role,
                 "amplitude_mv": amplitude,
                 "polarity": polarity,
                 "local": float(np.mean(values)),
+                "remote": float(np.mean(others)) if others else float("nan"),
                 "pulses": len(values),
                 "burst_rate": float(bursts.get(token, 0.0)),
             }
         )
     return sorted(rows, key=lambda r: (r["role"], r["amplitude_mv"], r["polarity"]))
+
+
+def compare_calibrations(
+    tables: dict[str, Sequence[dict]],
+    roles: Sequence[str],
+    min_local: float = 0.5,
+    burst_warn: float = 0.2,
+) -> tuple[list[dict], list[Verdict]]:
+    """Set two or more calibration runs of the same regions side by side -- typically the same
+    sites driven through different electrode patterns -- and say which pattern did better.
+
+    Per pattern and region, three numbers decide it, in this order:
+
+    1. **threshold**: the lowest amplitude that evokes ``min_local`` spikes per pulse locally
+       without bursting -- lower means the pattern reaches neurons more easily;
+    2. **local response at the shared amplitude**: the largest amplitude every pattern has a
+       usable row at, so the patterns are compared at equal drive;
+    3. **spread** at that amplitude: the remote response as a fraction of the local one -- lower
+       means the pattern stays a site rather than a broadcast, which is what the return ring is
+       for.
+
+    A pattern wins a region when it has the lower threshold, or the same threshold and the higher
+    local response, or the same of both and less spread -- unless it wins on drive while
+    spreading more than a third further than the runner-up, which is flagged rather than
+    decided. Equal on all three is a draw, and the verdict says so.
+
+    :param tables: ``{pattern label: rows from calibration_table}``.
+    :returns: One summary row per (pattern, region), and the verdicts.
+    """
+    summary: list[dict] = []
+    for label, rows in tables.items():
+        for role in roles:
+            mine = [r for r in rows if r["role"] == role]
+            usable = [r for r in mine if r["local"] >= min_local and r["burst_rate"] <= burst_warn]
+            threshold = min((r["amplitude_mv"] for r in usable), default=None)
+            summary.append(
+                {
+                    "pattern": label,
+                    "role": role,
+                    "threshold_mv": threshold,
+                    "rows": mine,
+                    "usable": usable,
+                }
+            )
+
+    verdicts: list[Verdict] = []
+    labels = list(tables)
+    for role in roles:
+        entries = {s["pattern"]: s for s in summary if s["role"] == role}
+        shared = None
+        common = set.intersection(*({r["amplitude_mv"] for r in e["usable"]} for e in entries.values()))
+        if common:
+            shared = max(common)
+        for e in entries.values():
+            at = [r for r in e["usable"] if r["amplitude_mv"] == shared] if shared is not None else []
+            e["at_shared"] = at[0] if at else None
+            e["local_at_shared"] = at[0]["local"] if at else None
+            e["spread_at_shared"] = (
+                (at[0]["remote"] / at[0]["local"])
+                if at and at[0]["local"] > 0 and np.isfinite(at[0]["remote"])
+                else None
+            )
+        with_threshold = [e for e in entries.values() if e["threshold_mv"] is not None]
+        if not with_threshold:
+            verdicts.append(
+                Verdict("stop", f"{role}: no pattern evoked {min_local} spikes per pulse without bursting.")
+            )
+            continue
+        if len(with_threshold) < len(entries):
+            dead = [e["pattern"] for e in entries.values() if e["threshold_mv"] is None]
+            for e in with_threshold:
+                verdicts.append(
+                    Verdict(
+                        "ok",
+                        f"{role}: {e['pattern']} responds (threshold {e['threshold_mv']:.0f} mV); "
+                        f"{', '.join(dead)} never did. Use {e['pattern']}.",
+                    )
+                )
+            continue
+        ranked = sorted(
+            with_threshold,
+            key=lambda e: (
+                e["threshold_mv"],
+                -(e["local_at_shared"] or 0.0),
+                e["spread_at_shared"] if e["spread_at_shared"] is not None else float("inf"),
+            ),
+        )
+        if len(ranked) == 1:
+            verdicts.append(
+                Verdict("ok", f"{role}: {ranked[0]['pattern']} threshold {ranked[0]['threshold_mv']:.0f} mV.")
+            )
+            continue
+        best, runner = ranked[0], ranked[1]
+        spread_b, spread_r = best["spread_at_shared"], runner["spread_at_shared"]
+        worse_spread = spread_b is not None and spread_r is not None and spread_b > spread_r * 4 / 3
+        detail = (
+            f"threshold {best['threshold_mv']:.0f} vs {runner['threshold_mv']:.0f} mV"
+            + (
+                f"; at {shared:.0f} mV local {best['local_at_shared']:.2f} vs {runner['local_at_shared']:.2f} spikes/pulse"
+                if shared is not None
+                else ""
+            )
+            + (
+                f", spread {spread_b:.0%} vs {spread_r:.0%}"
+                if spread_b is not None and spread_r is not None
+                else ""
+            )
+        )
+        same_drive = best["threshold_mv"] == runner["threshold_mv"] and (best["local_at_shared"] or 0) == (
+            runner["local_at_shared"] or 0
+        )
+        if same_drive and (spread_b is None or spread_r is None or spread_b == spread_r):
+            verdicts.append(
+                Verdict("warn", f"{role}: {best['pattern']} and {runner['pattern']} tie ({detail}).")
+            )
+        elif same_drive:
+            verdicts.append(
+                Verdict("ok", f"{role}: {best['pattern']}, the same drive with less spread ({detail}).")
+            )
+        elif worse_spread:
+            verdicts.append(
+                Verdict(
+                    "warn",
+                    f"{role}: {best['pattern']} drives the site harder but spreads further "
+                    f"({detail}). Prefer {runner['pattern']} unless local response is what is short.",
+                )
+            )
+        else:
+            verdicts.append(Verdict("ok", f"{role}: {best['pattern']} ({detail})."))
+    if len(labels) < 2:
+        verdicts.append(Verdict("warn", "only one calibration given; nothing to compare it with."))
+    return summary, verdicts
 
 
 def calibration_verdicts(
@@ -321,6 +455,18 @@ def calibration_verdicts(
                     f"{best['local']:.1f} spikes per pulse, bursts on {best['burst_rate']:.0%}.",
                 )
             )
+            top = max(r["amplitude_mv"] for r in mine)
+            if min(r["amplitude_mv"] for r in usable) == top:
+                # Responds only at the top rung: the site is on few neurons, and the amplitude
+                # has nowhere to go if the response fades. Say so now, while reselecting is cheap.
+                out.append(
+                    Verdict(
+                        "warn",
+                        f"{role} responds only at the top of the ladder ({top:.0f} mV). The site is "
+                        f"on few neurons; a new centre (select --centers) is a better fix than "
+                        f"raising max_amplitude_mv.",
+                    )
+                )
             continue
         chosen[role] = None
         responsive = [r for r in mine if r["local"] >= min_local]
@@ -346,4 +492,191 @@ def calibration_verdicts(
                     f"sparser site; conditioning through it would drive the whole culture.",
                 )
             )
+    # CS and NS are compared with each other, so what should match between them is the drive
+    # each delivers (spikes per pulse at its site), not the voltage: a site on more neurons needs
+    # fewer mV for the same effect. Amplitudes differing is expected; responses differing by a lot
+    # is a confound, and the fix is to bring the stronger one down to the weaker's response.
+    a, b = chosen.get("CS"), chosen.get("NS")
+    if (
+        a
+        and b
+        and min(a["local"], b["local"]) > 0
+        and max(a["local"], b["local"]) > 2 * min(a["local"], b["local"])
+    ):
+        strong, weak = (("CS", a), ("NS", b)) if a["local"] > b["local"] else (("NS", b), ("CS", a))
+        options = [
+            r
+            for r in rows
+            if r["role"] == strong[0]
+            and r["polarity"] == strong[1]["polarity"]
+            and r["local"] >= min_local
+            and r["burst_rate"] <= burst_warn
+        ]
+        nearest = min(options, key=lambda r: abs(r["local"] - weak[1]["local"])) if options else None
+        out.append(
+            Verdict(
+                "warn",
+                f"CS and NS are not matched in drive: {strong[0]} evokes {strong[1]['local']:.1f} spikes "
+                f"per pulse at its amplitude, {weak[0]} {weak[1]['local']:.1f}. NS is CS's control, so "
+                f"the two should receive comparable drive"
+                + (
+                    f"; {nearest['amplitude_mv']:.0f} mV brings {strong[0]} to {nearest['local']:.1f}."
+                    if nearest and nearest["amplitude_mv"] != strong[1]["amplitude_mv"]
+                    else "; no lower rung of the ladder gets closer, so accept it and read NS against it."
+                ),
+            )
+        )
     return chosen, out
+
+
+def _rate(group: dict, role: str) -> tuple[float, float] | None:
+    """Per-pulse rate and its Poisson standard error for one role in one checkpoint, or None."""
+    pulses = group.get("pulses", {}).get(role, 0)
+    if not pulses:
+        return None
+    spikes = max(0, int(group.get("spikes", {}).get(role, 0)))
+    return spikes / pulses, (max(spikes, 1) ** 0.5) / pulses
+
+
+def conditioning_verdicts(
+    curve: Sequence[dict],
+    bursts: dict[str, float] | None = None,
+    crosstalk_warn: float = 0.3,
+    burst_warn: float = 0.2,
+    drift_warn: float = 0.5,
+    us: str = "US",
+    cs: str = "CS",
+    ns: str = "NS",
+) -> list[Verdict]:
+    """Read a conditioning run's checkpoint curve: was the experiment sound, and what did it show?
+
+    ``curve`` is :func:`~mxtreme.experiments.associative.report.checkpoints`' output: per
+    checkpoint, per role probed alone, the spikes in US per pulse with the totals behind it. The
+    error bars are Poisson on the pooled pulses, the same arithmetic as the probe design.
+
+    Checked, in the order they would undermine a result:
+
+    1. **high floor** -- at baseline, CS alone already drives US above ``crosstalk_warn`` of US's
+       own local response; the sites were not independent and the association starts from a
+       floor. Visible after the baseline block, 16 minutes in;
+    2. **bursting probes** -- more than ``burst_warn`` of probe or training pulses started a
+       network burst: the stimulus is driving the culture, not a site;
+    3. **excitability drift** -- US alone at the retrievals differs from baseline by more than
+       ``drift_warn``; a change in CS alone then has to be read against it;
+    4. **the result** -- CS alone at the retrievals against baseline, at two standard errors, and
+       NS alone the same way. CS up and NS flat is the association; both up is excitability;
+       neither is a null, and the note says what to try next.
+
+    :param bursts: ``{"probe": fraction, "train": fraction}`` of pulses followed by a burst.
+    """
+    out: list[Verdict] = []
+    if not curve:
+        return [Verdict("stop", "no probe-alone presentations found; nothing to read.")]
+    baseline = curve[0]
+    retrievals = [c for c in curve if str(c["label"]).startswith("retrieval")]
+    encode = [c for c in curve if str(c["label"]).startswith("encode")]
+
+    # 1. Independence at baseline.
+    base_cs, base_us = _rate(baseline, cs), _rate(baseline, us)
+    if base_cs and base_us and base_us[0] > 0 and base_cs[0] / base_us[0] > crosstalk_warn:
+        out.append(
+            Verdict(
+                "warn",
+                f"at baseline {cs} alone already evokes {base_cs[0]:.2f} spikes per pulse in {us}, "
+                f"{base_cs[0] / base_us[0]:.0%} of {us}'s own response (over {crosstalk_warn:.0%}). The "
+                f"sites are not independent, and the association starts from a high floor: any rise "
+                f"is measured against it, and a reselection with wider separation is the fix for the "
+                f"next culture.",
+            )
+        )
+
+    # 2. Bursts.
+    for kind, label in (("probe", "probe pulses"), ("train", "training pulses")):
+        rate = (bursts or {}).get(kind)
+        if rate is not None and rate > burst_warn:
+            out.append(
+                Verdict(
+                    "warn",
+                    f"{rate:.0%} of {label} were followed by a network burst (over {burst_warn:.0%}); "
+                    f"the stimulus is driving the whole culture and the readout window is flooded. "
+                    f"Lower the amplitudes next time.",
+                )
+            )
+
+    if not retrievals:
+        out.append(
+            Verdict(
+                "ok",
+                f"no retrieval block yet: {len(encode)} checkpoint(s) after baseline. The curve so far is "
+                f"all there is to read.",
+            )
+        )
+        return out
+
+    def pooled(groups, role):
+        spikes = sum(int(g.get("spikes", {}).get(role, 0)) for g in groups)
+        pulses = sum(int(g.get("pulses", {}).get(role, 0)) for g in groups)
+        return (spikes / pulses, (max(spikes, 1) ** 0.5) / pulses) if pulses else None
+
+    # 3. Excitability.
+    ret_us = pooled(retrievals, us)
+    if base_us and ret_us and base_us[0] > 0:
+        drift = (ret_us[0] - base_us[0]) / base_us[0]
+        if abs(drift) > drift_warn:
+            out.append(
+                Verdict(
+                    "warn",
+                    f"{us} alone changed by {drift:+.0%} from baseline to the retrievals: {us}'s own "
+                    f"excitability drifted, so read {cs} alone relative to it, not on its own.",
+                )
+            )
+
+    # 4. The result, at two standard errors on the pooled pulses.
+    def change(role):
+        before, after = _rate(baseline, role), pooled(retrievals, role)
+        if not before or not after:
+            return None
+        delta = after[0] - before[0]
+        se = (before[1] ** 2 + after[1] ** 2) ** 0.5
+        return delta, se, before[0], after[0]
+
+    d_cs, d_ns = change(cs), change(ns)
+    if d_cs is None:
+        out.append(Verdict("stop", f"{cs} alone was not probed at both baseline and retrieval."))
+        return out
+    cs_up = d_cs[0] > 2 * d_cs[1]
+    ns_up = d_ns is not None and d_ns[0] > 2 * d_ns[1]
+    trend = ""
+    if encode:
+        cs_points = [_rate(c, cs) for c in encode]
+        if all(cs_points):
+            trend = ", checkpoints " + " -> ".join(f"{p[0]:.2f}" for p in cs_points)
+    if cs_up and not ns_up:
+        out.append(
+            Verdict(
+                "ok",
+                f"association: {cs} alone in {us} rose from {d_cs[2]:.2f} to {d_cs[3]:.2f} spikes per "
+                f"pulse ({d_cs[0] / d_cs[1]:.1f} SE){trend}"
+                + (f"; {ns} alone {d_ns[2]:.2f} to {d_ns[3]:.2f}, within noise." if d_ns else "."),
+            )
+        )
+    elif cs_up and ns_up:
+        out.append(
+            Verdict(
+                "warn",
+                f"both {cs} alone ({d_cs[2]:.2f} to {d_cs[3]:.2f}) and {ns} alone ({d_ns[2]:.2f} to "
+                f"{d_ns[3]:.2f}) rose in {us}: a general change in excitability, not an association. "
+                f"The specific part, if any, is the difference between them.",
+            )
+        )
+    else:
+        out.append(
+            Verdict(
+                "warn",
+                f"no association: {cs} alone in {us} went {d_cs[2]:.2f} to {d_cs[3]:.2f} spikes per pulse "
+                f"({d_cs[0] / d_cs[1]:+.1f} SE){trend}. A flat curve after 712 paired pulses says single "
+                f"pulses did not change anything at this age; the tetanic variant "
+                f"(pulses_per_burst=11, burst_hz=20) is the next thing to try, with the burst cap watched.",
+            )
+        )
+    return out
