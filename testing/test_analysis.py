@@ -13,9 +13,9 @@ from mxtreme.config import Config
 from mxtreme.identity import CultureID, CultureSelector
 from mxtreme.recording import Recording
 from mxtreme.bursting import BurstDetector
-from mxtreme.params import ActivityParams, BurstDetectParams, BurstFeatureParams
+from mxtreme.params import ActivityParams, BurstDetectParams, BurstFeatureParams, NetworkParams
 from mxtreme.paths import CulturePaths, resolve_paths, resolve_recordings
-from mxtreme.analysis import activity, performance, stimulation, generate_report
+from mxtreme.analysis import activity, network, performance, stimulation, generate_report
 from mxtreme.analysis._paths import _summary_paths, load_population_summaries
 
 # Detection params tuned for the small synthetic fixture (see test_bursting.py).
@@ -509,3 +509,165 @@ def test_population_stim_plot_renders(tmp_path, make_recording_data):
                                              savename="stim.png")
 
     assert (config.analysis_dir / "stimulation" / "stim.png").exists()
+
+
+# --- network: connectivity and dimensionality ----------------------------------------------------
+
+
+def test_firing_rate_matrix_is_causal_and_peaks_after_the_spike():
+    """A lone spike produces a silent prefix and a double-exponential response peaking at the
+    analytic maximum of the difference of the two exponentials."""
+    params = NetworkParams(sample_bin_sec=0.01)  # no decimation, so bins map 1:1 to samples
+    bin_size = 0.01
+    spike_at = 100
+
+    spike_bin = np.zeros((1, 2000), dtype=np.uint8)
+    spike_bin[0, spike_at] = 1
+
+    rates = network.firing_rate_matrix(spike_bin, bin_size, params)[0]
+
+    assert rates.shape == (2000,)
+    assert np.allclose(rates[:spike_at + 1], 0.0)  # causal: nothing before the spike
+    assert rates[spike_at + 1:].min() >= 0
+
+    tau_r, tau_d = params.tau_rise_sec, params.tau_decay_sec
+    peak_sec = np.log(tau_d / tau_r) * tau_r * tau_d / (tau_d - tau_r)
+    assert np.argmax(rates) == pytest.approx(spike_at + peak_sec / bin_size, abs=3)
+
+
+def test_firing_rate_matrix_decimates_to_the_requested_resolution():
+    spike_bin = np.zeros((4, 1000), dtype=np.uint8)
+    spike_bin[:, ::50] = 1
+
+    rates = network.firing_rate_matrix(spike_bin, 0.01, NetworkParams(sample_bin_sec=0.05))
+
+    assert rates.shape == (4, 200)  # 1000 bins of 10 ms -> 200 samples of 50 ms
+    assert rates.dtype == np.float32
+
+
+def test_connectivity_matrix_recovers_known_correlations_and_drops_silent_electrodes():
+    rng = np.random.default_rng(0)
+    signal = rng.normal(size=500)
+
+    rates = np.vstack([signal, signal, -signal, np.zeros(500)])
+
+    corr, keep = network.connectivity_matrix(rates)
+
+    # The constant row has no variance and is dropped; the other three survive, in order.
+    assert keep.tolist() == [0, 1, 2]
+    assert corr.shape == (3, 3)
+    assert corr[0, 1] == pytest.approx(1.0, abs=1e-5)
+    assert corr[0, 2] == pytest.approx(-1.0, abs=1e-5)
+
+
+def test_variance_explained_and_effective_rank_bracket_the_extremes():
+    rng = np.random.default_rng(1)
+
+    # Rank 1: every electrode is a scaled copy of one signal, so one component carries everything.
+    signal = rng.normal(size=400)
+    rank_one = np.outer(np.arange(1, 9), signal)
+    p_one = network.variance_explained(rank_one)
+    assert p_one.sum() == pytest.approx(1.0)
+    assert p_one[0] == pytest.approx(1.0, abs=1e-6)
+    assert network.effective_rank(p_one) == pytest.approx(1.0, abs=1e-3)
+
+    # Independent equal-variance electrodes spread variance evenly: effective rank approaches d.
+    independent = rng.normal(size=(8, 20_000))
+    assert network.effective_rank(network.variance_explained(independent)) == pytest.approx(8, abs=0.5)
+
+
+def test_compute_network_metrics_keys_and_ranges():
+    rng = np.random.default_rng(2)
+    rates = rng.normal(size=(6, 500))
+
+    metrics = network.compute_network_metrics(rates)
+
+    assert metrics["n_electrodes_used"] == 6
+    assert -1 <= metrics["mean_corr"] <= 1
+    assert 1 <= metrics["effective_rank"] <= 6
+    assert metrics["n_pc_80"] <= metrics["n_pc_90"] <= 6
+    assert 0 < metrics["pc1_var_frac"] <= 1
+
+
+def test_network_summary_columns(store):
+    config, cid_a, _ = store
+    cpath = resolve_paths(cid_a, config)
+
+    df = network.network_summary(cpath, config.analysis_dir, show_plot=False)
+
+    assert {"culture_id", "div", "phase"} <= set(df.columns)
+    assert set(df["div"]) == {7, 8}
+    assert set(df["phase"]) == {"full"}
+    assert df["mean_corr"].between(-1, 1).all()
+    assert (df["effective_rank"] >= 1).all()
+    assert (df["effective_rank"] <= df["n_electrodes_used"]).all()
+    # The fixture's bursts recruit every channel, so the array moves as one: PC1 dominates.
+    assert (df["pc1_var_frac"] > 0.5).all()
+    # Stamped settings make a cached CSV self-describing.
+    assert set(df["sample_bin_sec"]) == {NetworkParams().sample_bin_sec}
+
+
+def test_network_summary_honors_embedded_phase_spec(tmp_path, make_recording_data):
+    config, cid = _phased_store(tmp_path, make_recording_data)
+    cpath = resolve_paths(cid, config)
+
+    df = network.network_summary(cpath, config.analysis_dir, show_plot=False)
+
+    assert set(df["phase"]) == {"early", "late"}
+
+
+def test_culture_connectivity_keys_and_cache(store):
+    config, cid_a, _ = store
+    cpath = resolve_paths(cid_a, config)
+
+    conn = network.culture_connectivity(cpath, config.analysis_dir)
+
+    assert sorted(conn) == [7, 8]
+    for per_div in conn.values():
+        assert set(per_div) == set(network.CONNECTIVITY_KEYS)
+        n = per_div["corr"].shape[0]
+        assert per_div["corr"].shape == (n, n)
+        assert per_div["elec_index"].size == n
+        # A cumulative variance curve is non-decreasing and ends at 1.
+        assert np.all(np.diff(per_div["cumvar"]) >= -1e-6)
+        assert per_div["cumvar"][-1] == pytest.approx(1.0, abs=1e-6)
+
+    _save_path, npz_path = _summary_paths(cpath, config.analysis_dir, "network",
+                                          "default_connectivity", ext=".npz")
+    assert npz_path.exists()
+
+    cached = network.culture_connectivity(cpath, config.analysis_dir)
+    assert np.array_equal(cached[7]["corr"], conn[7]["corr"])
+    assert np.array_equal(cached[7]["cumvar"], conn[7]["cumvar"])
+
+
+def test_network_plot_helpers_render(store, tmp_path):
+    config, cid_a, _ = store
+    cpath = resolve_paths(cid_a, config)
+    conn = network.culture_connectivity(cpath, config.analysis_dir)
+
+    grid = tmp_path / "conn_grid.png"
+    curves = tmp_path / "var_explained.png"
+    network.plot_connectivity_grid(conn, cid_a, save_path=grid, show_plot=False)
+    network.plot_variance_explained(conn, cid_a, save_path=curves, show_plot=False)
+
+    assert grid.exists() and curves.exists()
+
+
+def test_population_network_summary_renders(store):
+    config, cid_a, cid_b = store
+    sel = CultureSelector(cultures=[cid_a, cid_b])
+    sel_paths = resolve_paths(sel, config)
+
+    for epath in sel_paths.values():
+        for cpath in epath.cultures.values():
+            network.network_summary(cpath, config.analysis_dir, show_plot=False)
+
+    pop_df = load_population_summaries(sel_paths, data_dir=config.analysis_dir / "network",
+                                       suffix="network_summary")
+    assert {"culture_id", "chip", "well"} <= set(pop_df.columns)
+
+    network.plot_population_network_summary(sel_paths, config.analysis_dir, phase="full",
+                                            savename="network.png")
+
+    assert (config.analysis_dir / "network" / "network.png").exists()
