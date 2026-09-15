@@ -188,7 +188,8 @@ MXtreme writes to it itself, from the function that made the change, right after
 disk: a scan registered (`activity_scan.registered`, `network_scan.registered`, one per well), an
 outside recording ingested (`recording.ingested`), a well preprocessed (`preprocessed.saved`), its
 spike order repaired (`preprocessed.repaired`), bursts detected (`bursts.saved`), a report written
-(`report.written`, one per culture in it), the registry rebuilt (`registry.rebuilt`). A front end
+(`report.written`, one per culture in it), the registry rebuilt (`registry.rebuilt`), a recording
+removed (`recording.removed`), a batch renamed (`batch.renamed`). A front end
 records people's decisions in the same file: `culture.mark_dead` / `culture.mark_alive`,
 `batch.mark_dead` / `batch.mark_alive`, `chip.set_device`, `note`. The full vocabulary is
 {data}`mxtreme.transactions.OPS`.
@@ -203,6 +204,18 @@ op-specific `data` (paths written, counts). One culture's history is
 Nothing is edited or deleted; a correction is another line. A store that predates the log gets a
 history once from its registry and burst logs with {func}`mxtreme.transactions.backfill`, which
 skips what is already journaled and marks what it adds as back-filled.
+
+## Renaming a batch
+
+A batch id is written into far more than its plating directory: every file name under
+`recordings/`, `preprocessed/`, `burst_data/` and `analysis/`, the registry rows, the metadata
+blob inside every raw `.h5`, the identity inside every preprocessed `.npz`, and the burst-log and
+summary CSV rows. {func}`mxtreme.store.rename_batch` rewrites all of them (contents first, then
+paths deepest-first, so a file held open fails before anything has moved) and journals a
+`batch.renamed` against the new id. The log is not rewritten: its readers apply the rename to the
+records before it, so a culture's history and its alive/dead marks follow the batch to its new
+name. The plate date stays, the system (`M1`/`M2`) cannot change, and `dry_run=True` shows the
+plan. Nothing checks for a scan still recording into the batch; the caller must.
 
 ## Removing a recording
 

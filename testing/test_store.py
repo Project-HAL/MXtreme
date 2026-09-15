@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from mxtreme import store
+from mxtreme import store, transactions
 from mxtreme.config import Config
 from mxtreme.store import Batch
 
@@ -424,9 +424,10 @@ def test_rename_batch_renames_everything_the_store_names(tmp_path):
     _seed_batch(config, "fall2026_batch12_E18_M1", chip="P2")  # a sibling whose id contains no token of OLD
     npz_before = next(config.preprocessed_dir.rglob("*.npz")).stat().st_mtime
     sibling_before = sorted(_mentions(tmp_path, "fall2026_batch12_E18_M1"))
+    transactions.record(config, "culture.mark_dead", batch_id=OLD, plate_date=PLATE_DATE, chip="P1", well=0)
 
     lines = []
-    result = store.rename_batch(config, OLD, NEW, on_progress=lines.append)
+    result = store.rename_batch(config, OLD, NEW, reason="wrong season", actor="kam", on_progress=lines.append)
 
     assert _mentions(tmp_path, OLD) == []
     assert OLD not in config.registry_path.read_text()
@@ -434,7 +435,20 @@ def test_rename_batch_renames_everything_the_store_names(tmp_path):
     assert (result.old.id, result.new.id) == (OLD, NEW)
     assert (len(result.h5_files), len(result.npz_files), len(result.csv_files)) == (1, 1, 2)
     assert result.registry_rows == 2
-    assert lines and lines[-1].startswith("Paths:")
+    assert result.plate_dates == (PLATE_DATE,)
+    assert lines and lines[-1].startswith("Journal:")
+
+    # The rename is journaled against the new id, and what was journaled under the old one follows.
+    log = transactions.read(config)
+    last = log[-1]
+    assert last.op == "batch.renamed" and (last.batch_id, last.plate_date) == (NEW, PLATE_DATE)
+    assert (last.actor, last.note, last.data["old"], last.data["new"]) == ("kam", "wrong season", OLD, NEW)
+    assert last.data["paths"] == len(result.paths) and last.data["registry_rows"] == 2
+    mark = transactions.is_dead(
+        transactions.batch_states(config), transactions.culture_states(config), NEW, PLATE_DATE, "P1", 0
+    )
+    assert mark is not None and mark.dead
+    assert OLD in config.transactions_path.read_text().splitlines()[0]  # the file is not rewritten
 
     # The raw file's blob, and the preprocessed file's identity and pointer back to the raw file.
     h5_path = next(p for p in config.recordings_dir.rglob("*.h5") if NEW in p.name)
@@ -469,6 +483,7 @@ def test_rename_batch_dry_run_reports_the_plan_and_touches_nothing(tmp_path):
 
     assert sorted(str(p) for p in tmp_path.rglob("*")) == before
     assert OLD in config.registry_path.read_text()
+    assert "batch.renamed" not in {t.op for t in transactions.read(config)}
     assert result.registry_rows == 2 and len(result.paths) == 12
     assert all(NEW in dest.name and OLD not in dest.name for _, dest in result.paths)
 

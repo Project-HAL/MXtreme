@@ -21,6 +21,11 @@ Identity is recorded as the writer knows it. A scan knows its batch; a preproces
 from an older flow may know only its ``exp_id`` (which, for scans, *is* the batch id). Readers that
 want one culture's entries use :func:`for_culture`, which matches either way.
 
+A batch keeps its history through a rename. :func:`mxtreme.store.rename_batch` journals a
+``batch.renamed`` against the new id, and readers apply it to the records before it: everything
+written under the old id reads back under the new one (:func:`iter_transactions`). The file itself
+is never rewritten -- the early lines still say the old name, and the rename record says what it was.
+
 The current state of the decision-type records is a fold, computed on read: :func:`batch_states`,
 :func:`culture_states`, :func:`chip_devices`, combined by :func:`is_dead`. The file is small enough
 (a handful of lines per recording) that there is no index and no cache to invalidate.
@@ -31,7 +36,7 @@ from __future__ import annotations
 import getpass
 import json
 from collections.abc import Iterable, Iterator
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -290,12 +295,46 @@ def _append(path: Path, line: str) -> None:
 
 
 def iter_transactions(config) -> Iterator[Transaction]:
-    """Read the log back, oldest first, skipping lines that are not valid records.
+    """Read the log back, oldest first, with every batch under its current id.
 
     A torn last line (the process died mid-append) or a hand-edited line that does not parse is
     skipped rather than fatal: the records before it are still good, and a front end should show
     them rather than nothing.
+
+    A ``batch.renamed`` record (written by :func:`mxtreme.store.rename_batch`) is applied to the
+    records before it: a ``batch_id`` or ``exp_id`` equal to the old id reads back as the new one,
+    so marks, scans and analyses journaled before the rename still belong to the batch afterwards,
+    and the folds (:func:`batch_states`, :func:`culture_states`, :func:`chip_devices`) key on the
+    name the store has now. Records *after* the rename are left as written -- a later batch may
+    legitimately take the old id. The file is not touched; :func:`_iter_raw` is what it says.
     """
+    yield from _follow_renames(_iter_raw(config))
+
+
+def _follow_renames(transactions: Iterable[Transaction]) -> list[Transaction]:
+    """Apply each ``batch.renamed`` to the records before it, in order, so renames chain."""
+    out: list[Transaction] = []
+    for tx in transactions:
+        if tx.op == "batch.renamed":
+            old, new = str(tx.data.get("old") or ""), str(tx.data.get("new") or tx.batch_id)
+            if old and new and old != new:
+                out = [_under_new_id(t, old, new) for t in out]
+        out.append(tx)
+    return out
+
+
+def _under_new_id(tx: Transaction, old: str, new: str) -> Transaction:
+    if tx.batch_id != old and tx.exp_id != old:
+        return tx
+    return replace(
+        tx,
+        batch_id=new if tx.batch_id == old else tx.batch_id,
+        exp_id=new if tx.exp_id == old else tx.exp_id,
+    )
+
+
+def _iter_raw(config) -> Iterator[Transaction]:
+    """The records exactly as the file has them, oldest first, renames not applied."""
     path = _resolve_path(config)
     if not path.is_file():
         return

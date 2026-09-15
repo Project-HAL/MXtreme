@@ -858,6 +858,8 @@ class BatchRename:
     :param npz_files: Preprocessed files whose embedded identity was rewritten (paths as before).
     :param csv_files: Burst logs and analysis summaries whose rows named the batch (paths as before).
     :param registry_rows: How many registry rows named the batch.
+    :param plate_dates: Every plating date the batch has in the recordings tree (an id can be plated
+        more than once); the ``batch.renamed`` journal record is written once per date.
     """
 
     old: Batch
@@ -867,6 +869,7 @@ class BatchRename:
     npz_files: list[Path]
     csv_files: list[Path]
     registry_rows: int
+    plate_dates: tuple[int, ...]
 
 
 def _id_token(batch_id: str) -> re.Pattern[str]:
@@ -900,6 +903,8 @@ def rename_batch(
     new: Batch | str,
     *,
     dry_run: bool = False,
+    reason: str = "",
+    actor: str | None = None,
     on_progress: Callable[[str], None] = lambda _: None,
 ) -> BatchRename:
     """Give a plating batch a new id everywhere the store names it.
@@ -926,11 +931,18 @@ def rename_batch(
     whether a scan is still writing into the batch; the caller knows that, and must not rename a
     batch it is recording into.
 
+    The rename is journaled last (``batch.renamed`` in :mod:`mxtreme.transactions`, against the new
+    id, one record per plating date the batch has), and the log's readers follow it: everything
+    journaled under the old id -- scans, analyses, marks -- reads back under the new one, so a
+    culture's history and its alive/dead state survive the rename without the log being rewritten.
+
     :param config: The :class:`~mxtreme.config.Config` describing the managed store.
     :param old: The batch as it is named now.
     :param new: The batch id it should have. Validated by :meth:`Batch.parse`, so a malformed id
         is refused before anything is touched.
     :param dry_run: Collect and report what would change without changing it.
+    :param reason: Why, in the caller's words; goes into the journal record's ``note``.
+    :param actor: Who is renaming, for the journal. ``None`` records the OS user.
     :param on_progress: Called with a line of progress text as each group of files is done.
     :raises ValueError: If the new id is malformed, equals the old one, changes the system, or is a
         substring of another batch's id in the store (which the rename could not tell apart).
@@ -960,6 +972,12 @@ def rename_batch(
             f"Batch id {old.id!r} occurs inside other batch ids in this store ({nested}); "
             "a rename could not tell their files apart."
         )
+
+    plate_dates = tuple(sorted({
+        int(m["plate_date"])
+        for entry in (config.recordings_dir.iterdir() if config.recordings_dir.is_dir() else ())
+        if (m := _PLATING_DIR.match(entry.name)) and m["batch_id"] == old.id
+    }))
 
     roots = [config.recordings_dir, config.preprocessed_dir, config.burst_data_dir, config.analysis_dir]
     registry_text = config.registry_path.read_text() if config.registry_path.is_file() else ""
@@ -1058,7 +1076,31 @@ def rename_batch(
             os.rename(path, dest)
     on_progress(f"Paths: {len(renamed)} directory(ies) and file(s) renamed")
 
+    # --- and the journal, once the store really is renamed: one record per plating of the batch ----
+    if not dry_run:
+        from mxtreme import transactions
+
+        for plate_date in plate_dates or (None,):
+            transactions.record(
+                config,
+                "batch.renamed",
+                batch_id=new,
+                plate_date=plate_date,
+                actor=actor,
+                note=reason,
+                data={
+                    "old": old.id,
+                    "new": new.id,
+                    "paths": len(renamed),
+                    "h5_files": len(h5_files),
+                    "npz_files": len(npz_files),
+                    "csv_files": len(csv_files),
+                    "registry_rows": registry_rows,
+                },
+            )
+        on_progress(f"Journal: {len(plate_dates) or 1} batch.renamed record(s)")
+
     return BatchRename(
         old=old, new=new, paths=renamed, h5_files=h5_files, npz_files=npz_files,
-        csv_files=csv_files, registry_rows=registry_rows,
+        csv_files=csv_files, registry_rows=registry_rows, plate_dates=plate_dates,
     )
