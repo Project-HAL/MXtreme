@@ -842,3 +842,265 @@ def ingest_recording(
         )
 
     return written
+
+
+# --- renaming a batch -----------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class BatchRename:
+    """What :func:`rename_batch` changed, or -- with ``dry_run`` -- would change.
+
+    :param old: The batch as it was.
+    :param new: The batch as it is now.
+    :param paths: Every directory and file renamed, as ``(before, after)`` pairs.
+    :param h5_files: Raw recordings whose ``/assay/metadata`` blob was rewritten (paths as before).
+    :param npz_files: Preprocessed files whose embedded identity was rewritten (paths as before).
+    :param csv_files: Burst logs and analysis summaries whose rows named the batch (paths as before).
+    :param registry_rows: How many registry rows named the batch.
+    :param plate_dates: Every plating date the batch has in the recordings tree (an id can be plated
+        more than once); the ``batch.renamed`` journal record is written once per date.
+    """
+
+    old: Batch
+    new: Batch
+    paths: list[tuple[Path, Path]]
+    h5_files: list[Path]
+    npz_files: list[Path]
+    csv_files: list[Path]
+    registry_rows: int
+    plate_dates: tuple[int, ...]
+
+
+def _id_token(batch_id: str) -> re.Pattern[str]:
+    """Match ``batch_id`` where it stands as a whole token in a name or a CSV cell.
+
+    Every place the store writes a batch id butts it against ``_``, ``,``, a quote or an end, never
+    against a letter or digit -- so this is what separates ``fall2026_batch1_E18_M1`` from
+    ``fall2026_batch12_E18_M1``. It cannot separate an id from one whose cell type *contains* it
+    (``fall2026_batch1_E18_M1_E18_M1``); :func:`rename_batch` checks the store for that case first.
+    """
+    return re.compile(rf"(?<![A-Za-z0-9]){re.escape(batch_id)}(?![A-Za-z0-9])")
+
+
+def _batch_ids_on_disk(config) -> set[str]:
+    """Every batch id a top-level directory in the store is named by."""
+    found = set()
+    if config.recordings_dir.is_dir():
+        for entry in config.recordings_dir.iterdir():
+            match = _PLATING_DIR.match(entry.name)
+            if match:
+                found.add(match["batch_id"])
+    for root in (config.preprocessed_dir, config.burst_data_dir):
+        if root.is_dir():
+            found.update(entry.name for entry in root.iterdir() if entry.is_dir())
+    return found
+
+
+def rename_batch(
+    config,
+    old: Batch | str,
+    new: Batch | str,
+    *,
+    dry_run: bool = False,
+    reason: str = "",
+    actor: str | None = None,
+    on_progress: Callable[[str], None] = lambda _: None,
+) -> BatchRename:
+    """Give a plating batch a new id everywhere the store names it.
+
+    A batch id is written into far more than its plating directory: every file name under
+    ``recordings/``, ``preprocessed/``, ``burst_data/`` and ``analysis/`` carries it; so do the
+    registry rows, the ``/assay/metadata`` blob inside every raw ``.h5``, the ``exp_id`` and
+    ``path_to_h5`` fields inside every preprocessed ``.npz`` (which is where a registry rebuild reads
+    identity from), and the ``exp_id`` / ``culture_id`` columns of the burst log and the analysis
+    summary CSVs. This rewrites all of them, so that afterwards :func:`list_platings`,
+    :func:`mxtreme.io.rebuild_registry` and :func:`mxtreme.paths.resolve_paths` all agree on the
+    new name. Report PDFs are renamed but not regenerated: their text still says the old name until
+    they are produced again.
+
+    The plate date is not part of the batch id and is left alone -- the batch keeps its place in the
+    calendar, only its label changes. The system (``M1``/``M2``) is refused: it names the hardware
+    the recordings came off, and the chip directories and well counts assume it.
+
+    Contents (blobs, ``.npz`` fields, CSV rows, the registry) are rewritten before any path moves,
+    and paths are renamed deepest-first with the top-level directories last, so the failures most
+    likely on a live store -- a file held open, a permission -- surface before anything has moved.
+    The operation is not transactional beyond that ordering: a failure part-way leaves a store that
+    is partly renamed, and ``dry_run`` is the way to see the whole plan first. Nothing here checks
+    whether a scan is still writing into the batch; the caller knows that, and must not rename a
+    batch it is recording into.
+
+    The rename is journaled last (``batch.renamed`` in :mod:`mxtreme.transactions`, against the new
+    id, one record per plating date the batch has), and the log's readers follow it: everything
+    journaled under the old id -- scans, analyses, marks -- reads back under the new one, so a
+    culture's history and its alive/dead state survive the rename without the log being rewritten.
+
+    :param config: The :class:`~mxtreme.config.Config` describing the managed store.
+    :param old: The batch as it is named now.
+    :param new: The batch id it should have. Validated by :meth:`Batch.parse`, so a malformed id
+        is refused before anything is touched.
+    :param dry_run: Collect and report what would change without changing it.
+    :param reason: Why, in the caller's words; goes into the journal record's ``note``.
+    :param actor: Who is renaming, for the journal. ``None`` records the OS user.
+    :param on_progress: Called with a line of progress text as each group of files is done.
+    :raises ValueError: If the new id is malformed, equals the old one, changes the system, or is a
+        substring of another batch's id in the store (which the rename could not tell apart).
+    :raises FileNotFoundError: If nothing in the store is named by ``old``.
+    :raises FileExistsError: If something in the store is already named by ``new``.
+    :returns: A :class:`BatchRename` listing everything changed (or, with ``dry_run``, to change).
+    """
+    import os
+
+    import h5py
+    import numpy as np
+
+    old, new = Batch.parse(old), Batch.parse(new)
+    if old.id == new.id:
+        raise ValueError(f"Batch is already named {old.id!r}.")
+    if old.system != new.system:
+        raise ValueError(
+            f"Cannot move batch {old.id!r} from {old.system} to {new.system}: the system names the "
+            "hardware the recordings came off, and the store's layout assumes it."
+        )
+
+    old_token, new_token = _id_token(old.id), _id_token(new.id)
+    on_disk = _batch_ids_on_disk(config)
+    nested = sorted(b for b in on_disk if b != old.id and old_token.search(b))
+    if nested:
+        raise ValueError(
+            f"Batch id {old.id!r} occurs inside other batch ids in this store ({nested}); "
+            "a rename could not tell their files apart."
+        )
+
+    plate_dates = tuple(sorted({
+        int(m["plate_date"])
+        for entry in (config.recordings_dir.iterdir() if config.recordings_dir.is_dir() else ())
+        if (m := _PLATING_DIR.match(entry.name)) and m["batch_id"] == old.id
+    }))
+
+    roots = [config.recordings_dir, config.preprocessed_dir, config.burst_data_dir, config.analysis_dir]
+    registry_text = config.registry_path.read_text() if config.registry_path.is_file() else ""
+
+    def _named(root: Path, token: re.Pattern[str]) -> list[Path]:
+        return sorted(p for p in root.rglob("*") if token.search(p.name)) if root.is_dir() else []
+
+    paths = [p for root in roots for p in _named(root, old_token)]
+    registry_rows = sum(bool(old_token.search(line)) for line in registry_text.splitlines())
+    if not paths and not registry_rows:
+        raise FileNotFoundError(f"Nothing in {config.data_root} is named by batch {old.id!r}.")
+
+    taken = [p for root in roots for p in _named(root, new_token)]
+    if taken or new_token.search(registry_text):
+        where = taken[0] if taken else config.registry_path
+        raise FileExistsError(f"Batch {new.id!r} is already present in the store: {where}")
+
+    def _keep_mtime(path: Path, write: Callable[[], None]) -> None:
+        stat = path.stat()
+        write()
+        os.utime(path, (stat.st_atime, stat.st_mtime))
+
+    # --- contents first: the identity each file carries inside it -----------------------------
+    old_bytes = re.compile(old_token.pattern.encode())
+    h5_files = []
+    for h5_path in (p for p in paths if p.suffix == ".h5" and p.is_file()):
+        with h5py.File(str(h5_path), "r") as f:
+            raw = bytes(f["/assay/metadata"][:][0]) if "/assay/metadata" in f else b""
+        if not old_bytes.search(raw):
+            continue
+        h5_files.append(h5_path)
+        if dry_run:
+            continue
+
+        def _rewrite_blob(h5_path=h5_path, raw=raw):
+            with h5py.File(str(h5_path), "r+") as f:
+                del f["/assay/metadata"]
+                f["assay"].create_dataset(
+                    "metadata", data=np.array([old_bytes.sub(new.id.encode(), raw)])
+                )
+
+        _keep_mtime(h5_path, _rewrite_blob)
+    on_progress(f"Metadata blobs: {len(h5_files)} raw recording(s)")
+
+    npz_files = []
+    for npz_path in (p for p in paths if p.suffix == ".npz" and p.is_file()):
+        with np.load(npz_path, allow_pickle=True) as npz:
+            contents = {key: npz[key] for key in npz.files}
+        changed = False
+        for key, value in contents.items():
+            if value.ndim == 0 and isinstance(value.item(), str) and old_token.search(value.item()):
+                # A fresh array, not the old dtype: a fixed-width ``<U24`` would truncate a longer id.
+                renamed_value = old_token.sub(new.id, value.item())
+                contents[key] = np.array(renamed_value, dtype=object if value.dtype == object else None)
+                changed = True
+        if not changed:
+            continue  # an electrode-selection cache, not a preprocessed recording
+        npz_files.append(npz_path)
+        if dry_run:
+            continue
+
+        def _rewrite_npz(npz_path=npz_path, contents=contents):
+            tmp = npz_path.with_name(npz_path.name + ".tmp")
+            with open(tmp, "wb") as fh:  # a file object, so savez does not re-append ".npz"
+                np.savez_compressed(fh, **contents)
+            os.replace(tmp, npz_path)
+
+        _keep_mtime(npz_path, _rewrite_npz)
+    on_progress(f"Embedded identity: {len(npz_files)} preprocessed file(s)")
+
+    csv_files = []
+    for csv_path in (
+        p for root in (config.burst_data_dir, config.analysis_dir) if root.is_dir()
+        for p in sorted(root.rglob("*.csv"))
+    ):
+        text = csv_path.read_text()
+        if not old_token.search(text):
+            continue
+        csv_files.append(csv_path)
+        if not dry_run:
+            _keep_mtime(csv_path, lambda p=csv_path, t=text: p.write_text(old_token.sub(new.id, t)))
+    on_progress(f"CSV rows: {len(csv_files)} burst log(s) and summary table(s)")
+
+    if registry_rows and not dry_run:
+        tmp = config.registry_path.with_name(config.registry_path.name + ".tmp")
+        tmp.write_text(old_token.sub(new.id, registry_text))
+        os.replace(tmp, config.registry_path)
+    on_progress(f"Registry: {registry_rows} row(s)")
+
+    # --- then the paths, deepest first so every parent is still where its children expect --------
+    renamed = []
+    for path in sorted(paths, key=lambda p: len(p.parts), reverse=True):
+        dest = path.with_name(old_token.sub(new.id, path.name))
+        renamed.append((path, dest))
+        if not dry_run:
+            os.rename(path, dest)
+    on_progress(f"Paths: {len(renamed)} directory(ies) and file(s) renamed")
+
+    # --- and the journal, once the store really is renamed: one record per plating of the batch ----
+    if not dry_run:
+        from mxtreme import transactions
+
+        for plate_date in plate_dates or (None,):
+            transactions.record(
+                config,
+                "batch.renamed",
+                batch_id=new,
+                plate_date=plate_date,
+                actor=actor,
+                note=reason,
+                data={
+                    "old": old.id,
+                    "new": new.id,
+                    "paths": len(renamed),
+                    "h5_files": len(h5_files),
+                    "npz_files": len(npz_files),
+                    "csv_files": len(csv_files),
+                    "registry_rows": registry_rows,
+                },
+            )
+        on_progress(f"Journal: {len(plate_dates) or 1} batch.renamed record(s)")
+
+    return BatchRename(
+        old=old, new=new, paths=renamed, h5_files=h5_files, npz_files=npz_files,
+        csv_files=csv_files, registry_rows=registry_rows, plate_dates=plate_dates,
+    )

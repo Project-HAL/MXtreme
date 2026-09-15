@@ -224,6 +224,44 @@ def test_for_culture_matches_by_batch_or_exp_id_and_includes_batch_level(config)
     assert len(tx.for_batch(tx.read(config), BATCH, 260813)) == 4
 
 
+def test_reading_follows_a_batch_rename(config):
+    old, new = "summer2026_batch1_DRG_M1", BATCH
+    tx.record(config, "activity_scan.registered", batch_id=old, plate_date=260813, chip="P1", well=0, div=7)
+    tx.record(config, "preprocessed.saved", exp_id=old, chip="P1", well=0, div=7)  # older flow: exp id only
+    tx.record(config, "culture.mark_dead", batch_id=old, plate_date=260813, chip="P1", well=0)
+    tx.record(config, "chip.set_device", batch_id=old, plate_date=260813, chip="P1", data={"device": "MaxOne+"})
+    tx.record(config, "batch.renamed", batch_id=new, plate_date=260813, data={"old": old, "new": new})
+    tx.record(config, "bursts.saved", batch_id=new, plate_date=260813, chip="P1", well=0, div=7)
+    tx.record(config, "note", batch_id=old, plate_date=270101, note="a later batch reusing the old id")
+
+    log = tx.read(config)
+    assert [t.batch_id or t.exp_id for t in log[:6]] == [new] * 6
+    assert (log[1].batch_id, log[1].exp_id) == ("", new)  # the exp-id-only record follows too
+    assert log[4].data == {"old": old, "new": new}  # the rename record remembers what it was
+    assert log[6].batch_id == old  # a record after the rename is left as written
+    assert [t.op for t in tx.for_culture(log, new, 260813, "P1", 0)] == [
+        "activity_scan.registered", "preprocessed.saved", "culture.mark_dead", "chip.set_device",
+        "batch.renamed", "bursts.saved",
+    ]
+    assert tx.for_batch(log, old, 260813) == []
+    assert tx.is_dead(tx.batch_states(config), tx.culture_states(config), new, 260813, "P1", 0).dead
+    assert tx.chip_devices(config) == {(new, 260813, "P1"): "MaxOne+"}
+    # The file is untouched: the first line still names the old batch.
+    assert json.loads(config.transactions_path.read_text().splitlines()[0])["batch_id"] == old
+
+
+def test_renames_chain(config):
+    a, b, c = "summer2026_batch1_DRG_M1", "fall2026_batch1_DRG_M1", "fall2026_batch9_DRG_M1"
+    tx.record(config, "batch.mark_dead", batch_id=a, plate_date=260813)
+    tx.record(config, "batch.renamed", batch_id=b, plate_date=260813, data={"old": a, "new": b})
+    tx.record(config, "note", batch_id=b, plate_date=260813, note="under the middle name")
+    tx.record(config, "batch.renamed", batch_id=c, plate_date=260813, data={"old": b, "new": c})
+
+    log = tx.read(config)
+    assert [t.batch_id for t in log] == [c] * 4
+    assert tx.batch_states(config) == {(c, 260813): tx.Mark(True, log[0].time, log[0].actor, "")}
+
+
 def test_journal_ops_need_their_identity(config):
     with pytest.raises(ValueError):
         tx.record(config, "preprocessed.saved", exp_id="x", chip="P1", well=0)  # no DIV

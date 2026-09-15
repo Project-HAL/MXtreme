@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from mxtreme import store
+from mxtreme import store, transactions
 from mxtreme.config import Config
 from mxtreme.store import Batch
 
@@ -342,3 +342,179 @@ def test_ingest_requires_a_wells_format_file(tmp_path):
             src, config, batch=BATCH, plate_date=260810, chip="M07460", div=21,
             exp_id="trial", on_progress=lambda _: None,
         )
+
+
+# --- renaming a batch -----------------------------------------------------------------------------
+
+OLD = "summer2026_batch1_E18_M1"
+NEW = "fall2026_batch1_E18_M1"
+PLATE_DATE = 260813
+
+
+def _seed_batch(config, batch, chip="P1", div=19):
+    """Lay down one well of one batch everywhere the store names it, the way a run leaves it."""
+    import h5py
+
+    from mxtreme import io
+
+    stem = store.recording_stem(batch, PLATE_DATE, chip, 0, div)
+    rec_dir = store.recording_dir(config, batch, PLATE_DATE, chip, 0, div)
+    (rec_dir / "electrode_selection").mkdir(parents=True)
+    h5_path = rec_dir / f"{stem}_activity_scan.raw.h5"
+    blob = str({"Exp ID": batch, "Batch ID": batch, "Chip ID": chip, "Plate date": PLATE_DATE,
+                "DIV": div, "Well IDs": [0], "Conditions": []})
+    with h5py.File(h5_path, "w") as f:
+        f.create_dataset("/assay/metadata", data=np.array([blob.encode("utf-8")]))
+        f.create_dataset("/wells/well000/rec0000/spikes", data=np.arange(5))
+    (rec_dir / "electrode_selection" / f"{stem}_activity_scan_AS_well0.png").write_bytes(b"png")
+    np.savez_compressed(
+        rec_dir / "electrode_selection" / f"{stem}_activity_scan_network_well0.npz",
+        recording_electrodes=np.arange(3),
+    )
+    io.register(
+        {0: {"chip": chip, "DIV": div, "batch_id": batch, "plate_date": PLATE_DATE}},
+        config.registry_path, kind="activity_scan",
+    )
+
+    npz_dir = config.preprocessed_dir / batch / chip / "well0"
+    npz_dir.mkdir(parents=True)
+    npz_path = npz_dir / f"DIV{div}_{PLATE_DATE}_{chip}_{batch}_well0_exp_data.npz"
+    np.savez_compressed(
+        npz_path, spike_data=np.arange(4), exp_id=np.array(batch), chip=np.array(chip),
+        well=np.array(0), DIV=np.array(div), plate_date=np.array(PLATE_DATE),
+        exp_condition=np.asarray(None), path_to_h5=np.array(str(h5_path)),
+        step_log=np.asarray([{"step": "normalize_time"}], dtype=object),
+    )
+    io.register(
+        {0: {"exp_id": batch, "chip": chip, "DIV": div, "plate_date": PLATE_DATE}},
+        config.registry_path,
+    )
+
+    burst_dir = config.burst_data_dir / batch / chip / "well0"
+    burst_dir.mkdir(parents=True)
+    (burst_dir / f"DIV{div}_{PLATE_DATE}_{chip}_{batch}_well0_burst_data.csv").write_text("a,b\n1,2\n")
+    (config.burst_data_dir / f"{batch}_burst_log.csv").write_text(
+        f"exp_id,chip,well,DIV\n{batch},{chip},0,{div}\n"
+    )
+
+    summary_dir = config.analysis_dir / "activity" / batch / chip / "well0"
+    summary_dir.mkdir(parents=True)
+    (summary_dir / f"{batch}_{chip}_well0_burst_activity_summary.csv").write_text(
+        f"culture_id,div,n_bursts\n{batch}_{chip}_well0,{div},17\n"
+    )
+    (config.analysis_dir / "reports").mkdir(exist_ok=True)
+    (config.analysis_dir / "reports" / f"{batch}_{chip}_well0_report.pdf").write_bytes(b"%PDF")
+    return h5_path, npz_path
+
+
+def _mentions(root, batch_id):
+    """Every path under ``root`` whose name, or whose text (CSVs), carries ``batch_id``."""
+    hits = [p for p in root.rglob("*") if batch_id in p.name]
+    hits += [p for p in root.rglob("*.csv") if batch_id in p.read_text()]
+    return hits
+
+
+def test_rename_batch_renames_everything_the_store_names(tmp_path):
+    import h5py
+
+    from mxtreme import io
+
+    config = Config(data_root=tmp_path)
+    _seed_batch(config, OLD)
+    _seed_batch(config, "fall2026_batch12_E18_M1", chip="P2")  # a sibling whose id contains no token of OLD
+    npz_before = next(config.preprocessed_dir.rglob("*.npz")).stat().st_mtime
+    sibling_before = sorted(_mentions(tmp_path, "fall2026_batch12_E18_M1"))
+    transactions.record(config, "culture.mark_dead", batch_id=OLD, plate_date=PLATE_DATE, chip="P1", well=0)
+
+    lines = []
+    result = store.rename_batch(config, OLD, NEW, reason="wrong season", actor="kam", on_progress=lines.append)
+
+    assert _mentions(tmp_path, OLD) == []
+    assert OLD not in config.registry_path.read_text()
+    assert {p.batch.id for p in store.list_platings(config)} == {NEW, "fall2026_batch12_E18_M1"}
+    assert (result.old.id, result.new.id) == (OLD, NEW)
+    assert (len(result.h5_files), len(result.npz_files), len(result.csv_files)) == (1, 1, 2)
+    assert result.registry_rows == 2
+    assert result.plate_dates == (PLATE_DATE,)
+    assert lines and lines[-1].startswith("Journal:")
+
+    # The rename is journaled against the new id, and what was journaled under the old one follows.
+    log = transactions.read(config)
+    last = log[-1]
+    assert last.op == "batch.renamed" and (last.batch_id, last.plate_date) == (NEW, PLATE_DATE)
+    assert (last.actor, last.note, last.data["old"], last.data["new"]) == ("kam", "wrong season", OLD, NEW)
+    assert last.data["paths"] == len(result.paths) and last.data["registry_rows"] == 2
+    mark = transactions.is_dead(
+        transactions.batch_states(config), transactions.culture_states(config), NEW, PLATE_DATE, "P1", 0
+    )
+    assert mark is not None and mark.dead
+    assert OLD in config.transactions_path.read_text().splitlines()[0]  # the file is not rewritten
+
+    # The raw file's blob, and the preprocessed file's identity and pointer back to the raw file.
+    h5_path = next(p for p in config.recordings_dir.rglob("*.h5") if NEW in p.name)
+    with h5py.File(h5_path, "r") as f:
+        assert io._embedded_metadata(h5_path)["Batch ID"] == NEW
+        assert f["/wells/well000/rec0000/spikes"][()].tolist() == [0, 1, 2, 3, 4]
+    npz_path = next(p for p in config.preprocessed_dir.rglob("*.npz") if NEW in p.name)
+    with np.load(npz_path, allow_pickle=True) as npz:
+        assert npz["exp_id"].item() == NEW
+        assert npz["path_to_h5"].item() == str(h5_path)
+        assert npz["spike_data"].tolist() == [0, 1, 2, 3]
+    assert npz_path.stat().st_mtime == npz_before  # a rebuilt registry keeps its timestamps
+
+    # The sibling batch was not touched.
+    assert sorted(_mentions(tmp_path, "fall2026_batch12_E18_M1")) == sibling_before
+
+    # And a registry rebuilt from disk agrees with the one rewritten in place.
+    rebuilt = tmp_path / "rebuilt.csv"
+    io.rebuild_registry(config, registry_path=rebuilt)
+    key = ["exp_id", "batch_id", "chip", "well", "div", "kind"]
+    live = pd.read_csv(config.registry_path).fillna("")[key].astype(str)
+    fresh = pd.read_csv(rebuilt).fillna("")[key].astype(str)
+    assert set(map(tuple, live.values)) == set(map(tuple, fresh.values))
+
+
+def test_rename_batch_dry_run_reports_the_plan_and_touches_nothing(tmp_path):
+    config = Config(data_root=tmp_path)
+    _seed_batch(config, OLD)
+    before = sorted(str(p) for p in tmp_path.rglob("*"))
+
+    result = store.rename_batch(config, OLD, NEW, dry_run=True)
+
+    assert sorted(str(p) for p in tmp_path.rglob("*")) == before
+    assert OLD in config.registry_path.read_text()
+    assert "batch.renamed" not in {t.op for t in transactions.read(config)}
+    assert result.registry_rows == 2 and len(result.paths) == 12
+    assert all(NEW in dest.name and OLD not in dest.name for _, dest in result.paths)
+
+
+@pytest.mark.parametrize("new, error", [
+    (OLD, ValueError),                          # nothing to do
+    ("summer2026_batch1_E18_M2", ValueError),   # the system is not a label
+    ("batch-one", ValueError),                  # not a batch id
+    ("fall2026_batch2_E18_M1", FileExistsError),  # already in the store
+])
+def test_rename_batch_refuses_bad_targets(tmp_path, new, error):
+    config = Config(data_root=tmp_path)
+    _seed_batch(config, OLD)
+    _seed_batch(config, "fall2026_batch2_E18_M1", chip="P2")
+    before = sorted(str(p) for p in tmp_path.rglob("*"))
+
+    with pytest.raises(error):
+        store.rename_batch(config, OLD, new)
+    assert sorted(str(p) for p in tmp_path.rglob("*")) == before
+
+
+def test_rename_batch_refuses_a_batch_it_cannot_find(tmp_path):
+    config = Config(data_root=tmp_path)
+    with pytest.raises(FileNotFoundError):
+        store.rename_batch(config, OLD, NEW)
+
+
+def test_rename_batch_refuses_an_id_nested_inside_another(tmp_path):
+    config = Config(data_root=tmp_path)
+    _seed_batch(config, OLD)
+    _seed_batch(config, f"{OLD}_E18_M1", chip="P2")  # cell type "E18_M1_E18": contains OLD whole
+
+    with pytest.raises(ValueError, match="inside other batch ids"):
+        store.rename_batch(config, OLD, NEW)
