@@ -632,8 +632,9 @@ def run_activity_scan(
     Path(params.save_path).mkdir(parents=True, exist_ok=True)
 
     on_progress("Initializing chip...")
-    mx.initialize()
-    time.sleep(mx.Timing.waitInit)
+    with mx_setup.stream_blanked(mx.Timing.waitInit):
+        mx.initialize()
+        time.sleep(mx.Timing.waitInit)
 
     on_progress(f"Activating wells {params.wells}")
     mx.activate(params.wells)
@@ -662,7 +663,8 @@ def run_activity_scan(
 
             on_progress(f"\n--- Scan {i + 1}/{params.n_scans} ---")
 
-            # 1. Route this round's electrodes in every well
+            # 1. Route this round's electrodes in every well. Software only: nothing reaches the
+            #    chip until the download below.
             for well in params.wells:
                 scan_elecs = plan[well][i]
 
@@ -674,16 +676,23 @@ def run_activity_scan(
                 result = array.route()  # server solves electrode->channel wiring
                 if str(result).upper() != "OK":  # route() returns 'OK'/'ERROR', it never raises
                     raise RuntimeError(f"Routing failed on scan {i}, well {well}: {result!r}")
-                array.download([well])  # push the solution to the chip
                 recorded[well].append(scan_elecs)
-                on_progress(f"  Well {well}: routed and downloaded")
+                on_progress(f"  Well {well}: routed")
 
-            time.sleep(mx.Timing.waitAfterDownload)
-            on_progress("  Running offset compensation...")
-            mx.offset()  # amplifier offset compensation
-            time.sleep(mx.Timing.waitInMX2Offset)
+            # 2. Push every well's wiring to the chip and let the amplifiers settle, with the
+            #    stream blanked meanwhile (see mx_setup.stream_blanked) -- the same sequence, with
+            #    the same wait, as MaxLab Live's own Activity Scan.
+            with mx_setup.stream_blanked(mx.Timing.waitAfterDownload):
+                for well in params.wells:
+                    arrays[well].download([well])
+                time.sleep(mx.Timing.waitAfterDownload)
+            on_progress("  Downloaded; running offset compensation...")
+            # offset() itself sleeps the system-specific settle time (5 s MaxOne, 15 s MaxTwo);
+            # what follows is the Scope assay's post-offset wait, not a second one of those.
+            mx.offset()
+            time.sleep(mx.Timing.waitAfterOffset)
 
-            # 2. Record and save data from all wells
+            # 3. Record and save data from all wells
             on_progress(f"  Recording {params.rec_length_sec} s...")
             s.start_recording(params.wells)
             time.sleep(params.rec_length_sec)

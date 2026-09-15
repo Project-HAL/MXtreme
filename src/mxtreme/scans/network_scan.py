@@ -455,8 +455,9 @@ def run_network_scan(
     Path(params.save_path).mkdir(parents=True, exist_ok=True)
 
     on_progress("Initializing chip...")
-    mx.initialize()
-    time.sleep(mx.Timing.waitInit)
+    with mx_setup.stream_blanked(mx.Timing.waitInit):
+        mx.initialize()
+        time.sleep(mx.Timing.waitInit)
 
     # Route first, then open the file: a routing failure then leaves no empty .h5 behind. init_well
     # selects, routes and downloads one well; with no stimulation electrodes it neither connects nor
@@ -473,8 +474,8 @@ def run_network_scan(
     mx.activate(params.wells)  # init_well activates one well at a time; record them together
 
     on_progress("Running offset compensation...")
-    mx.offset()
-    time.sleep(mx.Timing.waitInMX2Offset)
+    mx.offset()  # sleeps the system-specific settle time itself (5 s MaxOne, 15 s MaxTwo)
+    time.sleep(mx.Timing.waitAfterOffset)  # then the Scope assay's post-offset wait
 
     s = mx.Saving()
     s.open_directory(params.save_path)

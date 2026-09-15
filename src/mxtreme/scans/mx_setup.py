@@ -6,6 +6,7 @@ import os
 import datetime
 import re # regular expressions
 import shutil
+from contextlib import contextmanager
 from typing import List
 import sys
 import time
@@ -24,6 +25,30 @@ import mxtreme.scans.mx_config as cfg
 from mxtreme import device
 
 phase_event_id = 200
+
+
+@contextmanager
+def stream_blanked(seconds: float):
+    """Mute the server's data stream around a step that slams every amplifier at once.
+
+    ``stream_blanking_on <seconds>`` / ``stream_blanking_off`` are server commands the ``maxlab``
+    package does not wrap. MaxLab Live's own Activity Scan assay sends them (through
+    ``maxlab.send_raw``) around ``system_initialize`` and around every ``mea_array_download``, and
+    then sleeps for the same number of seconds before lifting the blank. Downloading a configuration
+    rewires ~1000 amplifiers to new electrodes in one go, and the settling transient otherwise
+    crosses the spike threshold on every channel -- the "burst" seen on the live view at each
+    configuration change. Nothing is being recorded while the blank is on (both scans start
+    recording well after it ends), so this changes what the spike detector and Scope see, not the
+    file.
+
+    :param seconds: How long the server mutes the stream. Match it to the settling sleep performed
+        inside the block, exactly as the Scope assay does.
+    """
+    mx.send_raw(f"stream_blanking_on {seconds}")
+    try:
+        yield
+    finally:
+        mx.send_raw("stream_blanking_off")
 
 def get_system_type():
     """
@@ -265,8 +290,9 @@ def init_well(well: int, rec_elecs: List[int] | str, stim_elecs: List[int], conn
     else:
         stimulation_units = None
     
-    array.download([well])
-    time.sleep(mx.Timing.waitAfterDownload)
+    with stream_blanked(mx.Timing.waitAfterDownload):
+        array.download([well])
+        time.sleep(mx.Timing.waitAfterDownload)
 
     if power_up:
         power_up_stim_units(stimulation_units, dac=dac_source)
