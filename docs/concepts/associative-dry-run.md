@@ -166,8 +166,15 @@ Calibration is the step most likely to fail, so watch it:
   `--centers`, or widen `inner_gap`. Electrodes given up this way are not recorded for the whole
   run (the routing is fixed once per run); the stimulation electrodes that displaced them are, and
   count towards their region's readout whenever that region is not the one being pulsed;
-- each driven block has to land on **distinct** stimulation units. If `init_well_regions` raises
-  about two electrodes sharing a unit, raise `inner_gap` in `$P` and re-run;
+- each stimulation electrode needs a stimulation unit of its **own**, and a unit is a fixed
+  function of the readout channel the router happens to give an electrode, so which electrodes
+  clash cannot be known in advance. When two clash, `run` tries the later one's routed
+  neighbours on the spot (connect, query, disconnect if taken), and only routes again -- with the
+  clashing electrodes' neighbourhoods routed as candidates -- when none is free. It prints each
+  substitution and, once done, every electrode's `channel -> unit`; the protocol in the
+  recording carries the electrodes actually driven. If it gives up after 8 routings, spread the
+  site out: `inner_gap` and `return_radius` live in `$P` under `stim_site`, or on the command
+  line as one value, e.g. `--set 'stim_site={"shape":"focal","inner":2,"inner_gap":6,"return_radius":8,"return_points":"corners"}'`;
 - `run` reports whether the protocol went into the recording. If it says it did not, the copy in
   `$DRY` is what `report` needs (`--protocol`).
 

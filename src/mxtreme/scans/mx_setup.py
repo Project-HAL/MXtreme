@@ -270,13 +270,15 @@ def init_well(well: int, rec_elecs: List[int] | str, stim_elecs: List[int], conn
     return array, stimulation_units
 
 
-def _select_and_route(array, rec_elecs: List[int], stim_elecs: List[int]) -> set:
-    """Select, route, and return the set of electrodes the router actually kept."""
+def _select_and_route(array, rec_elecs: List[int], stim_elecs: List[int], extra: List[int] = ()) -> set:
+    """Select, route, and return the set of electrodes the router actually kept. ``extra`` are
+    routed with stimulation priority too but nothing is promised for them: candidate
+    replacements, so that a clash can be tried against them without another routing."""
     array.clear_selected_electrodes()
-    stim = set(stim_elecs)
+    stim = set(stim_elecs) | set(extra)
     array.select_electrodes([e for e in rec_elecs if e not in stim])
-    if stim_elecs:
-        array.select_stimulation_electrodes(list(stim_elecs))
+    if stim:
+        array.select_stimulation_electrodes(list(dict.fromkeys(list(stim_elecs) + list(extra))))
     reply = array.route()
     if "ERROR" in str(reply).upper():
         raise RuntimeError(
@@ -286,7 +288,9 @@ def _select_and_route(array, rec_elecs: List[int], stim_elecs: List[int]) -> set
     return {m.electrode for m in array.get_config().mappings}
 
 
-def route_with_stimulation(array, rec_elecs: List[int], stim_elecs: List[int], retries=(2, 4, 6)) -> set:
+def route_with_stimulation(
+    array, rec_elecs: List[int], stim_elecs: List[int], retries=(2, 4, 6), extra: List[int] = ()
+) -> set:
     """Route recording and stimulation electrodes so that every stimulation electrode is routed.
 
     ``Array.route`` gives stimulation electrodes priority but does not promise them a channel:
@@ -302,7 +306,7 @@ def route_with_stimulation(array, rec_elecs: List[int], stim_elecs: List[int], r
     :returns: The set of routed electrodes.
     """
     rec = list(dict.fromkeys(rec_elecs))
-    routed = _select_and_route(array, rec, stim_elecs)
+    routed = _select_and_route(array, rec, stim_elecs, extra)
     missing = [e for e in stim_elecs if e not in routed]
     dropped_total = 0
     for radius in retries:
@@ -323,7 +327,7 @@ def route_with_stimulation(array, rec_elecs: List[int], stim_elecs: List[int], r
             f"routing left stimulation electrode(s) {missing} unrouted; giving up {len(near)} recording "
             f"electrode(s) within {radius} of them and routing again"
         )
-        routed = _select_and_route(array, rec, stim_elecs)
+        routed = _select_and_route(array, rec, stim_elecs, extra)
         missing = [e for e in stim_elecs if e not in routed]
     if missing:
         where = ", ".join(f"{e} at ({(e % 220) * 17.5:.0f}, {(e // 220) * 17.5:.0f}) um" for e in missing)
@@ -362,17 +366,157 @@ def connect_stim_units_to_stim_electrodes(stim_electrodes: List[int], array: mx.
         array.connect_electrode_to_stimulation(stim_el)
         stim = array.query_stimulation_at_electrode(stim_el)
         if len(stim) == 0:
-            raise RuntimeError(
-                f"No stimulation channel can connect to electrode: {str(stim_el)}"
+            raise StimulationUnreachable(
+                stim_el, f"No stimulation channel can connect to electrode: {str(stim_el)}"
             )
         stim_unit_int = int(stim)
         if stim_unit_int in stim_units:
-            raise RuntimeError(
-                f"Two electrodes connected to the same stim unit. This is not allowed. Please Select a neighboring electrode of {stim_el}!"
+            raise StimulationUnitClash(
+                stim_el,
+                f"Two electrodes connected to the same stim unit. This is not allowed. Please Select a neighboring electrode of {stim_el}!",
             )
         else:
             stim_units.append(stim_unit_int)
     return stim_units
+
+
+class StimulationUnreachable(RuntimeError):
+    """A routed electrode that no stimulation unit can reach."""
+
+    def __init__(self, electrode: int, message: str):
+        super().__init__(message)
+        self.electrode = electrode
+
+
+class StimulationUnitClash(RuntimeError):
+    """An electrode whose only stimulation unit is already taken by an earlier electrode."""
+
+    def __init__(self, electrode: int, message: str):
+        super().__init__(message)
+        self.electrode = electrode
+
+
+def _neighbours(electrode: int, taken: set, others: List[int] = (), max_distance: int = 3) -> List[int]:
+    """Electrodes around one, nearest first, that are on the array and not already in use.
+
+    Among equally near candidates, the one furthest from the other stimulation electrodes
+    (``others``) comes first, so a swap keeps a block's spacing rather than closing it up; then
+    same row, then same column, then the corners.
+    """
+    col, row = electrode % 220, electrode // 220
+    far = [(o % 220, o // 220) for o in others if o != electrode]
+
+    def clearance(c, r):
+        return min((max(abs(c - oc), abs(r - orow)) for oc, orow in far), default=0)
+
+    out = []
+    for d in range(1, max_distance + 1):
+        ring = [
+            (c, r)
+            for r in range(row - d, row + d + 1)
+            for c in range(col - d, col + d + 1)
+            if max(abs(c - col), abs(r - row)) == d and 0 <= c < 220 and 0 <= r < 120
+        ]
+        ring.sort(key=lambda cr: (-clearance(*cr), cr[1] != row and cr[0] != col, abs(cr[1] - row), abs(cr[0] - col)))
+        out += [r * 220 + c for c, r in ring if r * 220 + c not in taken]
+    return out
+
+
+def _connect_with_alternatives(array, stim: List[int], routed: set, avoid: set):
+    """Connect each stimulation electrode to a unit, and where its unit is already taken try its
+    routed neighbours in turn, disconnecting each that lands on a taken unit. Needs no routing.
+
+    :returns: ``(units, electrodes used, electrodes that found nothing, {electrode: (channel, unit)})``.
+    """
+    channel_of = {m.electrode: m.channel for m in array.get_config().mappings}
+    units, used, failed, table = [], [], [], {}
+    for e in stim:
+        candidates = [e] + [n for n in _neighbours(e, avoid | set(used) | set(stim), stim) if n in routed]
+        chosen = None
+        for c in candidates:
+            array.connect_electrode_to_stimulation(c)
+            q = array.query_stimulation_at_electrode(c)
+            if len(q) == 0:
+                continue
+            u = int(q)
+            table[c] = (channel_of.get(c), u)
+            if u in units:
+                array.disconnect_electrode_from_stimulation(c)
+                continue
+            chosen = (c, u)
+            break
+        if chosen is None:
+            failed.append(e)
+            used.append(e)
+            continue
+        c, u = chosen
+        if c != e:
+            print(
+                f"stimulation electrode {e} shares its unit with an earlier one; connected neighbour {c} "
+                f"({(c % 220 - e % 220):+d} col, {(c // 220 - e // 220):+d} row) instead, unit {u}"
+            )
+        units.append(u)
+        used.append(c)
+    return units, used, failed, table
+
+
+def init_well_stim(well: int, rec_elecs: List[int] | str, stim_elecs: List[int], max_attempts: int = 8):
+    """Like :func:`init_well` with ``connect=True, power_up=False``, but every stimulation electrode
+    ends up on a stimulation unit of its own, by substituting neighbours where the chip demands it.
+
+    A stimulation unit is a fixed function of the readout channel the router gives an electrode
+    (maxlab: ``readoutToStim(getReadoutCh(...))``), so which electrodes clash is decided by the
+    routing and cannot be known in advance. When two clash, the later electrode's routed
+    neighbours are tried on the spot -- connect, query, disconnect if taken -- which needs no
+    routing; only when none of them is free is the array routed again, with the clashing
+    electrodes' neighbourhoods (up to three pitches) routed as candidates, and the connecting
+    tried again. The electrodes actually connected are returned, and every (electrode, channel,
+    unit) seen is printed, so the chip's channel-to-unit rule can be read off a dry run.
+
+    :returns: ``(array, stimulation units, stimulation electrodes actually used)``, the last two
+        in the order of ``stim_elecs``.
+    :raises RuntimeError: If no clash-free set is found within ``max_attempts`` routings.
+    """
+    mx.activate([well])
+    array = mx.Array(f"stimulation{well}", persistent=False)
+    array.close()
+    array = mx.Array(f"stimulation{well}", persistent=True)
+    array.reset()
+    array.clear_selected_electrodes()
+    elec_nums = cfg.read_config_elecs(rec_elecs) if isinstance(rec_elecs, str) else list(rec_elecs)
+
+    stim = list(stim_elecs)
+    extra: List[int] = []
+    seen: dict = {}
+    for attempt in range(max_attempts):
+        routed = route_with_stimulation(array, elec_nums, stim, extra=extra)
+        units, used, failed, table = _connect_with_alternatives(array, stim, routed, set(stim_elecs))
+        seen.update(table)
+        if not failed:
+            stim = used
+            break
+        widen = 1 + attempt
+        for e in failed:
+            extra += [n for n in _neighbours(e, set(stim) | set(extra), stim, max_distance=min(3, widen)) if n not in extra]
+        print(
+            f"no free stimulation unit among the routed neighbours of {failed}; routing again with "
+            f"{len(extra)} candidate electrode(s) around them (attempt {attempt + 1} of {max_attempts})"
+        )
+    else:
+        rows = ", ".join(f"e{e}: ch {ch} -> unit {u}" for e, (ch, u) in sorted(seen.items()))
+        raise RuntimeError(
+            f"no clash-free set of stimulation electrodes found in {max_attempts} routings; last tried {stim}. "
+            f"Widen inner_gap or return_radius so the site's electrodes are further apart, or move the site. "
+            f"Channel-to-unit pairs seen: {rows}"
+        )
+    print("stimulation electrodes connected (electrode: channel -> unit): " + ", ".join(
+        f"e{e}: {seen[e][0]} -> {seen[e][1]}" for e in stim if e in seen
+    ))
+
+    array.download([well])
+    time.sleep(mx.Timing.waitAfterDownload)
+    return array, units, stim
+
 
 def power_up_stim_units(stimulation_units: List[int], dac=0):
     """Powers up stimulation units for an experiment

@@ -151,9 +151,14 @@ def init_well_regions(well: int, rec_elecs, groups: dict[str, list[int]]):
     :param well: Well number.
     :param rec_elecs: Recording electrodes, as a list or a ``.cfg`` path.
     :param groups: ``{name: [electrodes]}``, e.g. ``{"US_drive": [...], "US_return": [...]}``.
-    :raises RuntimeError: If an electrode is in two groups, or routing cannot give every
-        stimulation electrode its own unit (then try a sparser site).
-    :returns: The ``mx.Array``, and ``{name: [stimulation units]}`` in electrode order.
+    Where two stimulation electrodes would need the same stimulation unit, the later one is
+    swapped for a neighbour (see :func:`mxtreme.scans.mx_setup.init_well_stim`), so the
+    electrodes actually connected are returned alongside the units and may differ from
+    ``groups`` by a pitch or two.
+
+    :raises RuntimeError: If an electrode is in two groups, or no clash-free set can be found.
+    :returns: The ``mx.Array``, ``{name: [stimulation units]}`` and ``{name: [electrodes used]}``,
+        both in the order of ``groups``.
     """
     from mxtreme.scans import mx_setup
 
@@ -161,13 +166,14 @@ def init_well_regions(well: int, rec_elecs, groups: dict[str, list[int]]):
     if len(all_stim) != len(set(all_stim)):
         raise RuntimeError("a stimulation electrode is in more than one group")
 
-    array, units = mx_setup.init_well(well, rec_elecs, all_stim, connect=True, power_up=False)
+    array, units, used = mx_setup.init_well_stim(well, rec_elecs, all_stim)
 
-    per_group, i = {}, 0
+    per_group, per_group_electrodes, i = {}, {}, 0
     for name, elecs in groups.items():
         per_group[name] = list(units[i : i + len(elecs)])
+        per_group_electrodes[name] = list(used[i : i + len(elecs)])
         i += len(elecs)
-    return array, per_group
+    return array, per_group, per_group_electrodes
 
 
 def mark(well: int, text: str) -> None:

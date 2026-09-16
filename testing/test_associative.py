@@ -618,7 +618,18 @@ def test_a_session_run_sets_the_rig_up_once_and_opens_one_recording_per_phase(mo
             mock.patch("mxtreme.experiments.associative.run.check_device", return_value="MaxOne"),
             mock.patch(
                 "mxtreme.stimulation.sequences.init_well_regions",
-                return_value=(types.SimpleNamespace(get_config=lambda: cfg), units),
+                return_value=(
+                    types.SimpleNamespace(get_config=lambda: cfg),
+                    units,
+                    {
+                        k: [
+                            protocol.stim_site(p.regions[k.split("_")[0]], p.stim_site)[
+                                0 if k.endswith("drive") else 1
+                            ][0]
+                        ]
+                        for k in units
+                    },
+                ),
             ),
             mock.patch(
                 "mxtreme.stimulation.sequences.build_region_sequence",
@@ -714,6 +725,96 @@ def test_routing_gives_up_recording_electrodes_to_route_every_stimulation_electr
 
         with pytest.raises(RuntimeError, match="routing failed"):
             route_with_stimulation(Broken(), far, stim)
+    finally:
+        for name in set(sys.modules) - before:
+            sys.modules.pop(name, None)
+
+
+def test_a_stimulation_unit_clash_is_solved_by_a_neighbouring_electrode(monkeypatch):
+    """A fake chip on which two electrodes of the block map to the same stimulation unit."""
+    import types
+    from unittest import mock
+
+    before = set(sys.modules)
+    for name in (
+        "maxlab",
+        "maxlab.saving",
+        "maxlab.system",
+        "maxlab.chip",
+        "maxlab.util",
+        "maxlab.characterize",
+    ):
+        monkeypatch.setitem(sys.modules, name, mock.MagicMock())
+    try:
+        from mxtreme.scans import mx_setup
+
+        def unit_of(e):
+            return 7 if e in (3853, 3858) else e % 32  # 3853 and 3858 clash
+
+        log = {"routes": 0, "downloads": 0}
+
+        class Array:
+            def __init__(self, token, persistent=False):
+                self.connected = []
+
+            def close(self):
+                pass
+
+            def reset(self):
+                pass
+
+            def clear_selected_electrodes(self):
+                self.selected = set()
+
+            def select_electrodes(self, elecs, weight=1):
+                self.selected |= set(elecs)
+
+            def select_stimulation_electrodes(self, elecs):
+                self.selected |= set(elecs)
+
+            def route(self):
+                log["routes"] += 1
+                self.connected = []
+                return "OK"
+
+            def get_config(self):
+                return types.SimpleNamespace(
+                    mappings=[types.SimpleNamespace(electrode=e, channel=e % 1024) for e in self.selected]
+                )
+
+            def connect_electrode_to_stimulation(self, e):
+                self.connected.append(e)
+
+            def disconnect_electrode_from_stimulation(self, e):
+                self.connected.remove(e)
+
+            def query_stimulation_at_electrode(self, e):
+                return str(unit_of(e))
+
+            def download(self, wells):
+                log["downloads"] += 1
+
+        fake_mx = types.SimpleNamespace(
+            Array=Array,
+            activate=lambda w: None,
+            Timing=types.SimpleNamespace(waitAfterDownload=0),
+        )
+        monkeypatch.setattr(mx_setup, "mx", fake_mx)
+        monkeypatch.setattr(mx_setup.time, "sleep", lambda s: None)
+
+        block = [3853, 3858, 4953, 4958]
+        _array, units, used = mx_setup.init_well_stim(0, [100, 200, 300], block)
+        assert used[0] == 3853 and used[2:] == [4953, 4958]
+        moved = used[1]
+        assert max(abs(moved % 220 - 3858 % 220), abs(moved // 220 - 3858 // 220)) == 1  # one pitch away
+        # ... and the neighbour that keeps the block's spacing: no closer than 5 pitches to the rest.
+        rest = [3853, 4953, 4958]
+        assert min(max(abs(moved % 220 - o % 220), abs(moved // 220 - o // 220)) for o in rest) >= 5
+        assert len(set(units)) == 4
+        # Routed once, the clash found no routed neighbour, routed once more with candidates, then
+        # the neighbour was connected without a third routing; downloaded once.
+        assert log["routes"] == 2 and log["downloads"] == 1
+        assert sorted(_array.connected) == sorted(used)  # nothing left connected on a taken unit
     finally:
         for name in set(sys.modules) - before:
             sys.modules.pop(name, None)

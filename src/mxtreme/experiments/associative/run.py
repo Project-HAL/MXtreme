@@ -274,9 +274,21 @@ def run(
         groups[f"{role}_drive"] = spec.drive_electrodes
         if spec.return_electrodes:
             groups[f"{role}_return"] = spec.return_electrodes
-    array, units = sequences.init_well_regions(well, list(params.rec_electrodes), groups)
+    array, units, used = sequences.init_well_regions(well, list(params.rec_electrodes), groups)
     routed = array.get_config()
     on_progress(f"routed {len(routed.get_channels())} channels")
+    # A stimulation electrode may have been swapped for a neighbour to get its own unit; the
+    # regions, and so the protocol written into every recording, say what was actually driven.
+    for role, spec in regions.items():
+        for kind in ("drive", "return"):
+            before, after = list(getattr(spec, f"{kind}_electrodes")), used.get(f"{role}_{kind}", [])
+            if after and after != before:
+                setattr(spec, f"{kind}_electrodes", list(after))
+                swapped = [(a, b) for a, b in zip(before, after) if a != b]
+                on_progress(
+                    f"  {role} {kind} electrodes adjusted for stimulation units: "
+                    + ", ".join(f"{a} -> {b}" for a, b in swapped)
+                )
 
     from mxtreme.stimulation.timeline import RegionUnits
 
