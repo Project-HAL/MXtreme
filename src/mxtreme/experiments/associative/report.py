@@ -149,14 +149,26 @@ def _trace(data, channel, frame, before, after):
 
 def readout(data, record, well) -> list[dict]:
     """One row per presentation fired: block, token, frame, and per region the count in each
-    response window and the pulse-locked count."""
+    response window and the pulse-locked count.
+
+    A region's count is over its recording electrodes plus, when the region is not the one being
+    pulsed, its stimulation electrodes (which record between pulses and sit on its liveliest
+    spots)."""
     fps = data["fps"]
     spikes = data["spikes"]
     frames = spikes["frameno"].astype(np.int64)
     elec_of_chan = {int(m["channel"]): int(m["electrode"]) for m in data["mapping"]}
     spike_elec = np.array([elec_of_chan.get(int(c), -1) for c in spikes["channel"]])
+    # A region's stimulation electrodes are routed to amplifiers like any other and record between
+    # pulses -- and they sit on the region's liveliest spots, since select placed them there. They
+    # count towards the region's readout whenever the region is not the one being pulsed; during
+    # its own pulses they carry the artifact, so only the recording electrodes count then.
     members = {
         role: np.isin(spike_elec, np.asarray(r["rec_electrodes"])) for role, r in record["regions"].items()
+    }
+    members_quiet = {
+        role: np.isin(spike_elec, np.asarray(list(r["rec_electrodes"]) + list(r.get("stim_electrodes", []))))
+        for role, r in record["regions"].items()
     }
     windows = {
         k: (int(a / 1000 * fps), int(b / 1000 * fps)) for k, (a, b) in record["response_windows_ms"].items()
@@ -191,7 +203,9 @@ def readout(data, record, well) -> list[dict]:
             "frame": frame,
             "sec": None,
         }
-        for role, member in members.items():
+        pulsed = set(protocol.roles_in(token))
+        for role, member_rec in members.items():
+            member = member_rec if role in pulsed else members_quiet[role]
             for label, (a, b) in windows.items():
                 row[f"{role}_{label}"] = count(member, frame + a, frame + b)
             total = 0

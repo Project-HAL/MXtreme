@@ -321,30 +321,33 @@ def run(
 
     # --- one recording per phase ---
     results: list[RunResult] = []
-    for k, p in enumerate(per_phase):
-        if len(per_phase) > 1:
-            on_progress(f"\n=== {p.phase} ({k + 1} of {len(per_phase)}) ===")
-        blocks, mine = schedules[p.phase]
-        result = _record_phase(
-            p,
-            blocks,
-            mine,
-            regions,
-            units,
-            routed,
-            mx,
-            mx_setup,
-            fire,
-            mark,
-            registry_path,
-            work,
-            on_progress,
-            should_stop,
-        )
-        results.append(result)
-        if result.stopped_early:
-            on_progress(f"stopped during {p.phase}; {len(per_phase) - k - 1} phase(s) not recorded")
-            break
+    try:
+        for k, p in enumerate(per_phase):
+            if len(per_phase) > 1:
+                on_progress(f"\n=== {p.phase} ({k + 1} of {len(per_phase)}) ===")
+            blocks, mine = schedules[p.phase]
+            result = _record_phase(
+                p,
+                blocks,
+                mine,
+                regions,
+                units,
+                routed,
+                mx,
+                mx_setup,
+                fire,
+                mark,
+                registry_path,
+                work,
+                on_progress,
+                should_stop,
+            )
+            results.append(result)
+            if result.stopped_early:
+                on_progress(f"stopped during {p.phase}; {len(per_phase) - k - 1} phase(s) not recorded")
+                break
+    finally:
+        release(mx, well, list(registered))
     results[-1].phases = results
     if len(results) > 1:
         on_progress(
@@ -354,6 +357,26 @@ def run(
             + " ".join(str(r.h5_path) for r in results)
         )
     return results[-1]
+
+
+def release(mx, well: int, tokens) -> None:
+    """Delete this run's objects from the MaxLab server: the array ``init_well`` made and every
+    sequence that was built.
+
+    Both are created ``persistent=True`` so they outlive the Python objects, which a run needs
+    while it fires them -- but nothing deletes them afterwards, and an ``Array`` on the server
+    costs seconds to create and real memory to keep. Left behind, one accumulates per session.
+    Deleting is the ``close`` of a non-persistent object with the same token.
+    """
+    for token in tokens:
+        try:
+            mx.Sequence(f"{token}_{well}", persistent=False).close()
+        except Exception as e:  # noqa: BLE001 -- clean-up; the recording is already safe
+            print(f"could not delete sequence {token}_{well}: {e}")
+    try:
+        mx.Array(f"stimulation{well}", persistent=False).close()
+    except Exception as e:  # noqa: BLE001
+        print(f"could not delete array stimulation{well}: {e}")
 
 
 def _record_phase(

@@ -191,22 +191,29 @@ def place_site(centre_um, site: dict, activity: dict, max_shift_um: float = 70.0
     }
 
 
-def _experiment_routing(pool, roles, radius, scan_data, budget):
+#: Electrodes a run asks the router for, recording and stimulation together. MaxLab's own limit is
+#: 1020, and it says routing "will not converge well" near it; 1000 leaves it room.
+ROUTING_BUDGET = 1000
+
+
+def _experiment_routing(pool, roles, radius, scan_data, budget, stim_electrodes=()):
     """Recording electrodes for the experiment: the chosen regions' electrodes first -- the
     baseline's, plus the activity scan's active ones when given -- then the rest of the baseline's
-    set, cut to the routing budget.
+    set, cut to the routing budget. The stimulation electrodes are routed on their own account
+    and left out of the recording set, so they never count twice.
 
     :returns: ``(electrodes, {role: electrodes inside it})``.
     """
+    stim = set(stim_electrodes)
     region_sets = {}
     for role, centre in roles.items():
         inside = set(protocol.within(pool, centre, radius))
         if scan_data is not None:
             active = scan_data["active_electrodes"]["electrode"].unique().tolist()
             inside |= set(protocol.within(active, centre, radius))
-        region_sets[role] = sorted(inside)
+        region_sets[role] = sorted(inside - stim)
     first = [e for role in ROLES for e in region_sets[role]]
-    rest = [e for e in pool if e not in set(first)]
+    rest = [e for e in pool if e not in set(first) and e not in stim]
     ordered = list(dict.fromkeys(first + rest))
     return sorted(ordered[:budget]), region_sets
 
@@ -443,13 +450,15 @@ def select(
         )
 
     # --- 5: the experiment's routing ---
-    stim_units = protocol.site_footprint(params.stim_site)["units"] * len(ROLES)
-    budget = 1020 - stim_units
+    sites = protocol.regions_for(replace(params, regions={r: list(c) for r, c in roles.items()}), [])
+    stim_electrodes = [e for spec in sites.values() for e in spec.stim_electrodes]
+    stim_units = len(stim_electrodes)
+    budget = ROUTING_BUDGET - stim_units
     if pool is None:
         every = list(range(protocol.NUM_ELECTRODES))
         near = sorted({e for c in roles.values() for e in protocol.within(every, c, radius)})
         pool = near + _lattice(set(near), budget - len(near))
-    rec_electrodes, region_sets = _experiment_routing(pool, roles, radius, scan_data, budget)
+    rec_electrodes, region_sets = _experiment_routing(pool, roles, radius, scan_data, budget, stim_electrodes)
     on_progress(
         f"experiment routing: {len(rec_electrodes)} electrodes plus {stim_units} stimulation; in the regions "
         + ", ".join(f"{r} {len(v)}" for r, v in region_sets.items())

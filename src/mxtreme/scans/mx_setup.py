@@ -254,11 +254,7 @@ def init_well(well: int, rec_elecs: List[int] | str, stim_elecs: List[int], conn
     else:
         elec_nums = rec_elecs
     
-    array.select_electrodes(stim_elecs + elec_nums)
-    
-    array.select_stimulation_electrodes(stim_elecs)
-    
-    array.route()
+    route_with_stimulation(array, elec_nums, stim_elecs)
 
     if connect:
         stimulation_units = connect_stim_units_to_stim_electrodes(stim_elecs, array)
@@ -272,6 +268,79 @@ def init_well(well: int, rec_elecs: List[int] | str, stim_elecs: List[int], conn
         power_up_stim_units(stimulation_units, dac=dac_source)
 
     return array, stimulation_units
+
+
+def _select_and_route(array, rec_elecs: List[int], stim_elecs: List[int]) -> set:
+    """Select, route, and return the set of electrodes the router actually kept."""
+    array.clear_selected_electrodes()
+    stim = set(stim_elecs)
+    array.select_electrodes([e for e in rec_elecs if e not in stim])
+    if stim_elecs:
+        array.select_stimulation_electrodes(list(stim_elecs))
+    reply = array.route()
+    if "ERROR" in str(reply).upper():
+        raise RuntimeError(
+            f"routing failed ({reply!r}) for {len(set(rec_elecs) | stim)} electrodes; MaxLab asks for "
+            f"at most 1020, and dense selections can fail below that. Ask for fewer."
+        )
+    return {m.electrode for m in array.get_config().mappings}
+
+
+def route_with_stimulation(array, rec_elecs: List[int], stim_elecs: List[int], retries=(2, 4, 6)) -> set:
+    """Route recording and stimulation electrodes so that every stimulation electrode is routed.
+
+    ``Array.route`` gives stimulation electrodes priority but does not promise them a channel:
+    where the switch matrix is crowded it drops some of what was asked for, silently, and a
+    stimulation electrode it dropped cannot be connected to a stimulation unit afterwards
+    (``connect_electrode_to_stimulation`` needs it "already routed to an amplifier"). So the
+    routing is checked, and when a stimulation electrode is missing the recording electrodes
+    competing with it -- those within ``retries[k]`` electrodes of it, in column and row -- are
+    given up and the routing tried again, widening each time.
+
+    :raises RuntimeError: If routing reports an error, or a stimulation electrode cannot be routed
+        even with its neighbourhood cleared. The message names the electrodes and their positions.
+    :returns: The set of routed electrodes.
+    """
+    rec = list(dict.fromkeys(rec_elecs))
+    routed = _select_and_route(array, rec, stim_elecs)
+    missing = [e for e in stim_elecs if e not in routed]
+    dropped_total = 0
+    for radius in retries:
+        if not missing:
+            break
+        near = set()
+        for e in missing:
+            col, row = e % 220, e // 220
+            near |= {
+                r for r in rec
+                if abs(r % 220 - col) <= radius and abs(r // 220 - row) <= radius
+            }
+        if not near:
+            break
+        rec = [r for r in rec if r not in near]
+        dropped_total += len(near)
+        print(
+            f"routing left stimulation electrode(s) {missing} unrouted; giving up {len(near)} recording "
+            f"electrode(s) within {radius} of them and routing again"
+        )
+        routed = _select_and_route(array, rec, stim_elecs)
+        missing = [e for e in stim_elecs if e not in routed]
+    if missing:
+        where = ", ".join(f"{e} at ({(e % 220) * 17.5:.0f}, {(e // 220) * 17.5:.0f}) um" for e in missing)
+        raise RuntimeError(
+            f"stimulation electrode(s) could not be routed even with nearby recording electrodes "
+            f"cleared: {where}. Move that site (select --centers), or widen inner_gap so its "
+            f"electrodes are further apart."
+        )
+    lost = [e for e in rec_elecs if e not in routed and e not in set(stim_elecs)]
+    if lost or dropped_total:
+        print(
+            f"routed {len(routed)} of {len(set(rec_elecs) | set(stim_elecs))} electrodes asked for: "
+            f"{len(lost) + dropped_total} recording electrode(s) not routed"
+            + (f", {dropped_total} of them given up to route the stimulation electrodes" if dropped_total else "")
+            + ("; every stimulation electrode is routed" if stim_elecs else "")
+        )
+    return routed
 
 
 #TODO: move this to an Array class.

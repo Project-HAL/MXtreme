@@ -102,8 +102,9 @@ def test_select_chooses_from_the_baseline_and_writes_outside_the_store(tmp_path)
     # The three regions land on the three patches the baseline was built with.
     for centre in chosen.regions.values():
         assert min(protocol.separation_um(centre, c) for c in CENTRES) < 150
-    # Routing: every baseline electrode fits here, so all of them are kept.
-    assert set(chosen.rec_electrodes) == set(electrodes)
+    # Routing: every baseline electrode fits here, so all of them are kept -- except the ones the
+    # stimulation sites landed on, which are routed as stimulation electrodes instead.
+    assert set(chosen.rec_electrodes) == set(electrodes) - _stim(chosen)
     written = sorted(p.name for p in out.iterdir())
     assert any(n.endswith("_coupling.png") for n in written)
     assert any(n.endswith("_regions.json") for n in written)
@@ -137,7 +138,12 @@ def test_select_adds_the_scans_active_electrodes_inside_the_chosen_regions(tmp_p
         candidates=3,
         on_progress=lambda _: None,
     )
-    assert set(extra) <= set(chosen.rec_electrodes)
+    assert set(extra) - _stim(chosen) <= set(chosen.rec_electrodes)
+    assert not _stim(chosen) & set(chosen.rec_electrodes)
+
+
+def _stim(params):
+    return {e for spec in protocol.regions_for(params).values() for e in spec.stim_electrodes}
 
 
 def test_select_places_regions_by_hand_on_a_silent_baseline(tmp_path):
@@ -153,7 +159,9 @@ def test_select_places_regions_by_hand_on_a_silent_baseline(tmp_path):
         centers=";".join(f"{x},{y}" for x, y in CENTRES),
         on_progress=lambda _: None,
     )
-    assert set(chosen.rec_electrodes) == set(electrodes)  # the silent baseline supplied the routing
+    assert set(chosen.rec_electrodes) == set(electrodes) - _stim(
+        chosen
+    )  # the silent baseline supplied the routing
 
 
 def test_select_leaves_room_for_the_stimulation_electrodes(tmp_path):
@@ -161,9 +169,11 @@ def test_select_leaves_room_for_the_stimulation_electrodes(tmp_path):
 
     pool = list(range(0, protocol.NUM_ELECTRODES, 20))[:1020]
     roles = {"US": CENTRES[0], "CS": CENTRES[1], "NS": CENTRES[2]}
-    rec, regions = _experiment_routing(pool, roles, 150.0, None, 1020 - 24)
-    assert len(rec) == 1020 - 24
+    stim = pool[:5] + [protocol.within(pool, CENTRES[0], 150.0)[0]]  # some of the pool is stimulation
+    rec, regions = _experiment_routing(pool, roles, 150.0, None, 1000 - 24, stim)
+    assert len(rec) == 1000 - 24
     assert all(set(v) <= set(rec) for v in regions.values())  # the regions survive the cut
+    assert not set(stim) & set(rec)  # stimulation electrodes are routed on their own, never twice
 
 
 def test_raw_channels_follow_raw_traces():

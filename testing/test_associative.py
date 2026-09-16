@@ -584,10 +584,22 @@ def test_a_session_run_sets_the_rig_up_once_and_opens_one_recording_per_phase(mo
             def enable_stimulation_power(self, b):
                 return "cmd"
 
+        deleted = []
+
+        class ServerObject:
+            def __init__(self, token, persistent=False):
+                self.token, self.persistent = token, persistent
+
+            def close(self):
+                if not self.persistent:
+                    deleted.append(self.token)
+
         mx = types.SimpleNamespace(
             Saving=Saving,
             Timing=Timing,
             Core=Core,
+            Array=ServerObject,
+            Sequence=ServerObject,
             initialize=lambda: inits.append(1),
             send=lambda c: "Ok",
             clear_events=lambda: None,
@@ -625,6 +637,8 @@ def test_a_session_run_sets_the_rig_up_once_and_opens_one_recording_per_phase(mo
         assert inits == [1]  # the chip once
         assert [n.rsplit("_t_", 1)[1] for n in opened] == ["baseline", "encode_1", "encode_2", "retrieval"]
         assert closed == [1, 2, 3, 4]  # each file closed before the next opens
+        # Nothing of the run is left on the server afterwards: the array and every sequence.
+        assert "stimulation0" in deleted and any(t.startswith("probe_cs_") for t in deleted)
         assert [r.h5_path.name.rsplit("_t_", 1)[1] for r in result.phases] == [
             "baseline.raw.h5",
             "encode_1.raw.h5",
@@ -633,5 +647,73 @@ def test_a_session_run_sets_the_rig_up_once_and_opens_one_recording_per_phase(mo
         ]
     finally:
         # Modules imported under the fake maxlab must not outlive this test.
+        for name in set(sys.modules) - before:
+            sys.modules.pop(name, None)
+
+
+def test_routing_gives_up_recording_electrodes_to_route_every_stimulation_electrode(monkeypatch):
+    """A fake router that refuses a stimulation electrode until its crowded neighbourhood clears."""
+    import types
+    from unittest import mock
+
+    before = set(sys.modules)
+    for name in (
+        "maxlab",
+        "maxlab.saving",
+        "maxlab.system",
+        "maxlab.chip",
+        "maxlab.util",
+        "maxlab.characterize",
+    ):
+        monkeypatch.setitem(sys.modules, name, mock.MagicMock())
+    try:
+        from mxtreme.scans.mx_setup import route_with_stimulation
+
+        stim = [3858]
+        crowd = [3858 + d for d in (-221, -220, -219, -1, 1, 219, 220, 221)]  # its eight neighbours
+        far = [100, 200, 300]
+        state = {"selected": set(), "stim": set(), "routes": 0}
+
+        class Array:
+            def clear_selected_electrodes(self):
+                state["selected"], state["stim"] = set(), set()
+
+            def select_electrodes(self, elecs, weight=1):
+                state["selected"] |= set(elecs)
+
+            def select_stimulation_electrodes(self, elecs):
+                state["stim"] |= set(elecs)
+
+            def route(self):
+                state["routes"] += 1
+                return "OK"
+
+            def get_config(self):
+                # The router keeps the stimulation electrode only once none of its neighbours ask.
+                kept = set(state["selected"])
+                if not (state["selected"] & set(crowd)):
+                    kept |= state["stim"]
+                return types.SimpleNamespace(mappings=[types.SimpleNamespace(electrode=e) for e in kept])
+
+        routed = route_with_stimulation(Array(), crowd + far, stim)
+        assert 3858 in routed and set(far) <= routed and not (routed & set(crowd))
+        assert state["routes"] == 2  # once, then once more with the crowd given up
+
+        class Never(Array):
+            def get_config(self):
+                return types.SimpleNamespace(
+                    mappings=[types.SimpleNamespace(electrode=e) for e in state["selected"]]
+                )
+
+        with pytest.raises(RuntimeError, match=r"3858 at \(2065, 298\) um"):
+            route_with_stimulation(Never(), far, stim)
+
+        class Broken(Array):
+            def route(self):
+                return "ERROR"
+
+        with pytest.raises(RuntimeError, match="routing failed"):
+            route_with_stimulation(Broken(), far, stim)
+    finally:
         for name in set(sys.modules) - before:
             sys.modules.pop(name, None)

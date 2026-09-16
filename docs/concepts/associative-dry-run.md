@@ -11,7 +11,7 @@ stimulation-unit assignment, sequence length, DAC timing, artifact shape) are un
 
 | | experiment day | dry run |
 |---|---|---|
-| where it writes | the managed store, registered | `<store root>/dryruns/<chip>_<date>/`, beside the store, not registered |
+| where it writes | the managed store, registered | any directory (`$DRY`, a temp dir is fine), not registered |
 | batch id | the culture's | `fall2026_batch1_saline_M1` (or `_M2`), which says what it is |
 | scans | braintrix-cli, into the store | none: the scan path is braintrix-cli's and already known to work |
 | baseline | this culture's network scan | a real culture's network scan, already in the store, read as if it were this chip's |
@@ -19,8 +19,8 @@ stimulation-unit assignment, sequence length, DAC timing, artifact shape) are un
 | raw traces | none (spikes only) | the three regions' electrodes, for the artifact check |
 
 Saline has no plating batch or DIV, so registering it would put a fictitious culture into
-`registry.csv`. The store's own walks only look inside `recordings/`, so a `dryruns/` directory
-beside it is never mistaken for data.
+`registry.csv`; keeping the dry run out of the store altogether is the simplest way to be sure it
+never is.
 
 ## 0. Set up, on the rig
 
@@ -51,10 +51,14 @@ grep root ~/.config/mxtreme/mxtreme.toml      # or the file braintrix-cli's head
 BATCH=fall2026_batch1_saline_M1     # M1 on a MaxOne, M2 on a MaxTwo: run checks it against the device
 CHIP=M07459
 PLATE=$(date +%y%m%d)               # saline has no plating date; today's keeps every file's name consistent
-STORE=<root from the grep above>
-DRY=$STORE/dryruns/${CHIP}_$(date +%y%m%d)
+STORE=<root from the grep above>     # only used to find the live culture's scans in step 1
+DRY=<any directory you like>/${CHIP}_$(date +%y%m%d)
 mkdir -p $DRY
 ```
+
+`DRY` can be anywhere — a temp directory is fine. Nothing in this procedure reads the toml: no
+command is given `--config`, `select` writes `save_path=$DRY` into `$P`, so every run records
+there and registers nothing. `STORE` matters only for locating the live scans.
 
 ## 1. The baseline: a real culture's network scan
 
@@ -155,6 +159,13 @@ Calibration is the step most likely to fail, so watch it:
 
 - `run` prints the connected device and refuses if it does not match the batch's `M1`/`M2`;
 - `maxlab` has to accept every sequence;
+- every stimulation electrode has to be **routed** before a unit can be connected to it, and the
+  router drops what it cannot fit without saying so. `run` checks; if a stimulation electrode is
+  missing it gives up the recording electrodes crowding it and routes again (it prints when it
+  does), and if that fails it names the electrode and its position: move that site with
+  `--centers`, or widen `inner_gap`. Electrodes given up this way are not recorded for the whole
+  run (the routing is fixed once per run); the stimulation electrodes that displaced them are, and
+  count towards their region's readout whenever that region is not the one being pulsed;
 - each driven block has to land on **distinct** stimulation units. If `init_well_regions` raises
   about two electrodes sharing a unit, raise `inner_gap` in `$P` and re-run;
 - `run` reports whether the protocol went into the recording. If it says it did not, the copy in
