@@ -6,6 +6,8 @@
   "div": 1,
   "well": 0,
   "exp_id": "dryrun",
+  "_phase_lead_min": "Quiet at the start of each encode recording when the session is split; short here so the dry run's four files stay short.",
+  "phase_lead_min": 0.25,
   "description": "dry run on saline: does every presentation fire where and when it should",
   "save_path": null,
   "_rec_electrodes": "Filled in by `select`. Every electrode to record; the regions' patches plus a spread over the rest.",

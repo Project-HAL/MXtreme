@@ -115,7 +115,7 @@ def main(argv=None) -> None:
     t.add_argument("-o", "--out", help="draw the figure here; nothing is drawn without it")
     t.add_argument(
         "--csv",
-        help="per-presentation counts, for checking by hand; default <recording>_readout.csv beside it",
+        help="write the per-presentation counts here, for checking by hand; nothing is written without it",
     )
 
     c = sub.add_parser(
