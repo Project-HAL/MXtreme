@@ -13,9 +13,9 @@ stimulation-unit assignment, sequence length, DAC timing, artifact shape) are un
 |---|---|---|
 | where it writes | the managed store, registered | `<store root>/dryruns/<chip>_<date>/`, beside the store, not registered |
 | batch id | the culture's | `fall2026_batch1_saline_M1` (or `_M2`), which says what it is |
-| scans | braintrix-cli, into the store | braintrix-cli, with its **Save directory** set to the dry-run directory |
-| baseline | network scan of the culture's active set | network scan of some real culture's active set, recorded on the saline chip |
-| regions | chosen from the baseline | placed by hand with `--centers` |
+| scans | braintrix-cli, into the store | none: the scan path is braintrix-cli's and already known to work |
+| baseline | this culture's network scan | a real culture's network scan, already in the store, read as if it were this chip's |
+| regions | chosen from the baseline | chosen from that scan the same way (or placed with `--centers`) |
 | raw traces | none (spikes only) | the three regions' electrodes, for the artifact check |
 
 Saline has no plating batch or DIV, so registering it would put a fictitious culture into
@@ -31,6 +31,13 @@ PKG=../MXtreme/src/mxtreme/experiments/associative
 grep root ~/.config/mxtreme/mxtreme.toml      # or the file braintrix-cli's header names
 ```
 
+Nothing is installed by this. braintrix-cli's venv already holds MXtreme as an editable install
+pointing at `../MXtreme`, so `python -m mxtreme.experiments.associative` runs from it as it is,
+and the shell variables live only in this shell. `deactivate` (or closing the terminal) is the
+whole undo. The one thing that has to be true is that `../MXtreme` is checked out on the
+`boire/associative-learning` branch — a `git checkout` there, not an install; switch it back
+afterwards if the rig normally runs another branch.
+
 ```bash
 BATCH=fall2026_batch1_saline_M1     # M1 on a MaxOne, M2 on a MaxTwo: run checks it against the device
 CHIP=M07459
@@ -40,54 +47,59 @@ DRY=$STORE/dryruns/${CHIP}_$(date +%y%m%d)
 mkdir -p $DRY
 ```
 
-## 1. Activity scan, in braintrix-cli
+## 1. The baseline: a real culture's network scan
+
+The scan path is braintrix-cli's and needs no rehearsal. What the dry run starts from is the
+recording it would hand over on the day: a network scan of a live culture, taken from the store.
 
 ```bash
-python run_cli.py
+LIVE=$STORE/recordings/plating_<date>_<batch>/chip_<M1|M2>_<chip>/well_<N>/DIV_<d>/<stem>_network_scan.raw.h5
+WELL=<N>                            # the well that scan recorded; 0 on a MaxOne
 ```
 
-Skip loading a batch. **Record on device → Activity scan**, pick **Kam Scan**, enter the saline
-identity (batch `$BATCH`, chip `$CHIP`, plate date `$PLATE`, DIV 0, well 0), and set **Save
-directory** to the `$DRY` path. This checks the scan path end to end. On saline it finds no active
-electrodes, which is expected.
+It has to be a single continuous recording (a network scan is; an activity scan is not — `select`
+refuses one, since a scan is many short recordings whose spike times do not line up). Nothing
+about the chip it came from is used: electrode numbers are positions on the array, laid out the
+same on every chip, and routing is solved afresh on the saline chip when a run starts.
 
-## 2. Baseline, in braintrix-cli
-
-braintrix-cli's network scan selects electrodes from an activity scan, and the saline scan has
-none, so it would stop with "no network scan to run". Point it at a real culture's activity scan
-instead, so it records that culture's active set on the saline chip:
-
-**Record on device → Network scan**, choose to point at an `.h5`, give it any recent real
-`..._activity_scan.raw.h5`, then in the parameter editor set the identity back to the saline one
-and **Save directory** to `$DRY`. Recording length `300` s, or `60` to save time.
-
-If that is awkward, skip this step and pass `--electrodes <that activity scan or any .cfg>` to
-`select` in step 3 instead of `--baseline`; everything after works the same.
-
-```bash
-ls $DRY
-```
-
-## 3. Place the three regions by hand
+## 2. Choose the regions from it
 
 ```bash
 python -m mxtreme.experiments.associative select \
   --params $PKG/params_dryrun.json --out $DRY \
-  --baseline $DRY/*_network_scan.raw.h5 \
-  --centers "1000,500;2500,500;1750,1600" \
-  --set batch=$BATCH --set chip=$CHIP --set plate_date=$PLATE --set div=0 --set save_path=$DRY
+  --baseline $LIVE --candidates 6 \
+  --set batch=$BATCH --set chip=$CHIP --set plate_date=$PLATE --set div=0 --set well=$WELL --set save_path=$DRY
 P=$(ls $DRY/*_params.json)
 ```
 
-A silent baseline has nothing to rank or correlate, so `select` says so, skips coupling, says it
-has no per-electrode activity to place the driven blocks on (so they sit at the centres as given),
-and takes the routing from the electrodes the baseline recorded. `save_path` is stored in `$P`, so
-every run below writes to `$DRY` and is not registered. `params_dryrun.json` also carries
-`amplitudes_source: "saline"`: on a culture a connectivity or conditioning run refuses to start
-until calibration's numbers have been copied in, and saline has nothing to calibrate. `params_dryrun.json` keeps raw traces on
-the three regions (`raw_traces: "regions"`), which the artifact check in step 7 needs.
+Because the baseline is a live culture's, this is the full selection path, not the silent-chip
+shortcut: it ranks patches, measures their coupling, assigns roles, moves each driven block onto
+electrodes with recorded spikes, and writes the coupling and regions figures into `$DRY` — read
+them as you would on the day, since they are what the day's `select` will print. The regions are
+that culture's, which is fine: the saline chip is only going to fire pulses at them.
 
-## 4. Look before touching the chip
+Expect the site placement line to read "1 of 4" or "2 of 4 driven electrodes active" here: a
+network scan alone knows only its few hundred electrodes, 100 µm apart, so most of a driven
+block's four have no recording to be judged by. On the day `select` is also given the activity
+scan, which covers every electrode. If that culture's activity scan is in the store too, pass it
+with `--activity-scan <..._activity_scan.raw.h5>` and the placement line becomes the real thing.
+
+If it refuses (`only N patches qualify`), place them by hand instead:
+
+```bash
+python -m mxtreme.experiments.associative select \
+  --params $PKG/params_dryrun.json --out $DRY \
+  --baseline $LIVE --centers "1000,500;2500,500;1750,1600" \
+  --set batch=$BATCH --set chip=$CHIP --set plate_date=$PLATE --set div=0 --set well=$WELL --set save_path=$DRY
+```
+
+Either way `$P` carries the saline identity and `save_path=$DRY`, so every run below writes to
+`$DRY` and is not registered. `params_dryrun.json` also carries `amplitudes_source: "saline"`: on
+a culture a connectivity or conditioning run refuses to start until calibration's numbers have
+been copied in, and saline has nothing to calibrate. It keeps raw traces on the three regions
+(`raw_traces: "regions"`), which the artifact check in step 6 needs.
+
+## 3. Look before touching the chip
 
 ```bash
 python -m mxtreme.experiments.associative preview --params $P
@@ -96,7 +108,7 @@ python -m mxtreme.experiments.associative preview --params $P
 It should say the recording goes to `$DRY`, "not registered", raw traces on the three regions,
 and draw the sites (each driven block centred in its return ring), the schedule and the waveform.
 
-## 5. The three runs
+## 4. The three runs
 
 ```bash
 python -m mxtreme.experiments.associative run --params $P --mode calibration --set exp_id=dry_cal --work $DRY
@@ -133,7 +145,7 @@ Calibration is the step most likely to fail, so watch it:
 - `run` reports whether the protocol went into the recording. If it says it did not, the copy in
   `$DRY` is what `report` needs (`--protocol`).
 
-## 6. Two variants for the paths the first three miss
+## 5. Two variants for the paths the first three miss
 
 ```bash
 python -m mxtreme.experiments.associative run --params $P --set exp_id=dry_offset --set dt_cs_us=20 --work $DRY
@@ -155,7 +167,7 @@ commands, where a sequence-length limit would show: 198 pulse events over ten mi
 twice the real run's 89-event trains, at the same amplitude as any other. It tests length, not
 dose, and bounds what the real run will ask of the sequencer.
 
-## 7. Read each recording back
+## 6. Read each recording back
 
 For each of `dry_cal`, `dry_conn`, `dry_cond`, `dry_offset`, `dry_long`, `dry_cal_grid`, and the
 four `dry_split_*` files together:
@@ -190,9 +202,7 @@ stimulation code any run makes.
 
 ## Checklist
 
-- [ ] braintrix-cli activity scan wrote into `$DRY`, not the store
-- [ ] braintrix-cli network scan wrote into `$DRY` (or step 3 used `--electrodes`)
-- [ ] `select` wrote `$P` and said the baseline is silent
+- [ ] `select` chose three regions from the live scan (or took `--centers`), placed the driven blocks on active electrodes, and wrote `$P` with the saline identity
 - [ ] `preview` says `$DRY`, not registered, raw traces on the regions, rings centred
 - [ ] calibration printed the right device and ran without a routing error
 - [ ] connectivity and conditioning ran
