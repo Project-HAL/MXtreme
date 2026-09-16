@@ -125,7 +125,7 @@ python -m mxtreme.experiments.associative preview --params $P
 ```
 
 It should say the recording goes to `$DRY`, "not registered", raw traces on the three regions,
-and draw the sites (each driven block centred in its return ring), the schedule and the waveform.
+and draw the sites, the schedule and the waveform.
 
 ## 4. The three runs
 
@@ -173,8 +173,8 @@ Calibration is the step most likely to fail, so watch it:
   clashing electrodes' neighbourhoods routed as candidates -- when none is free. It prints each
   substitution and, once done, every electrode's `channel -> unit`; the protocol in the
   recording carries the electrodes actually driven. If it gives up after 8 routings, spread the
-  site out: `inner_gap` and `return_radius` live in `$P` under `stim_site`, or on the command
-  line as one value, e.g. `--set 'stim_site={"shape":"focal","inner":2,"inner_gap":6,"return_radius":9,"return_points":"diagonal"}'`;
+  site out: `gap` lives in `$P` under `stim_site`, or on the command line as one value, e.g.
+  `--set 'stim_site={"shape":"grid","size":2,"gap":8}'`;
 - `run` reports whether the protocol went into the recording. If it says it did not, the copy in
   `$DRY` is what `report` needs (`--protocol`).
 

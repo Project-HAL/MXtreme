@@ -144,15 +144,7 @@ class AssociativeParams:
     amplitudes_source: str = "default"
     min_region_separation_um: float = 1000.0
     region_radius_um: float = 150.0
-    stim_site: dict = field(
-        default_factory=lambda: {
-            "shape": "focal",
-            "inner": 2,
-            "inner_gap": 6,
-            "return_radius": 8,
-            "return_points": "diagonal",
-        }
-    )
+    stim_site: dict = field(default_factory=lambda: {"shape": "grid", "size": 2, "gap": 6})
     region_dacs: dict[str, int] = field(default_factory=lambda: {"US": 0, "CS": 1, "NS": 2})
     drive_dac: int = 0
     return_dac: int = 1

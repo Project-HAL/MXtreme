@@ -444,34 +444,33 @@ third day measures how much of any decay is the probing.
 counted:
 
 ```
-site: 4 driven electrodes spanning 122 um, return ring at 210 um;
-      response measured over 150 um; 18 of 32 stimulation units
+site: 4 driven electrodes spanning 122 um; response measured over 150 um; 12 of 32 stimulation units
 ```
 
-The driven block spans 122 µm; the two return electrodes sit at opposite corners around it,
-centred on it, outside the 150 µm counting radius, so a region's count is its driven block's
-response. The binding constraint is stimulation units: 32 on the chip, one per stimulation
-electrode — and, measured on a MaxOne, each *area* of the chip exposes only about seven of them,
-so a site of eight electrodes (a 2x2 with a four-corner ring) cannot be connected while one of six
-can. That is why the default ring is two corners.
+The driven block spans 122 µm inside the 150 µm counting radius, so a region's count is its
+driven block's response; the bath is the return. The binding constraint is stimulation units: 32
+on the chip, one per stimulation electrode — and, measured on a MaxOne, each *area* of the chip
+exposes only about seven of them. A 2x2 with a four-corner return ring (eight per site) could not
+be connected on the rig and one with two returns (six) failed too, so the default has none. If the
+connectivity check shows the sites driving each other, return electrodes are the next thing to
+try (`stim_site` focal, `return_points` `"diagonal"`).
 
-| site | units total | per site | driven span | fits? |
+| site | units total | per site | driven span | connects? |
 |---|---|---|---|---|
-| focal 2x2, `inner_gap` 6, two returns (default) | 18 | 6 | 122.5 µm | yes |
-| focal 2x2, `inner_gap` 4, four returns | 24 | 8 | 87.5 µm | routes, but one area rarely has 8 free units |
-| focal 2x2, `inner_gap` 7, `return_radius` 9, two returns | 18 | 6 | 140 µm | yes |
-| focal 3x3, two returns | 33 | 11 | 122.5 µm | **no**, refused |
-| grid 3x3, gap 2 (no ring) | 27 | 9 | 105 µm | routes, but 9 per area is over the ~7 available |
+| grid 2x2, `gap` 6 (default) | 12 | 4 | 122.5 µm | yes |
+| grid 2x2, `gap` 7 | 12 | 4 | 140 µm | yes |
+| focal 2x2, `inner_gap` 6, two returns | 18 | 6 | 122.5 µm | failed on a MaxOne: an area has ~7 units, and the returns compete for them |
+| focal 2x2, four returns | 24 | 8 | — | no, on that chip |
+| grid 3x3, gap 2 | 27 | 9 | 105 µm | 9 per area is over the ~7 available |
 
-Widen a focal site with `inner_gap`, never `inner`.
+Widen a site with `gap` (or `inner_gap`), never `size` (or `inner`).
 
 ## Safety notes
 
 - **Amplitude is in mV per phase; peak to peak is twice that.** The ladder is 20 to 120 mV per
   phase, 40 to 240 peak to peak, the range Ronchi et al. 2019 characterised on these arrays.
   `max_amplitude_mv` refuses anything above 150 per phase unless raised deliberately.
-- **Pulses are charge balanced** in time (equal and opposite phases) and in space (the return ring,
-  centred on the driven block, carries the inverted pulse).
+- **Pulses are charge balanced** in time (equal and opposite phases); the bath is the return.
 - **The duty cycle is very low.** The conditioning run delivers about 1400 pulses to each of US and
   CS; at 100 µs per phase that is under a third of a second of driven electrode across the day.
   `preview` prints this for whatever you are about to run.

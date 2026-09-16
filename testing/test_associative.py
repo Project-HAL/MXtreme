@@ -403,15 +403,13 @@ def test_site_footprint_and_the_unit_budget():
 
     default = AssociativeParams.from_json(os.path.join(PACKAGE, "params_default.json"))
     f = site_footprint(default.stim_site)
-    # Two return electrodes, not four: a chip area exposes only about seven stimulation units, and
-    # a site of eight electrodes could not be connected on the rig while one of six can.
-    assert f["units"] == 6 and f["units"] * 3 <= STIM_UNITS
+    # A plain 2x2 block, no return electrodes: four units per site. The chip hands units out per
+    # area of the array (about seven each, measured on a MaxOne), and sites of eight and six
+    # electrodes both failed to connect on the rig.
+    assert f["units"] == 4 and f["return"] == 0 and f["units"] * 3 <= STIM_UNITS
     # The stimulation site fills the region whose response is measured, rather than being a point
     # inside it.
     assert f["driven_span_um"] == pytest.approx(122.5)
-    assert f["ring_offset_um"] == pytest.approx(0.0)
-    # The ring sits outside the measured region, so a region's count is the driven block's.
-    assert default.region_radius_um < f["ring_radius_um"] < default.region_radius_um + 80
 
     # A 3x3 focal site needs 13 units per region, 39 for three, and cannot route.
     with pytest.raises(ValueError, match="stimulation units"):
@@ -551,7 +549,18 @@ def test_a_session_run_sets_the_rig_up_once_and_opens_one_recording_per_phase(mo
     try:
         from mxtreme.experiments.associative import run as R
 
-        p = _params(encode_cycles=2, save_path=str(tmp_path), exp_id="t")
+        p = _params(
+            encode_cycles=2,
+            save_path=str(tmp_path),
+            exp_id="t",
+            stim_site={
+                "shape": "focal",
+                "inner": 2,
+                "inner_gap": 4,
+                "return_radius": 6,
+                "return_points": "corners",
+            },
+        )
         opened, inits, closed = [], [], []
 
         class Saving:

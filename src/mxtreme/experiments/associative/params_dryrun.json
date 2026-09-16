@@ -24,13 +24,11 @@
   "amplitudes_source": "saline",
   "min_region_separation_um": 1000.0,
   "region_radius_um": 150.0,
-  "_stim_site": "focal: an inner x inner driven block on drive_dac, ringed by return electrodes on return_dac carrying the inverted pulse, which confines the field (Ronchi et al. 2019). The ring is laid out around the block itself, so it is centred on it whatever the spacing. The default drives four electrodes 122.5 um apart with two return electrodes at opposite corners, 220 um from the block's centre. Why two and not four: the chip's 32 stimulation units each serve an area of the array, and an area exposes only about seven of them (measured on a MaxOne), so a site of eight electrodes cannot be connected while one of six can. return_points 'corners' is the four-corner ring, if a chip allows it. Widen a site with inner_gap, not inner: a focal site costs inner^2 + return points units of the 32, and a 3x3 focal site will not fit. grid: {shape, size, gap}, one DAC per role from region_dacs, no return ring.",
+  "_stim_site": "What stimulates a region. grid: a size x size block of driven electrodes, gap empty electrodes between them, on the role's DAC from region_dacs, no return electrodes. The default is a 2x2 block 122.5 um on a side: four stimulation units per site, twelve of the chip's 32. focal: {shape, inner, inner_gap, return_radius, return_points} adds return electrodes carrying the inverted pulse to confine the field (Ronchi et al. 2019) -- 'diagonal' two at opposite corners, 'corners' four -- at the cost of more stimulation units, which the chip hands out per area of the array (about seven per area, measured on a MaxOne), so a site of eight would not connect and one of six was marginal. Add returns after the first culture if the connectivity check shows the sites driving each other; until then the bath is the return.",
   "stim_site": {
-    "shape": "focal",
-    "inner": 2,
-    "inner_gap": 6,
-    "return_radius": 8,
-    "return_points": "diagonal"
+    "shape": "grid",
+    "size": 2,
+    "gap": 6
   },
   "region_dacs": {
     "US": 0,
