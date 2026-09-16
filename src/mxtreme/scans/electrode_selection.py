@@ -53,7 +53,7 @@ def load_activity_scan(filepath: str):
         record_time_sec = int(f[f'/assay/inputs/record_time'][0]) # recording time in seconds
 
         for well_long in list(f[f'/wells/'].keys()):
-            well = int(well_long[-1]) # well values range from 0-5
+            well = int(well_long.removeprefix('well')) # 'well000' -> 0; a 24-well plate goes past one digit
             well_data = {}
             
             for recording in list(f[f'/wells/{well_long}/']): # collect all of the recording data

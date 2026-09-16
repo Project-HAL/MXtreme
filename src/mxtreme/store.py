@@ -29,8 +29,8 @@ them -- so ``import mxtreme`` (which re-exports :class:`Batch`) stays fast and r
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field
 from pathlib import Path
 
 #: Semesters a batch id may name, in calendar order.
@@ -40,7 +40,8 @@ SEMESTERS = ("spring", "summer", "fall", "winter")
 SYSTEMS = ("M1", "M2")
 
 #: What a file in the recordings tree can be. ``"experiment"`` is an ingested exogenous recording;
-#: the other two are scans MXtreme ran itself.
+#: the other two are scans -- run by MXtreme itself, or recorded by MaxLab Live's own assays and
+#: ingested as scans (see :func:`ingest_recording`).
 RECORDING_KINDS = ("activity_scan", "network_scan", "experiment")
 
 #: The batch-id convention, e.g. ``fall2026_batch1_DRG_M1``. The cell type is the one free-form
@@ -380,6 +381,7 @@ def split_by_well(
     *,
     on_progress: Callable[[str], None] = print,
     delete_original: bool = False,
+    wells: Iterable[int] | None = None,
 ) -> dict[int, Path]:
     """Break a multi-well MaxWell ``.h5`` into one file per well.
 
@@ -396,8 +398,10 @@ def split_by_well(
     :param on_progress: Called with each progress line.
     :param delete_original: Remove ``h5_path`` after every well has been written successfully.
         On any failure the original is always kept.
-    :returns: ``{well: destination}`` for every well the file held.
-    :raises ValueError: If the file has no ``/wells`` group.
+    :param wells: Only split out these wells; ``None`` means every well the file holds. A well
+        asked for that the file does not hold is an error, not silently skipped.
+    :returns: ``{well: destination}`` for every well written.
+    :raises ValueError: If the file has no ``/wells`` group, or ``wells`` names one it lacks.
     :raises FileExistsError: If a destination already exists.
     """
     import h5py
@@ -409,6 +413,15 @@ def split_by_well(
         if "wells" not in f:
             raise ValueError(f"{h5_path} has no /wells group; nothing to split by.")
         well_groups = sorted(f["wells"], key=_well_number)
+        if wells is not None:
+            wanted = sorted({int(w) for w in wells})
+            present = {_well_number(name) for name in well_groups}
+            missing = [w for w in wanted if w not in present]
+            if missing:
+                raise ValueError(
+                    f"{h5_path.name} holds no well {missing} (it has {sorted(present)})."
+                )
+            well_groups = [name for name in well_groups if _well_number(name) in wanted]
 
         for group_name in well_groups:
             well = _well_number(group_name)
@@ -694,7 +707,7 @@ def remove_recording(
     return removal
 
 
-# --- ingesting an exogenous recording -------------------------------------------------------------
+# --- describing and ingesting an exogenous recording ----------------------------------------------
 
 
 def _validate_exp_id(exp_id: str) -> str:
@@ -711,6 +724,314 @@ def _validate_exp_id(exp_id: str) -> str:
     return exp_id
 
 
+def _text(dataset) -> str | None:
+    """The string a one-element MaxLab text dataset holds (``|S`` or variable-length), or ``None``."""
+    try:
+        value = dataset[()]
+    except Exception:  # noqa: BLE001 -- an unreadable dataset is simply not a value
+        return None
+    try:
+        if hasattr(value, "shape") and value.shape != ():
+            value = value[0]
+    except (IndexError, TypeError):
+        return None
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", "replace")
+    return str(value).strip() or None
+
+
+def _scope_plating_date(raw: str | None) -> int | None:
+    """MaxLab Live's per-well ``Plating Date`` (``28.3.2024``, ``2024-03-28``...) as ``YYMMDD``."""
+    if not raw:
+        return None
+    from datetime import date
+
+    for pattern in (r"^(\d{1,2})\.(\d{1,2})\.(\d{4})$", r"^(\d{4})-(\d{1,2})-(\d{1,2})$", r"^(\d{1,2})/(\d{1,2})/(\d{4})$"):
+        match = re.match(pattern, raw.strip())
+        if not match:
+            continue
+        parts = [int(x) for x in match.groups()]
+        year, month, day = (parts[0], parts[1], parts[2]) if parts[0] > 31 else (parts[2], parts[1], parts[0])
+        try:
+            when = date(year, month, day)
+        except ValueError:
+            return None
+        return int(f"{when:%y%m%d}")
+    if re.fullmatch(r"\d{6}", raw.strip()):
+        return int(raw.strip())
+    return None
+
+
+@dataclass(frozen=True)
+class WellDescription:
+    """What one well of a MaxWell ``.h5`` holds, for :class:`RecordingDescription`.
+
+    :param well: Well number.
+    :param n_recordings: How many ``recNNNN`` groups the well has.
+    :param n_spikes: Spikes across all of them.
+    :param n_channels: Channels routed in the first recording (its ``settings/mapping`` size).
+    :param n_electrodes: Distinct electrodes across every recording's mapping.
+    :param sampling_hz: The first recording's sampling rate, or ``None``.
+    :param seconds: Total recorded seconds across the well's recordings, from MaxLab's per-recording
+        start/stop stamps, or ``None`` when the file carries none.
+    :param has_raw: Whether any recording saved raw traces (``groups/*/raw``), as a network scan does.
+    :param plating_date: The well's ``Plating Date`` from MaxLab Live's wellplate metadata, as
+        ``YYMMDD``, when someone filled it in in Scope and it parses; else ``None``.
+    :param wellplate: Every other string MaxLab Live stored about the well (``Plating Type``,
+        ``Cells``, ``group_name``...), verbatim, for a front end to show.
+    """
+
+    well: int
+    n_recordings: int
+    n_spikes: int
+    n_channels: int
+    n_electrodes: int
+    sampling_hz: float | None
+    seconds: float | None
+    has_raw: bool
+    plating_date: int | None
+    wellplate: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class RecordingDescription:
+    """What a MaxWell ``.h5`` says about itself, before anyone tells the store what it is.
+
+    Read by :func:`describe_recording` from the file alone. ``problems`` is the verdict: an empty
+    list means the file is a MaxWell recording the store can hold (``/wells`` with recordings
+    that carry spikes and settings); anything listed there is a reason it cannot be ingested as it
+    is. ``warnings`` are oddities worth showing that do not block an ingest.
+
+    :param path: The file.
+    :param size: Its size in bytes.
+    :param chip: The chip serial MaxLab wrote to ``/wellplate/id`` (Scope's own chip readout), or
+        ``None``.
+    :param wellplate_version: MaxLab's plate description, e.g. ``"MaxTwo 6 multi-well MEA"``.
+    :param system: ``"M1"`` or ``"M2"`` as far as the plate description says, else ``None``.
+    :param script_id: The MaxLab Live assay that recorded the file (``ActivityScan_v1.0``...), if
+        it was one of Scope's assays; ``None`` for a plain recording or an MXtreme scan.
+    :param mxw_version: MaxLab Live's version string.
+    :param recorded_at: When the first recording started, ISO 8601 in local time, or ``None``.
+    :param recorded_date: The same as a calendar date (``YYMMDD``), or ``None``.
+    :param record_time: ``/assay/inputs/record_time`` in seconds, when the file has it.
+    :param kind_guess: What the file looks like -- one of :data:`RECORDING_KINDS`: several
+        recordings per well on different electrode sets is an activity scan, one recording with
+        raw traces is a network scan, anything else an experiment. A guess to confirm, not a fact.
+    :param metadata: The ``/assay/metadata`` blob MXtreme writes into its own scans, decoded, or
+        ``None`` for a file recorded outside MXtreme.
+    :param wells: One :class:`WellDescription` per well the file holds data for, ascending.
+    :param problems: Why the file cannot be ingested; empty when it can.
+    :param warnings: Oddities that do not block an ingest.
+    """
+
+    path: Path
+    size: int
+    chip: str | None
+    wellplate_version: str | None
+    system: str | None
+    script_id: str | None
+    mxw_version: str | None
+    recorded_at: str | None
+    recorded_date: int | None
+    record_time: int | None
+    kind_guess: str
+    metadata: dict | None
+    wells: list[WellDescription] = field(default_factory=list)
+    problems: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        """Whether the file can be ingested as it is."""
+        return not self.problems
+
+    @property
+    def plating_date(self) -> int | None:
+        """The one plating date the wells agree on, or ``None`` when they disagree or have none."""
+        dates = {w.plating_date for w in self.wells if w.plating_date is not None}
+        return dates.pop() if len(dates) == 1 else None
+
+
+def describe_recording(h5_path: str | Path) -> RecordingDescription:
+    """Read what a MaxWell ``.h5`` says about itself, for an ingest that asks before it files.
+
+    Nothing here needs the store: this is the file's own account -- which chip Scope read, which
+    wells hold data, how many recordings each has, when it was recorded, whether it looks like an
+    activity scan -- so a front end can fill in what it can and ask only for what the file cannot
+    say (the batch, and with it the DIV). It never writes.
+
+    A file that is not HDF5, has no ``/wells`` group, or whose wells hold no recording with spikes
+    and settings is described with ``problems`` listing why; it does not raise.
+
+    :param h5_path: The recording.
+    :returns: The description; check :attr:`RecordingDescription.ok` before ingesting.
+    """
+    import json
+    from datetime import datetime
+
+    h5_path = Path(h5_path)
+    problems: list[str] = []
+    warnings: list[str] = []
+    wells: list[WellDescription] = []
+    chip = wellplate_version = script_id = mxw_version = None
+    record_time = None
+    metadata = None
+    starts: list[int] = []
+
+    def _describe(path: Path, size: int, **kw) -> RecordingDescription:
+        return RecordingDescription(path=path, size=size, **kw)
+
+    try:
+        size = h5_path.stat().st_size
+    except OSError as exc:
+        return _describe(
+            h5_path, 0, chip=None, wellplate_version=None, system=None, script_id=None,
+            mxw_version=None, recorded_at=None, recorded_date=None, record_time=None,
+            kind_guess="experiment", metadata=None, problems=[f"Cannot read the file: {exc}"],
+        )
+
+    import h5py
+
+    try:
+        f = h5py.File(str(h5_path), "r")
+    except OSError as exc:
+        return _describe(
+            h5_path, size, chip=None, wellplate_version=None, system=None, script_id=None,
+            mxw_version=None, recorded_at=None, recorded_date=None, record_time=None,
+            kind_guess="experiment", metadata=None,
+            problems=[f"Not an HDF5 file (h5py could not open it: {str(exc).splitlines()[0]})."],
+        )
+
+    with f:
+        if "wellplate" in f:
+            chip = _text(f["wellplate/id"]) if "id" in f["wellplate"] else None
+            wellplate_version = _text(f["wellplate/version"]) if "version" in f["wellplate"] else None
+        if "assay" in f:
+            if "script_id" in f["assay"]:
+                script_id = _text(f["assay/script_id"])
+            if "inputs" in f["assay"] and "record_time" in f["assay/inputs"]:
+                try:
+                    record_time = int(float(_text(f["assay/inputs/record_time"]) or ""))
+                except ValueError:
+                    warnings.append("/assay/inputs/record_time is present but not a number.")
+            if "metadata" in f["assay"]:
+                try:
+                    metadata = json.loads(
+                        (_text(f["assay/metadata"]) or "").replace("'", '"')
+                    )
+                except ValueError:
+                    warnings.append("/assay/metadata is present but not readable.")
+        mxw_version = _text(f["mxw_version"]) if "mxw_version" in f else None
+        if "version" not in f and mxw_version is None:
+            warnings.append("No /version or /mxw_version: the file was not written by MaxLab Live.")
+
+        if "wells" not in f:
+            problems.append("No /wells group: not a MaxWell recording (or a very old one).")
+        else:
+            well_names = []
+            for name in f["wells"]:
+                try:
+                    well_names.append((_well_number(name), name))
+                except ValueError:
+                    warnings.append(f"/wells/{name} is not a wellNNN group; ignored.")
+            if not well_names:
+                problems.append("/wells holds no wellNNN groups.")
+            for well, name in sorted(well_names):
+                group = f["wells"][name]
+                recordings = [r for r in group if isinstance(group[r], h5py.Group)]
+                if not recordings:
+                    warnings.append(f"Well {well} has no recordings; it will be skipped.")
+                    continue
+                n_spikes = n_channels = 0
+                electrodes: set[int] = set()
+                sampling = None
+                seconds = 0.0
+                have_seconds = False
+                has_raw = False
+                bad = []
+                for rec in sorted(recordings):
+                    r = group[rec]
+                    if "spikes" not in r or "settings" not in r or "mapping" not in r["settings"]:
+                        bad.append(rec)
+                        continue
+                    try:
+                        n_spikes += int(r["spikes"].shape[0])
+                        mapping = r["settings/mapping"]
+                        if not n_channels:
+                            n_channels = int(mapping.shape[0])
+                        if "electrode" in (mapping.dtype.names or ()):
+                            electrodes.update(int(e) for e in mapping["electrode"][:])
+                        if sampling is None and "sampling" in r["settings"]:
+                            sampling = float(r["settings/sampling"][0])
+                    except Exception as exc:  # noqa: BLE001 -- one broken recording, reported below
+                        bad.append(f"{rec} ({type(exc).__name__})")
+                        continue
+                    if "start_time" in r and "stop_time" in r:
+                        try:
+                            start, stop = int(r["start_time"][0]), int(r["stop_time"][0])
+                        except (IndexError, ValueError, TypeError):
+                            start = stop = 0
+                        if stop > start > 0:
+                            seconds += (stop - start) / 1000
+                            have_seconds = True
+                            starts.append(start)
+                    if "groups" in r and any("raw" in r["groups"][g] for g in r["groups"]):
+                        has_raw = True
+                if bad:
+                    problems.append(
+                        f"Well {well}: recording(s) {', '.join(bad)} lack spikes or settings/mapping."
+                    )
+                good = len(recordings) - len(bad)
+                if good and n_spikes == 0:
+                    warnings.append(f"Well {well} recorded no spikes at all.")
+                plate = None
+                info: dict[str, str] = {}
+                wp = f"wellplate/{name}"
+                if wp in f:
+                    for key in f[wp]:
+                        value = _text(f[wp][key])
+                        if value is not None:
+                            info[key] = value
+                    plate = _scope_plating_date(info.get("Plating Date"))
+                wells.append(
+                    WellDescription(
+                        well=well, n_recordings=good, n_spikes=n_spikes, n_channels=n_channels,
+                        n_electrodes=len(electrodes), sampling_hz=sampling,
+                        seconds=seconds if have_seconds else None, has_raw=has_raw,
+                        plating_date=plate, wellplate=info,
+                    )
+                )
+            if not wells and not problems:
+                problems.append("No well holds a recording.")
+
+    system = None
+    if wellplate_version:
+        lowered = wellplate_version.lower()
+        system = "M2" if "maxtwo" in lowered else "M1" if "maxone" in lowered else None
+
+    recorded_at = recorded_date = None
+    if starts:
+        when = datetime.fromtimestamp(min(starts) / 1000).astimezone()
+        recorded_at = when.isoformat(timespec="seconds")
+        recorded_date = int(f"{when:%y%m%d}")
+
+    if script_id and "activityscan" in script_id.replace(" ", "").lower():
+        kind_guess = "activity_scan"
+    elif wells and all(w.n_recordings >= 2 and w.n_electrodes > w.n_channels for w in wells):
+        kind_guess = "activity_scan"
+    elif wells and all(w.n_recordings == 1 and w.has_raw for w in wells):
+        kind_guess = "network_scan"
+    else:
+        kind_guess = "experiment"
+
+    return RecordingDescription(
+        path=h5_path, size=size, chip=chip, wellplate_version=wellplate_version, system=system,
+        script_id=script_id, mxw_version=mxw_version, recorded_at=recorded_at,
+        recorded_date=recorded_date, record_time=record_time, kind_guess=kind_guess,
+        metadata=metadata, wells=wells, problems=problems, warnings=warnings,
+    )
+
+
 def ingest_recording(
     h5_path: str | Path,
     config,
@@ -719,19 +1040,33 @@ def ingest_recording(
     plate_date,
     chip: str,
     div: int,
-    exp_id: str,
+    kind: str = "experiment",
+    exp_id: str | None = None,
+    wells: Iterable[int] | None = None,
     conditions: dict[int, object] | None = None,
     move: bool = False,
+    actor: str | None = None,
+    note: str = "",
     on_progress: Callable[[str], None] = print,
 ) -> dict[int, Path]:
     """Bring an exogenous ``.h5`` (recorded outside MXtreme) into the managed store.
 
-    The file is placed in the recordings tree under the identity given here, named
-    ``<stem>_<exp_id>.raw.h5``, and one ``experiment`` row per well is upserted into the registry --
-    exactly as if MXtreme had recorded it. A file holding several wells is split into one file per
-    well on the way in (see :func:`split_by_well`), so each culture's directory holds its own data.
-    An ingested copy with no ``/assay/metadata`` blob gets one written from the identity given here,
-    so :func:`mxtreme.extract.extract` and a registry rebuild can read it back without being handed
+    The file is placed in the recordings tree under the identity given here and one row per well
+    is upserted into the registry -- exactly as if MXtreme had recorded it. What it is filed *as*
+    is ``kind``: an ``experiment`` (the default) is named ``<stem>_<exp_id>.raw.h5`` after the
+    free-form experiment name; an ``activity_scan`` or ``network_scan`` recorded by MaxLab Live's
+    own assays (or any other tool) takes the scan tail instead, ``<stem>_activity_scan.raw.h5``,
+    and registers as that kind, so it is indistinguishable in the store from a scan MXtreme ran
+    -- electrode selection, the analysis chain and a registry rebuild all read it the same way.
+    An activity scan lacking ``/assay/inputs/record_time`` gets it derived from its own
+    timestamps (:func:`mxtreme.scans.activity_scan.ensure_record_time`), since the selection
+    pipeline needs it.
+
+    A file holding several wells is split into one file per well on the way in (see
+    :func:`split_by_well`), so each culture's directory holds its own data; ``wells`` narrows that
+    to the wells worth keeping (the plated ones of a MaxTwo plate). An ingested copy with no
+    ``/assay/metadata`` blob gets one written from the identity given here, so
+    :func:`mxtreme.extract.extract` and a registry rebuild can read it back without being handed
     the metadata again; a blob the file already carries is left as recorded. ::
 
         from mxtreme.config import Config
@@ -743,23 +1078,35 @@ def ingest_recording(
             batch="fall2026_batch1_DRG_M1", plate_date=260810,
             chip="M07460", div=21, exp_id="burstTrainer_trial3",
         )
+        ingest_recording(                      # a Scope activity scan
+            "/data/scope/M07460_260831.h5", config,
+            batch="fall2026_batch1_DRG_M1", plate_date=260810,
+            chip="M07460", div=21, kind="activity_scan",
+        )
 
-    :param h5_path: The recording to ingest. Must be a MaxWell wells-format file (``/wells/...``).
+    :param h5_path: The recording to ingest. Must be a MaxWell wells-format file (``/wells/...``);
+        :func:`describe_recording` says beforehand whether it is, and what it looks like.
     :param config: The :class:`~mxtreme.config.Config` describing the managed store.
     :param batch: The plating batch the culture belongs to, as a :class:`Batch` or its id string.
     :param plate_date: Plating date, ``YYMMDD``.
     :param chip: Chip serial, e.g. ``"M07460"``.
     :param div: Days *in vitro* at the time of the recording.
-    :param exp_id: Free-form name for this experiment -- becomes the file-name tail and the
-        registry row's ``exp_id``. Letters, digits, ``.``, ``-``, ``_``.
+    :param kind: What to file it as -- one of :data:`RECORDING_KINDS`.
+    :param exp_id: For an ``experiment``, its free-form name -- becomes the file-name tail and the
+        registry row's ``exp_id``. Letters, digits, ``.``, ``-``, ``_``. Required for an
+        experiment; not accepted for a scan (a scan's identity is its batch).
+    :param wells: Which of the file's wells to ingest; ``None`` means all of them.
     :param conditions: Optional per-well condition labels, keyed by well number.
     :param move: Move the file instead of copying it. A multi-well source is removed after a
         successful split either way when this is set; on any failure the original is kept.
+    :param actor: Who, for the journal; the OS user when ``None``.
+    :param note: A remark for the journal (where the file came from, say).
     :param on_progress: Called with each progress line.
     :returns: ``{well: destination path}`` for every well ingested.
     :raises FileNotFoundError: If ``h5_path`` does not exist.
     :raises FileExistsError: If a destination file already exists -- nothing is overwritten.
-    :raises ValueError: On a malformed batch id, plate date, or exp id, or a file with no wells.
+    :raises ValueError: On a malformed batch id, plate date, kind or exp id, a file with no wells,
+        or ``wells`` naming one the file lacks.
     """
     import shutil
 
@@ -770,17 +1117,37 @@ def ingest_recording(
         raise FileNotFoundError(f"No such file: {h5_path}")
 
     batch = Batch.parse(batch)
-    _validate_exp_id(exp_id)
+    if kind not in RECORDING_KINDS:
+        raise ValueError(f"kind must be one of {RECORDING_KINDS}, got {kind!r}.")
+    if kind == "experiment":
+        if exp_id is None:
+            raise ValueError("An experiment needs an exp_id; a scan takes kind='activity_scan' "
+                             "or 'network_scan' instead.")
+        _validate_exp_id(exp_id)
+        tail = exp_id
+    else:
+        if exp_id is not None:
+            raise ValueError(f"A {kind} carries no exp_id (its identity is the batch); got {exp_id!r}.")
+        tail = kind
     conditions = conditions or {}
-    wells = wells_in_file(h5_path)
+    present = wells_in_file(h5_path)
+    if wells is None:
+        chosen = present
+    else:
+        chosen = sorted({int(w) for w in wells})
+        missing = [w for w in chosen if w not in present]
+        if missing:
+            raise ValueError(f"{h5_path.name} holds no well {missing} (it has {present}).")
+        if not chosen:
+            raise ValueError("wells is empty: nothing to ingest.")
 
     def destination(well: int) -> Path:
         stem = recording_stem(batch, plate_date, chip, well, div)
-        return recording_dir(config, batch, plate_date, chip, well, div) / f"{stem}_{exp_id}.raw.h5"
+        return recording_dir(config, batch, plate_date, chip, well, div) / f"{stem}_{tail}.raw.h5"
 
-    if len(wells) == 1:
+    if len(present) == 1 and chosen == present:
         # One well: a straight file copy (or move) is faster and bit-exact; nothing to split.
-        well = wells[0]
+        well = present[0]
         dest = destination(well)
         if dest.exists():
             raise FileExistsError(f"Refusing to overwrite {dest}.")
@@ -792,15 +1159,17 @@ def ingest_recording(
             shutil.copy2(str(h5_path), str(dest))
         written = {well: dest}
     else:
-        on_progress(f"Splitting {h5_path.name} into {len(wells)} per-well files...")
+        on_progress(f"Splitting {h5_path.name} into {len(chosen)} per-well file(s)...")
         written = split_by_well(
-            h5_path, destination, on_progress=on_progress, delete_original=move
+            h5_path, destination, on_progress=on_progress, delete_original=move, wells=chosen
         )
 
     for well, dest in written.items():
         condition = conditions.get(well)
         _ensure_metadata_blob(dest, {
-            "Exp ID": exp_id,
+            # A scan has no experiment name -- its identity is the batch, as ActivityScanParams
+            # writes it. An experiment carries its own.
+            "Exp ID": exp_id if kind == "experiment" else batch.id,
             "Batch ID": batch.id,
             "Chip ID": chip,
             "Plate date": _validate_plate_date(plate_date),
@@ -808,11 +1177,23 @@ def ingest_recording(
             "Well IDs": [well],
             "Conditions": [] if condition is None else [condition],
         })
+        if kind == "activity_scan":
+            from mxtreme.scans.activity_scan import ensure_record_time, has_record_time
+
+            if not has_record_time(dest):
+                try:
+                    seconds = ensure_record_time(dest)
+                except ValueError as exc:
+                    on_progress(f"  Well {well}: {exc}")
+                else:
+                    on_progress(f"  Well {well}: wrote record_time = {seconds} s from the file's timestamps")
 
     io.register(
         {
             well: {
-                "exp_id": exp_id,
+                # The blank exp_id is what separates scan rows from `experiment` rows, as
+                # io.register_scan writes them.
+                "exp_id": exp_id if kind == "experiment" else "",
                 "chip": chip,
                 "DIV": int(div),
                 "experimental_condition": conditions.get(well),
@@ -822,9 +1203,9 @@ def ingest_recording(
             for well in written
         },
         config.registry_path,
-        kind="experiment",
+        kind=kind,
     )
-    on_progress(f"Registered wells {sorted(written)} in {config.registry_path}")
+    on_progress(f"Registered wells {sorted(written)} as {kind} in {config.registry_path}")
 
     from mxtreme import transactions
 
@@ -834,11 +1215,13 @@ def ingest_recording(
             "recording.ingested",
             batch_id=batch,
             plate_date=plate_date,
-            exp_id=exp_id,
+            exp_id=exp_id if kind == "experiment" else batch.id,
             chip=chip,
             well=well,
             div=div,
-            data={"source": str(h5_path), "path": str(dest), "moved": bool(move)},
+            actor=actor,
+            note=note,
+            data={"source": str(h5_path), "path": str(dest), "moved": bool(move), "kind": kind},
         )
 
     return written

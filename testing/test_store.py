@@ -518,3 +518,181 @@ def test_rename_batch_refuses_an_id_nested_inside_another(tmp_path):
 
     with pytest.raises(ValueError, match="inside other batch ids"):
         store.rename_batch(config, OLD, NEW)
+
+
+# --- ingesting scans, choosing wells, describing a file -------------------------------------------
+
+
+def _scope_activity_scan_h5(path, wells=(0, 1), n_recordings=3):
+    """A file shaped the way MaxLab Live's Activity Scan assay writes one: no /assay/metadata,
+    the chip in /wellplate/id, a Plating Date per well, several recordings per well each on a
+    different electrode set, with MaxLab's per-recording start/stop stamps."""
+    import h5py
+
+    mapping_dtype = np.dtype([("channel", "<i4"), ("electrode", "<i4"), ("x", "<f8"), ("y", "<f8")])
+    spike_dtype = np.dtype([("frameno", "<i8"), ("channel", "<i4"), ("amplitude", "<f4")])
+    with h5py.File(path, "w") as f:
+        f.create_dataset("version", data=np.array([b"20190530"]))
+        f.create_dataset("mxw_version", data=np.array([b"25.1.8.2"]))
+        f.create_dataset("assay/script_id", data=np.array([b"ActivityScan_v1.0"]))
+        f.create_dataset("assay/inputs/record_time", data=np.array([b"30"]))
+        f.create_dataset("wellplate/id", data=np.array([b"M07474"]))
+        f.create_dataset("wellplate/version", data=np.array([b"MaxTwo 6 multi-well MEA"]))
+        for well in wells:
+            f.create_dataset(f"wellplate/well{well:03d}/Plating Date", data=np.array([b"28.3.2024"]))
+            f.create_dataset(f"wellplate/well{well:03d}/name", data=np.array([str(well + 1).encode()]))
+            for rec in range(n_recordings):
+                g = f.create_group(f"wells/well{well:03d}/rec{rec:04d}")
+                mapping = np.zeros(4, dtype=mapping_dtype)
+                mapping["channel"] = np.arange(4)
+                mapping["electrode"] = np.arange(4) + 4 * rec  # a different subset every recording
+                g.create_dataset("settings/mapping", data=mapping)
+                g.create_dataset("settings/sampling", data=np.array([20000.0]))
+                g.create_dataset("settings/lsb", data=np.array([6.3e-6]))
+                spikes = np.zeros(5, dtype=spike_dtype)
+                spikes["channel"] = np.arange(5) % 4
+                spikes["amplitude"] = -20
+                g.create_dataset("spikes", data=spikes)
+                start = 1713555896329 + rec * 40_000
+                g.create_dataset("start_time", data=np.array([start]))
+                g.create_dataset("stop_time", data=np.array([start + 30_000]))
+                f[f"recordings/rec{rec:04d}/well{well:03d}"] = g
+    return path
+
+
+def test_describe_reads_what_a_scope_activity_scan_says_about_itself(tmp_path):
+    src = _scope_activity_scan_h5(tmp_path / "M07474_240419.h5")
+
+    d = store.describe_recording(src)
+
+    assert d.ok and d.problems == [] and d.warnings == []
+    assert d.chip == "M07474" and d.system == "M2"
+    assert d.script_id == "ActivityScan_v1.0" and d.kind_guess == "activity_scan"
+    assert d.record_time == 30 and d.recorded_date == 240419 and d.recorded_at.startswith("2024-04-19")
+    assert d.plating_date == 240328 and d.metadata is None
+    assert [w.well for w in d.wells] == [0, 1]
+    w = d.wells[0]
+    assert (w.n_recordings, w.n_spikes, w.n_channels, w.n_electrodes) == (3, 15, 4, 12)
+    assert w.sampling_hz == 20000.0 and abs(w.seconds - 90) < 1e-6 and not w.has_raw
+    assert w.plating_date == 240328 and w.wellplate["name"] == "1"
+
+
+def test_describe_guesses_a_network_scan_from_one_raw_recording(tmp_path):
+    src = _scope_activity_scan_h5(tmp_path / "net.h5", wells=(0,), n_recordings=1)
+    import h5py
+
+    with h5py.File(src, "r+") as f:
+        del f["assay/script_id"]
+        f.create_dataset("wells/well000/rec0000/groups/routed/raw", data=np.zeros((4, 10), dtype="<i2"))
+
+    d = store.describe_recording(src)
+    assert d.ok and d.kind_guess == "network_scan" and d.wells[0].has_raw
+
+
+def test_describe_reports_instead_of_raising(tmp_path):
+    import h5py
+
+    not_h5 = tmp_path / "notes.h5"
+    not_h5.write_bytes(b"just text")
+    assert store.describe_recording(not_h5).problems[0].startswith("Not an HDF5 file")
+    assert store.describe_recording(tmp_path / "missing.h5").problems[0].startswith("Cannot read")
+
+    flat = tmp_path / "flat.h5"
+    with h5py.File(flat, "w") as f:
+        f.create_dataset("sig", data=np.arange(3))
+    d = store.describe_recording(flat)
+    assert not d.ok and "/wells" in d.problems[0] and d.kind_guess == "experiment"
+
+    empty_well = tmp_path / "empty.h5"
+    with h5py.File(empty_well, "w") as f:
+        f.create_dataset("wells/well000/rec0000/events", data=np.arange(0))
+    d = store.describe_recording(empty_well)
+    assert not d.ok and "lack spikes" in d.problems[0]
+
+
+def test_describe_keeps_mxtreme_scan_metadata(tmp_path):
+    src = _multiwell_h5(tmp_path / "combined.raw.h5")
+    d = store.describe_recording(src)
+    assert d.metadata["Chip ID"] == "C1" and d.metadata["Well IDs"] == [0, 3]
+    assert d.chip is None  # MXtreme's own scans carry no /wellplate group in this fixture
+
+
+def test_ingest_files_a_scope_activity_scan_as_an_activity_scan(tmp_path):
+    """An outside scan lands under the scan tail and registers as a scan, so it reads back exactly
+    like one MXtreme ran: kind from the name, blank exp_id, blob carrying the batch as exp id."""
+    import h5py
+
+    from mxtreme.scans.electrode_selection import load_activity_scan
+
+    config = Config(data_root=tmp_path / "ms")
+    src = _scope_activity_scan_h5(tmp_path / "M07474_240419.h5")
+
+    written = store.ingest_recording(
+        src, config, batch="spring2024_batch1_DRG_M2", plate_date=240328, chip="M07474", div=22,
+        kind="activity_scan", wells=[1], actor="kam", note="from the Scope archive",
+        on_progress=lambda _: None,
+    )
+
+    assert sorted(written) == [1]
+    dest = written[1]
+    assert dest.name.endswith("_well_1_DIV_22_activity_scan.raw.h5")
+    assert store.recording_kind(dest) == "activity_scan"
+    location = store.parse_recording_path(dest, config.recordings_dir)
+    assert (location.kind, location.well, location.div) == ("activity_scan", 1, 22) and not location.exp_id
+
+    df = pd.read_csv(config.registry_path, keep_default_na=False)
+    assert len(df) == 1
+    row = df.iloc[0]
+    assert (row["kind"], row["exp_id"], int(row["well"]), int(row["div"])) == ("activity_scan", "", 1, 22)
+
+    with h5py.File(dest, "r") as f:
+        blob = eval(f["assay/metadata"][:][0].decode())
+        assert list(f["wells"]) == ["well001"]
+    assert blob["Exp ID"] == "spring2024_batch1_DRG_M2" and blob["Well IDs"] == [1]
+    assert sorted(load_activity_scan(str(dest))) == [1]  # the selection pipeline reads it
+
+    log = transactions.read(config)
+    assert [t.op for t in log] == ["recording.ingested"]
+    assert (log[0].actor, log[0].note, log[0].data["kind"]) == ("kam", "from the Scope archive", "activity_scan")
+    assert log[0].exp_id == "spring2024_batch1_DRG_M2"
+    assert src.exists()  # copied; only the chosen well was split out
+
+
+def test_ingest_derives_record_time_for_a_scan_that_lacks_it(tmp_path):
+    import h5py
+
+    config = Config(data_root=tmp_path / "ms")
+    src = _scope_activity_scan_h5(tmp_path / "scan.h5", wells=(0,))
+    with h5py.File(src, "r+") as f:
+        del f["assay/inputs/record_time"]
+
+    written = store.ingest_recording(
+        src, config, batch=BATCH, plate_date=240328, chip="M07474", div=22,
+        kind="activity_scan", on_progress=lambda _: None,
+    )
+    with h5py.File(written[0], "r") as f:
+        assert int(f["assay/inputs/record_time"][0]) == 30  # from the start/stop stamps
+
+
+def test_ingest_wells_must_exist_and_a_scan_takes_no_exp_id(tmp_path):
+    config = Config(data_root=tmp_path / "ms")
+    src = _scope_activity_scan_h5(tmp_path / "scan.h5")
+    common = {"batch": BATCH, "plate_date": 240328, "chip": "M07474", "div": 22, "on_progress": lambda _: None}
+
+    with pytest.raises(ValueError, match="holds no well"):
+        store.ingest_recording(src, config, kind="activity_scan", wells=[5], **common)
+    with pytest.raises(ValueError, match="exp_id"):
+        store.ingest_recording(src, config, kind="network_scan", exp_id="x", **common)
+    with pytest.raises(ValueError, match="exp_id"):
+        store.ingest_recording(src, config, **common)  # an experiment with no name
+    with pytest.raises(ValueError, match="kind"):
+        store.ingest_recording(src, config, kind="stimulation", exp_id="x", **common)
+    assert not (config.data_root / "recordings").exists()
+
+
+def test_split_by_well_can_pick_wells(tmp_path):
+    src = _multiwell_h5(tmp_path / "combined.raw.h5")
+    written = store.split_by_well(src, lambda w: tmp_path / f"w{w}.h5", wells=[3], on_progress=lambda _: None)
+    assert sorted(written) == [3]
+    with pytest.raises(ValueError, match="holds no well"):
+        store.split_by_well(src, lambda w: tmp_path / f"x{w}.h5", wells=[1], on_progress=lambda _: None)

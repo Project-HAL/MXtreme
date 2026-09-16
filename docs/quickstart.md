@@ -161,6 +161,27 @@ The file is copied into `.../well_<w>/DIV_<div>/` under the canonical name (pass
 it instead), a multi-well file is split into one file per well, and each well gets an `experiment`
 row in `registry.csv`.
 
+A scan recorded by MaxLab Live's own assays (Scope's Activity Scan, a network recording made from
+its Record tab) is not an experiment: pass `kind="activity_scan"` or `kind="network_scan"` instead
+of an `exp_id`, and it is filed under the scan tail and registered as that kind — indistinguishable
+in the store from a scan MXtreme ran, so electrode selection and the analysis chain read it as one.
+`wells=[...]` keeps only the plated wells of a multi-well plate. Before deciding what a file is,
+{func}`mxtreme.store.describe_recording` reads what it says about itself — the chip Scope wrote to
+`/wellplate/id`, the wells with data, the recording count per well, when it was recorded, the
+plating date typed into Scope, and a guess at the kind — and lists any reason it cannot be
+ingested, without raising:
+
+```python
+from mxtreme.store import describe_recording
+
+d = describe_recording("/path/to/M07460_260831.h5")
+if d.ok:
+    ingest_recording(d.path, config, batch="fall2026_batch1_DRG_M1", plate_date=260810,
+                     chip=d.chip, div=21, kind=d.kind_guess, wells=[w.well for w in d.wells])
+else:
+    print(d.problems)
+```
+
 ## Analysis 
 
 Raw `.h5` file(s) to a PDF report. Each step writes to the managed store, so you can
