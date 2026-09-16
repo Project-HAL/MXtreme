@@ -64,6 +64,14 @@ class Config:
         return self.data_root / "trash"
 
     @property
+    def incoming_dir(self) -> Path:
+        """Where a front end stages a recording on its way into the store -- a file uploaded
+        through a browser, say -- before :func:`mxtreme.store.ingest_recording` files it. Inside
+        the store so that the final move is a rename on the same filesystem, not a second copy of
+        a multi-gigabyte recording. Nothing here is registered; a leftover is safe to delete."""
+        return self.data_root / "incoming"
+
+    @property
     def transactions_path(self) -> Path:
         """Path to the append-only log of decisions made about the data (a culture marked dead,
         a chip's device kind) -- see :mod:`mxtreme.transactions`."""

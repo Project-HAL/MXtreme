@@ -60,7 +60,7 @@ OPS: dict[str, str] = {
     # -- what MXtreme did to the store, journaled by the function that did it ---------------------
     "activity_scan.registered": "recording",  # data: {"path"}; one per well
     "network_scan.registered": "recording",  # data: {"path"}; one per well
-    "recording.ingested": "recording",  # data: {"source", "path", "moved"}; one per well
+    "recording.ingested": "recording",  # data: {"source", "path", "moved", "kind"}; one per well
     "preprocessed.saved": "recording",  # data: {"path", "source"}
     "preprocessed.repaired": "recording",  # data: {"path"}; spike order fixed in place
     "bursts.saved": "recording",  # data: {"path", "n_bursts"}

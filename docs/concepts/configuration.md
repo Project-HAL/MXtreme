@@ -24,6 +24,7 @@ later stage reads back from there. The structure is as follows:
 ├── analysis/                      per-culture summary CSVs, plots, PDF reports
 │   ├── <category>/<exp_id>/<chip>/well<N>/<culture_id>_<name>.csv
 │   └── reports/<slug>_report.pdf
+├── incoming/                      a front end's staging area for files on their way in (not registered)
 ├── trash/                         what remove_recording took out, at its store-relative path
 ├── registry.csv                   index of every raw file and recording in the store
 └── transactions.jsonl             append-only journal of everything that changed the store
@@ -87,6 +88,7 @@ subtree:
 | {attr}`~mxtreme.config.Config.burst_data_dir` | `data_root/burst_data` |
 | {attr}`~mxtreme.config.Config.analysis_dir` | `data_root/analysis` |
 | {attr}`~mxtreme.config.Config.registry_path` | `data_root/registry.csv` |
+| {attr}`~mxtreme.config.Config.incoming_dir` | `data_root/incoming` |
 | {attr}`~mxtreme.config.Config.trash_dir` | `data_root/trash` |
 | {attr}`~mxtreme.config.Config.transactions_path` | `data_root/transactions.jsonl` |
 
@@ -155,7 +157,7 @@ Rows are keyed by `(exp_id, batch_id, chip, well, div, kind)`:
 | `exp_id` | the experiment's name — blank for scans, which have none |
 | `batch_id`, `plate_date` | which plating batch — blank for rows from before the recordings tree |
 | `chip`, `well`, `div` | which culture, on which day |
-| `kind` | `preprocessed`, `activity_scan`, `network_scan`, or `experiment` (an ingested raw file) |
+| `kind` | `preprocessed`, `activity_scan`, `network_scan`, or `experiment` (an ingested raw file with its own name; an ingested *scan* registers as the scan kind) |
 | `conditions` | the well's experimental condition, when it has one |
 | `timestamp` | when the row was written |
 

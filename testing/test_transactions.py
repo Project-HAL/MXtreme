@@ -192,7 +192,7 @@ def test_ingest_journals_each_well(config, tmp_path):
     log = tx.read(config)
     assert [t.op for t in log] == ["recording.ingested"]
     assert log[0].exp_id == "stim1" and log[0].batch_id == BATCH and log[0].div == 9
-    assert log[0].data == {"source": str(src), "path": str(written[0]), "moved": False}
+    assert log[0].data == {"source": str(src), "path": str(written[0]), "moved": False, "kind": "experiment"}
 
 
 def test_rebuild_registry_journals_once(config, make_well):
