@@ -174,7 +174,7 @@ Calibration is the step most likely to fail, so watch it:
   substitution and, once done, every electrode's `channel -> unit`; the protocol in the
   recording carries the electrodes actually driven. If it gives up after 8 routings, spread the
   site out: `inner_gap` and `return_radius` live in `$P` under `stim_site`, or on the command
-  line as one value, e.g. `--set 'stim_site={"shape":"focal","inner":2,"inner_gap":6,"return_radius":8,"return_points":"corners"}'`;
+  line as one value, e.g. `--set 'stim_site={"shape":"focal","inner":2,"inner_gap":6,"return_radius":9,"return_points":"diagonal"}'`;
 - `run` reports whether the protocol went into the recording. If it says it did not, the copy in
   `$DRY` is what `report` needs (`--protocol`).
 

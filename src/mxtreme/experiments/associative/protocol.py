@@ -146,10 +146,14 @@ def stim_site(center_um, site: dict) -> tuple[list[int], list[int]]:
     The ring is laid out around the driven block itself, a whole number of electrodes beyond its
     edge on every side, so it is symmetric about the block however the block falls on the grid.
     ``return_radius`` is the ring's distance from the site's centre along each axis, in
-    electrodes, rounded outward to the nearest symmetric position. ``"corners"`` puts one return
-    electrode at each corner; ``"corners+edges"`` adds the four edge midpoints, which sit half an
-    electrode off centre when the block's span is odd. Adjacent electrodes can land on the same
-    stimulation unit, which routing refuses; widen ``inner_gap`` then.
+    electrodes, rounded outward to the nearest symmetric position. ``"diagonal"`` puts a return
+    electrode at two opposite corners; ``"corners"`` at all four; ``"corners+edges"`` adds the
+    four edge midpoints, which sit half an electrode off centre when the block's span is odd.
+
+    The chip's 32 stimulation units are not free for any electrode: each serves an area of the
+    array, and an area exposes only about seven of them (measured on a MaxOne: a site's electrodes
+    all drew from the same seven). A 2x2 block with a four-corner ring asks one area for eight,
+    which cannot be met; with ``"diagonal"`` it asks for six, which can.
     """
     import math
 
@@ -175,10 +179,16 @@ def stim_site(center_um, site: dict) -> tuple[list[int], list[int]]:
     centre = nearest_electrode(*center_um)
     col0, row0 = centre % COLS, centre // COLS
     lo, hi = offsets[0] - margin, offsets[-1] + margin
-    points = [(lo, lo), (hi, lo), (lo, hi), (hi, hi)]
-    if site.get("return_points", "corners") == "corners+edges":
-        mid = math.floor((offsets[0] + offsets[-1]) / 2)
-        points += [(mid, lo), (mid, hi), (lo, mid), (hi, mid)]
+    kind = site.get("return_points", "corners")
+    if kind == "diagonal":
+        points = [(lo, lo), (hi, hi)]
+    elif kind in ("corners", "corners+edges"):
+        points = [(lo, lo), (hi, lo), (lo, hi), (hi, hi)]
+        if kind == "corners+edges":
+            mid = math.floor((offsets[0] + offsets[-1]) / 2)
+            points += [(mid, lo), (mid, hi), (lo, mid), (hi, mid)]
+    else:
+        raise ValueError(f"return_points must be diagonal, corners or corners+edges, not {kind!r}")
     ring = []
     for dx, dy in points:
         electrode = electrode_at(col0 + dx, row0 + dy)
@@ -215,8 +225,8 @@ def site_footprint(site: dict) -> dict:
     block = (sum(p[0] for p in xy) / len(xy), sum(p[1] for p in xy) / len(xy))
     ring_um = offset_um = 0.0
     if ring:
-        corners = [electrode_xy(e) for e in ring[:4]]
-        ring_centre = (sum(p[0] for p in corners) / 4, sum(p[1] for p in corners) / 4)
+        corners = [electrode_xy(e) for e in ring[: min(4, len(ring))]]
+        ring_centre = (sum(p[0] for p in corners) / len(corners), sum(p[1] for p in corners) / len(corners))
         ring_um = separation_um(corners[0], block)
         offset_um = separation_um(ring_centre, block)
     return {

@@ -148,9 +148,9 @@ class AssociativeParams:
         default_factory=lambda: {
             "shape": "focal",
             "inner": 2,
-            "inner_gap": 4,
-            "return_radius": 6,
-            "return_points": "corners",
+            "inner_gap": 6,
+            "return_radius": 8,
+            "return_points": "diagonal",
         }
     )
     region_dacs: dict[str, int] = field(default_factory=lambda: {"US": 0, "CS": 1, "NS": 2})

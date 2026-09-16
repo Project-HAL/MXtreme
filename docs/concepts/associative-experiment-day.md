@@ -444,22 +444,24 @@ third day measures how much of any decay is the probing.
 counted:
 
 ```
-site: 4 driven electrodes spanning 88 um, return ring at 161 um;
-      response measured over 150 um; 24 of 32 stimulation units
+site: 4 driven electrodes spanning 122 um, return ring at 210 um;
+      response measured over 150 um; 18 of 32 stimulation units
 ```
 
-The driven block spans 88 µm; the return ring sits around it, centred on it, just outside the
-150 µm counting radius, so a region's count is its driven block's response. The binding
-constraint is stimulation units: 32 on the chip, one per stimulation electrode, shared by three
-regions.
+The driven block spans 122 µm; the two return electrodes sit at opposite corners around it,
+centred on it, outside the 150 µm counting radius, so a region's count is its driven block's
+response. The binding constraint is stimulation units: 32 on the chip, one per stimulation
+electrode — and, measured on a MaxOne, each *area* of the chip exposes only about seven of them,
+so a site of eight electrodes (a 2x2 with a four-corner ring) cannot be connected while one of six
+can. That is why the default ring is two corners.
 
-| site | units total | driven span | fits? |
-|---|---|---|---|
-| focal 2x2, `inner_gap` 0 | 24 | 17.5 µm | yes, but single-neuron scale |
-| focal 2x2, `inner_gap` 4 (default) | 24 | 87.5 µm | yes |
-| focal 2x2, `inner_gap` 7, `return_radius` 9 | 24 | 140 µm | yes |
-| focal 3x3 | 39 | 105 µm | **no**, refused |
-| grid 3x3, gap 2 (no ring) | 27 | 105 µm | yes, but no spatial charge balance |
+| site | units total | per site | driven span | fits? |
+|---|---|---|---|---|
+| focal 2x2, `inner_gap` 6, two returns (default) | 18 | 6 | 122.5 µm | yes |
+| focal 2x2, `inner_gap` 4, four returns | 24 | 8 | 87.5 µm | routes, but one area rarely has 8 free units |
+| focal 2x2, `inner_gap` 7, `return_radius` 9, two returns | 18 | 6 | 140 µm | yes |
+| focal 3x3, two returns | 33 | 11 | 122.5 µm | **no**, refused |
+| grid 3x3, gap 2 (no ring) | 27 | 9 | 105 µm | routes, but 9 per area is over the ~7 available |
 
 Widen a focal site with `inner_gap`, never `inner`.
 

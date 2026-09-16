@@ -403,13 +403,15 @@ def test_site_footprint_and_the_unit_budget():
 
     default = AssociativeParams.from_json(os.path.join(PACKAGE, "params_default.json"))
     f = site_footprint(default.stim_site)
-    assert f["units"] == 8 and f["units"] * 3 <= STIM_UNITS
+    # Two return electrodes, not four: a chip area exposes only about seven stimulation units, and
+    # a site of eight electrodes could not be connected on the rig while one of six can.
+    assert f["units"] == 6 and f["units"] * 3 <= STIM_UNITS
     # The stimulation site fills the region whose response is measured, rather than being a point
     # inside it.
-    assert f["driven_span_um"] == pytest.approx(87.5)
+    assert f["driven_span_um"] == pytest.approx(122.5)
     assert f["ring_offset_um"] == pytest.approx(0.0)
-    # The ring sits just outside the measured region, so a region's count is the driven block's.
-    assert default.region_radius_um < f["ring_radius_um"] < default.region_radius_um + 20
+    # The ring sits outside the measured region, so a region's count is the driven block's.
+    assert default.region_radius_um < f["ring_radius_um"] < default.region_radius_um + 80
 
     # A 3x3 focal site needs 13 units per region, 39 for three, and cannot route.
     with pytest.raises(ValueError, match="stimulation units"):
