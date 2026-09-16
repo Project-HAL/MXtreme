@@ -92,11 +92,13 @@ Why each number is what it is: [the stimulus rationale](associative-stimulus-rat
 
 ## 0. Set up, on the rig
 
-Everything runs in braintrix-cli's environment, which already has MXtreme and `maxlab`.
+Everything runs from the environment braintrix-cli runs from on the rig (`conda activate jkts`
+at the time of writing), which already has MXtreme and `maxlab`; nothing here installs anything.
+The dry run's step 0 says how to check it sees the right MXtreme checkout and branch.
 
 ```bash
 cd <path to>/braintrix-cli
-source .venv/bin/activate
+conda activate jkts
 PKG=../MXtreme/src/mxtreme/experiments/associative
 CFG=~/.config/mxtreme/mxtreme.toml     # the store braintrix-cli's header names; $MXTREME_CONFIG wins if set
 grep root $CFG                         # the store's root, for STORE below

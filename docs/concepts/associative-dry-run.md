@@ -24,19 +24,28 @@ beside it is never mistaken for data.
 
 ## 0. Set up, on the rig
 
+Everything runs from the environment braintrix-cli runs from on the rig (at the time of writing
+`conda activate jkts`; braintrix-cli's README describes a venv, but the rig's is a conda env).
+Nothing here installs anything into it, and the shell variables live only in this shell. Before
+anything else, check that the environment sees the right MXtreme:
+
 ```bash
 cd <path to>/braintrix-cli
-source .venv/bin/activate
+conda activate jkts
+python -c "import maxlab, mxtreme; print(mxtreme.__file__)"
+```
+
+It should print a path inside the `../MXtreme` checkout (an editable install). Then `git -C
+../MXtreme branch --show-current` should say `boire/associative-learning`; if not, check it out
+there, and check the previous branch back out when you are done. If the printed path is *not* the
+checkout — MXtreme was installed as a copy — the new code is not what runs, and `pip install -e
+../MXtreme` in that env fixes it; that is the one change to the env this procedure can ask for,
+and `pip uninstall mxtreme` followed by whatever was installed before undoes it.
+
+```bash
 PKG=../MXtreme/src/mxtreme/experiments/associative
 grep root ~/.config/mxtreme/mxtreme.toml      # or the file braintrix-cli's header names
 ```
-
-Nothing is installed by this. braintrix-cli's venv already holds MXtreme as an editable install
-pointing at `../MXtreme`, so `python -m mxtreme.experiments.associative` runs from it as it is,
-and the shell variables live only in this shell. `deactivate` (or closing the terminal) is the
-whole undo. The one thing that has to be true is that `../MXtreme` is checked out on the
-`boire/associative-learning` branch — a `git checkout` there, not an install; switch it back
-afterwards if the rig normally runs another branch.
 
 ```bash
 BATCH=fall2026_batch1_saline_M1     # M1 on a MaxOne, M2 on a MaxTwo: run checks it against the device
@@ -53,36 +62,42 @@ The scan path is braintrix-cli's and needs no rehearsal. What the dry run starts
 recording it would hand over on the day: a network scan of a live culture, taken from the store.
 
 ```bash
-LIVE=$STORE/recordings/plating_<date>_<batch>/chip_<M1|M2>_<chip>/well_<N>/DIV_<d>/<stem>_network_scan.raw.h5
-WELL=<N>                            # the well that scan recorded; 0 on a MaxOne
+CULTURE=$STORE/recordings/plating_<date>_<batch>/chip_<M1|M2>_<chip>/well_<N>/DIV_<d>
+LIVE=$CULTURE/<stem>_network_scan.raw.h5
+SCAN=$CULTURE/<stem>_activity_scan.raw.h5
+WELL=<N>                            # the well those scans recorded; 0 on a MaxOne
 ```
 
-It has to be a single continuous recording (a network scan is; an activity scan is not — `select`
-refuses one, since a scan is many short recordings whose spike times do not line up). Nothing
-about the chip it came from is used: electrode numbers are positions on the array, laid out the
-same on every chip, and routing is solved afresh on the saline chip when a run starts.
+The network scan is the baseline (one continuous recording of the active set; `select` refuses an
+activity scan in that role, since a scan is many short recordings whose spike times do not line
+up). The activity scan is what the stimulation sites are placed on. Nothing about the chip they
+came from is used: electrode numbers are positions on the array, laid out the same on every chip,
+and routing is solved afresh on the saline chip when a run starts.
 
 ## 2. Choose the regions from it
 
 ```bash
 python -m mxtreme.experiments.associative select \
   --params $PKG/params_dryrun.json --out $DRY \
-  --baseline $LIVE --candidates 6 \
+  --baseline $LIVE --activity-scan $SCAN --candidates 6 \
   --set batch=$BATCH --set chip=$CHIP --set plate_date=$PLATE --set div=0 --set well=$WELL --set save_path=$DRY
 P=$(ls $DRY/*_params.json)
 ```
 
-Because the baseline is a live culture's, this is the full selection path, not the silent-chip
-shortcut: it ranks patches, measures their coupling, assigns roles, moves each driven block onto
-electrodes with recorded spikes, and writes the coupling and regions figures into `$DRY` — read
-them as you would on the day, since they are what the day's `select` will print. The regions are
-that culture's, which is fine: the saline chip is only going to fire pulses at them.
+This is the day's own invocation, on a live culture's files, so it is the full selection path and
+not the silent-chip shortcut: it ranks the network scan's patches, measures their coupling,
+assigns roles, moves each driven block onto electrodes the *activity scan* recorded spikes from,
+and writes the coupling and regions figures into `$DRY` — read them as you would on the day. The
+regions are that culture's, which is fine: the saline chip is only going to fire pulses at them.
 
-Expect the site placement line to read "1 of 4" or "2 of 4 driven electrodes active" here: a
-network scan alone knows only its few hundred electrodes, 100 µm apart, so most of a driven
-block's four have no recording to be judged by. On the day `select` is also given the activity
-scan, which covers every electrode. If that culture's activity scan is in the store too, pass it
-with `--activity-scan <..._activity_scan.raw.h5>` and the placement line becomes the real thing.
+The two scans play different parts, and using both is not a mismatch. The **recording** set is
+the network scan's electrodes (the active set braintrix-cli chose, 100 µm apart) plus every
+electrode the activity scan found active inside the three regions, so the readout counts on as
+many electrodes as the culture has there. The **stimulation** electrodes — four driven and four
+return per site — are routed separately, on top of that set, and need not be in it; they are the
+ones the activity scan is used to place, because it is the only recording that covers every
+electrode and can say whether a particular one has a neuron under it. Expect "3 of 4" or "4 of 4
+driven electrodes active" per region.
 
 If it refuses (`only N patches qualify`), place them by hand instead:
 
