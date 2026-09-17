@@ -14,7 +14,7 @@ recording (:mod:`.report`). Choosing where the three regions go is :mod:`.select
 needs ``maxlab`` except :mod:`.run` and the rig steps of :mod:`.select`, which import it on use.
 
 Two short runs gate the long one, and both report back before a culture is committed
-(:mod:`.checks`): ``calibration`` finds each region's amplitude, and ``connectivity`` measures how
+(:mod:`.checks`): ``calibration`` finds each region's amplitude, and the session's baseline block measures how
 much stimulating each region alone drives the other two. Sites that turn out not to be
 independent, or not connected at all, are worth knowing about before four hours of conditioning.
 
@@ -24,8 +24,8 @@ independent, or not connected at all, are worth knowing about before four hours 
     python -m mxtreme.experiments.associative preview  --params <the file select wrote> --config mxtreme.toml
     python -m mxtreme.experiments.associative run      --params <same> --config mxtreme.toml --mode calibration
     python -m mxtreme.experiments.associative compare  <calibration>.raw.h5 <calibration, other pattern>.raw.h5
-    python -m mxtreme.experiments.associative run      --params <same, amplitudes filled in> --config mxtreme.toml --mode connectivity
-    python -m mxtreme.experiments.associative run      --params <same> --config mxtreme.toml --phase session
+    python -m mxtreme.experiments.associative report   <calibration>.raw.h5 --apply <the parameter file>
+    python -m mxtreme.experiments.associative run      --params <same, amplitudes filled in> --config mxtreme.toml --phase session
     python -m mxtreme.experiments.associative report   <every recording of the session>.raw.h5 -o <work dir>/session.png
 
 The store gets the recordings and nothing else; each carries its own protocol, so ``report`` needs

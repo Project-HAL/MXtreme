@@ -17,7 +17,7 @@ from mxtreme import store
 
 ROLES = ("US", "CS", "NS")
 PAIR = "PAIR"
-MODES = ("conditioning", "calibration", "connectivity")
+MODES = ("conditioning", "calibration")
 RAW_TRACES = ("none", "regions", "all")
 
 
@@ -53,11 +53,16 @@ class AssociativeParams:
         written back here so every later run drives the same electrodes). Honoured only while
         ``stim_electrodes_site`` still equals ``stim_site``; a different site is built from the
         centres again.
+    :param routing_cfg: The routing (electrode-to-channel map) the first run solved, saved as a
+        MaxLab ``.cfg`` in the work directory and written back here by ``run``. Later runs load
+        it instead of routing again: the router is not reproducible, a stimulation unit is a
+        function of the channel, so only the same routing gives the same units and the same
+        driven electrodes.
     :param amplitudes_mv: Per role, **mV per phase**, from a calibration run. Peak to peak is
         twice this, which is the number stimulation papers usually quote: 80 here is 160 mV
         peak to peak.
     :param amplitudes_source: Where ``amplitudes_mv`` came from -- the calibration recording's
-        name, as its report prints it. ``"default"`` means nobody calibrated, and a connectivity or
+        name, as its report prints it. ``"default"`` means nobody calibrated, and a
         conditioning run refuses to start on it.
     :param min_region_separation_um: :mod:`.select` refuses closer centres.
     :param region_radius_um: Recording electrodes within this of a centre belong to the region.
@@ -81,8 +86,7 @@ class AssociativeParams:
 
     The schedule (see :mod:`.protocol`):
 
-    :param mode: ``"conditioning"``, ``"calibration"`` (find each region's amplitude), or
-        ``"connectivity"`` (check how much stimulating each region alone drives the other two).
+    :param mode: ``"conditioning"``, ``"calibration"`` (find each region's amplitude), or.
     :param pre_min: Minutes of nothing before the first probe.
     :param probe_roles: Roles probed in the baseline block.
     :param probe_reps: Probes of each role per probe block.
@@ -121,8 +125,6 @@ class AssociativeParams:
         arrays, and well inside the water window that keeps voltage stimulation from electrolysing
         the electrode. Raising it is a deliberate act: nothing in
         this package knows your electrodes' impedance or history.
-    :param check_reps: Connectivity mode: single pulses per region.
-    :param check_iti: Connectivity mode: seconds between pulses.
     :param crosstalk_warn: Connectivity mode: warn when a region's response to another region's
         stimulus reaches this fraction of that region's own local response.
     :param burst_warn: Connectivity mode: warn when this fraction of pulses is followed by a
@@ -153,6 +155,7 @@ class AssociativeParams:
     regions: dict[str, list[float]] = field(default_factory=dict)
     stim_electrodes: dict[str, list[int]] = field(default_factory=dict)
     stim_electrodes_site: dict = field(default_factory=dict)
+    routing_cfg: str | None = None
     amplitudes_mv: dict[str, float] = field(default_factory=lambda: {r: 80.0 for r in ROLES})
     amplitudes_source: str = "default"
     min_region_separation_um: float = 1000.0
@@ -194,8 +197,6 @@ class AssociativeParams:
     calibration_reps: int = 6
     calibration_iti: float = 3.0
     max_amplitude_mv: float = 120.0
-    check_reps: int = 20
-    check_iti: float = 5.0
     crosstalk_warn: float = 0.3
     burst_warn: float = 0.2
     raw_traces: str = "none"

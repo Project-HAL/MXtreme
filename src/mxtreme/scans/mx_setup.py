@@ -460,7 +460,14 @@ def _connect_with_alternatives(array, stim: List[int], routed: set, avoid: set):
     return units, used, failed, table
 
 
-def init_well_stim(well: int, rec_elecs: List[int] | str, stim_elecs: List[int], max_attempts: int = 8):
+def init_well_stim(
+    well: int,
+    rec_elecs: List[int] | str,
+    stim_elecs: List[int],
+    max_attempts: int = 8,
+    config_path: str | None = None,
+    save_to: str | None = None,
+):
     """Like :func:`init_well` with ``connect=True, power_up=False``, but every stimulation electrode
     ends up on a stimulation unit of its own, by substituting neighbours where the chip demands it.
 
@@ -472,6 +479,12 @@ def init_well_stim(well: int, rec_elecs: List[int] | str, stim_elecs: List[int],
     electrodes' neighbourhoods (up to three pitches) routed as candidates, and the connecting
     tried again. The electrodes actually connected are returned, and every (electrode, channel,
     unit) seen is printed, so the chip's channel-to-unit rule can be read off a dry run.
+
+    The router is not reproducible from one call to the next, and the unit follows the channel,
+    so the only way to drive the same electrodes through the same units every run is to keep the
+    routing: ``save_to`` writes the solved routing as a MaxLab ``.cfg``, and ``config_path`` loads
+    one instead of routing. A loaded routing that does not carry every stimulation electrode, or
+    still clashes, falls back to routing afresh (and says so).
 
     :returns: ``(array, stimulation units, stimulation electrodes actually used)``, the last two
         in the order of ``stim_elecs``.
@@ -488,7 +501,27 @@ def init_well_stim(well: int, rec_elecs: List[int] | str, stim_elecs: List[int],
     stim = list(stim_elecs)
     extra: List[int] = []
     seen: dict = {}
+    loaded = False
+    if config_path and os.path.exists(config_path):
+        array.load_config(config_path)
+        routed = {m.electrode for m in array.get_config().mappings}
+        missing = [e for e in stim if e not in routed]
+        if missing:
+            print(f"routing {config_path} does not carry stimulation electrode(s) {missing}; routing afresh")
+        else:
+            units, used, failed, table = _connect_with_alternatives(array, stim, routed, set(stim_elecs))
+            seen.update(table)
+            if failed:
+                print(f"routing {config_path} leaves {failed} without a free stimulation unit; routing afresh")
+            else:
+                stim, loaded = used, True
+                print(f"routing loaded from {config_path}: {len(routed)} electrodes, no routing done")
+        if not loaded:
+            array.reset()
+            array.clear_selected_electrodes()
     for attempt in range(max_attempts):
+        if loaded:
+            break
         routed = route_with_stimulation(array, elec_nums, stim, extra=extra)
         units, used, failed, table = _connect_with_alternatives(array, stim, routed, set(stim_elecs))
         seen.update(table)
@@ -512,6 +545,9 @@ def init_well_stim(well: int, rec_elecs: List[int] | str, stim_elecs: List[int],
     print("stimulation electrodes connected (electrode: channel -> unit): " + ", ".join(
         f"e{e}: {seen[e][0]} -> {seen[e][1]}" for e in stim if e in seen
     ))
+    if save_to and not loaded:
+        array.save_config(save_to)
+        print(f"routing saved to {save_to}; later runs load it instead of routing")
 
     array.download([well])
     time.sleep(mx.Timing.waitAfterDownload)

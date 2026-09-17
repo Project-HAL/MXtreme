@@ -208,11 +208,12 @@ def test_report_reads_a_spikes_only_multi_recording_file_by_itself(tmp_path, cap
     params = _params(
         regions={"US": list(CENTRES[0]), "CS": list(CENTRES[1]), "NS": list(CENTRES[2])},
         rec_electrodes=list(range(0, protocol.NUM_ELECTRODES, 11)),
-        mode="connectivity",
-        check_reps=2,
-        check_iti=2,
+        phase="baseline",
+        probe_reps=3,
+        probe_iti=4,
+        t_probe=1,
+        encode_probe_sec=1,
         pre_min=0.05,
-        post_min=0.05,
     )
     blocks, stimuli = protocol.build_schedule(params)
     record, regions = _record(params, blocks, stimuli)
@@ -236,7 +237,7 @@ def test_report_reads_a_spikes_only_multi_recording_file_by_itself(tmp_path, cap
     path = tmp_path / "run.raw.h5"
     _write(path, recs, assay={PROTOCOL_KEY: json.dumps(record, separators=(",", ":"))})
 
-    assert load_protocol(str(path))["params"]["mode"] == "connectivity"
+    assert load_protocol(str(path))["params"]["phase"] == "baseline"
     rows = report(str(path))  # no --protocol, no outputs
     text = capsys.readouterr().out
     assert "2 recording(s)" in text
@@ -528,10 +529,16 @@ def test_calibration_warns_when_cs_and_ns_are_not_matched_in_drive():
         row("NS", 120, 1.1),
     ]
     chosen, verdicts = calibration_verdicts(rows, ["CS", "NS"])
-    assert chosen["CS"]["local"] == 3.0 and chosen["NS"]["local"] == 1.1
-    match = [v for v in verdicts if "not matched in drive" in v.message]
-    assert len(match) == 1 and match[0].level == "warn"
-    assert "80 mV brings CS to 1.2" in match[0].message
+    # CS at 120 mV (3.0) is more than twice NS (1.1), so it steps down to 80 mV (1.2).
+    assert chosen["CS"]["amplitude_mv"] == 80 and chosen["CS"]["local"] == 1.2
+    assert chosen["NS"]["local"] == 1.1
+    step = [v for v in verdicts if "stepped down" in v.message]
+    assert len(step) == 1 and step[0].level == "ok" and "120 to 80 mV" in step[0].message
+    # With no lower rung within twice the weakest, it is flagged instead.
+    rows = [row("CS", 40, 5.0), row("CS", 80, 6.0), row("NS", 40, 0.6), row("NS", 80, 1.0)]
+    chosen, verdicts = calibration_verdicts(rows, ["CS", "NS"])
+    assert chosen["CS"]["amplitude_mv"] == 80
+    assert any(v.level == "warn" and "not matched in drive" in v.message for v in verdicts)
 
 
 def _session(tmp_path, phases, learned_from="retrieval", gap_sec=120.0):
@@ -626,9 +633,12 @@ def test_report_reads_a_split_session_as_one_curve(tmp_path, capsys):
     assert "[ok  ] association" in text
     assert (tmp_path / "s.csv").exists() and (tmp_path / "s.png").exists()
 
-    # One recording alone still reads, and says the session is not over.
+    # One recording alone still reads, gates the session on its baseline probes, and says the
+    # session is not over.
     report(paths[0])
-    assert "no retrieval block yet" in capsys.readouterr().out
+    text = capsys.readouterr().out
+    assert "=== baseline gate" in text
+    assert "no retrieval block yet" in text
 
 
 def test_the_silence_check_ignores_the_stimulation_artifact():

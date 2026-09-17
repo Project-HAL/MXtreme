@@ -31,9 +31,8 @@ def _params(**overrides):
 
 
 def test_a_run_refuses_uncalibrated_amplitudes_except_for_calibration_itself():
-    for mode in ("connectivity", "conditioning"):
-        with pytest.raises(ValueError, match="uncalibrated"):
-            _params(mode=mode, amplitudes_source="default").validate(for_run=True)
+    with pytest.raises(ValueError, match="uncalibrated"):
+        _params(mode="conditioning", amplitudes_source="default").validate(for_run=True)
     _params(mode="calibration", amplitudes_source="default").validate(for_run=True)
     _params(mode="conditioning", amplitudes_source="saline").validate(for_run=True)
 
@@ -383,21 +382,6 @@ def test_execute_schedule_fires_on_time_with_a_fake_clock():
         on_progress=lambda _s: None,
     )
     assert stopped and len(fired) < 5
-
-
-def test_connectivity_mode_is_single_pulses_interleaved():
-    params = _params(mode="connectivity", pre_min=1, post_min=1, check_reps=3, check_iti=4)
-    blocks, stimuli = protocol.build_schedule(params)
-    assert [b.label for b in blocks] == ["pre", "check", "post"]
-    check = blocks[1]
-    assert len(check.presentations) == 3 * 3
-    assert {p.token for p in check.presentations} == {"check_us", "check_cs", "check_ns"}
-    assert all(stimuli[p.token].num_events == 1 for p in check.presentations)
-    # Interleaved: each rep of three has all three roles.
-    for k in range(3):
-        rep = [p.token for p in check.presentations[3 * k : 3 * k + 3]]
-        assert sorted(rep) == ["check_cs", "check_ns", "check_us"]
-    assert check.duration_sec == pytest.approx(9 * 4)
 
 
 def test_overrides_apply_json_values_and_reject_unknown_keys():

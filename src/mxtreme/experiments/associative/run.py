@@ -53,6 +53,7 @@ class RunResult:
     fired_copy: Path | None = None
     phases: list[RunResult] = field(default_factory=list)  # every phase's result, in order
     stim_electrodes: dict[str, list[int]] = field(default_factory=dict)  # per role, as actually driven
+    routing_cfg: str | None = None  # the routing used, saved or loaded, for the parameter file
 
 
 #: What the MaxLab server's system type means, in the batch id's terms.
@@ -275,7 +276,12 @@ def run(
         groups[f"{role}_drive"] = spec.drive_electrodes
         if spec.return_electrodes:
             groups[f"{role}_return"] = spec.return_electrodes
-    array, units, used = sequences.init_well_regions(well, list(params.rec_electrodes), groups)
+    routing_cfg = params.routing_cfg
+    if routing_cfg is None and work is not None:
+        routing_cfg = str(Path(work) / f"{params.chip}_well{well}_DIV{params.div}_routing.cfg")
+    array, units, used = sequences.init_well_regions(
+        well, list(params.rec_electrodes), groups, config_path=routing_cfg, save_to=routing_cfg
+    )
     routed = array.get_config()
     on_progress(f"routed {len(routed.get_channels())} channels")
     # A stimulation electrode may have been swapped for a neighbour to get its own unit; the
@@ -363,6 +369,7 @@ def run(
         release(mx, well, list(registered))
     results[-1].phases = results
     results[-1].stim_electrodes = {role: list(spec.drive_electrodes) for role, spec in regions.items()}
+    results[-1].routing_cfg = routing_cfg if routing_cfg and Path(routing_cfg).exists() else None
     if len(results) > 1:
         on_progress(
             f"session: {len(results)} recordings\n  "

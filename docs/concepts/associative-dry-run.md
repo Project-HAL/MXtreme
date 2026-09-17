@@ -4,7 +4,7 @@ The same path as the [experiment day](associative-experiment-day.md), on a chip 
 Nothing fires, so nothing is learned, but every pulse leaves an artifact on the electrodes it went
 through, so the recordings answer what a dry run is asking: **did each stimulus fire where and
 when it was meant to?** The steps that need a culture (choosing regions, calibrating amplitude,
-measuring connectivity) run and come back empty; the steps that need hardware (routing,
+gating on the baseline) run and come back empty; the steps that need hardware (routing,
 stimulation-unit assignment, sequence length, DAC timing, artifact shape) are under test.
 
 ## How it differs from the real day
@@ -112,9 +112,13 @@ python -m mxtreme.experiments.associative select \
   --set batch=$BATCH --set chip=$CHIP --set plate_date=$PLATE --set div=0 --set well=$WELL --set save_path=$DRY
 ```
 
+`params_dryrun.json` is the day's parameter file with short values (two encode cycles, two
+calibration repeats, 15 s leads); which keys matter at which step, and how values get into `$P`,
+is in the day-of procedure under [Where the values live](associative-experiment-day.md#where-the-values-live).
+
 Either way `$P` carries the saline identity and `save_path=$DRY`, so every run below writes to
 `$DRY` and is not registered. `params_dryrun.json` also carries `amplitudes_source: "saline"`: on
-a culture a connectivity or conditioning run refuses to start until calibration's numbers have
+a culture a conditioning run refuses to start until calibration's numbers have
 been copied in, and saline has nothing to calibrate. It keeps raw traces on the three regions
 (`raw_traces: "regions"`), which the artifact check in step 6 needs.
 
@@ -160,8 +164,10 @@ Calibration is the step most likely to fail, so watch the run:
   clashing electrodes' neighbourhoods routed as candidates -- when none is free. It prints each
   substitution and, once done, every electrode's `channel -> unit`; the protocol in the
   recording carries the electrodes actually driven, and so does `$P`: `run` writes them back as
-  `stim_electrodes`, so every later run with the same `$P` drives exactly those and prints no
-  substitutions. If it gives up after 8 routings, spread the site out: `gap` lives in `$P` under
+  `stim_electrodes`, saves the routing it solved as a `.cfg` in `$DRY` and writes its path in as
+  `routing_cfg`. Every later run loads that routing (it prints `routing loaded from ...`) and
+  drives exactly those electrodes with no substitutions; a run that routes afresh would get
+  different channels, so different units, so different swaps. If it gives up after 8 routings, spread the site out: `gap` lives in `$P` under
   `stim_site`, or on the command line as one value, e.g.
   `--set 'stim_site={"shape":"grid","size":2,"gap":8}'` (a different site ignores the written-back
   electrodes and starts from the centres);
@@ -177,7 +183,7 @@ verdict says so and every response number is zero. What a dry run *can* pass or 
 | | healthy |
 |---|---|
 | presentations against the schedule | every token `ok`, intervals matching the parameters |
-| artifact on each driven electrode | a deflection at 0 ms on every pulse, one sign per polarity (saturating at ~±3.3 mV is normal on saline) |
+| artifact on each driven electrode | a deflection at 0 ms on every pulse, one sign per polarity (saturating at ~±3.2 mV is normal on saline), the amplifier at its rail for 50-200 ms and the electrode back within 100 µV well before the next pulse, which starts within a few tens of µV of the last: no `WARN` about carry-over |
 | the 5-50 ms readout window | empty: the artifact does not outlast it |
 
 In the figure the same three things are the timeline, the artifact panels, and a flat response
@@ -193,21 +199,17 @@ and picks the one that reaches threshold with less voltage, whatever it is calle
 for reading the literature's "anodic-first is more effective" onto ours, so note the winner's sign
 as recorded.
 
-## 5. Run, then read: connectivity and a whole conditioning schedule in one file
-
-```bash
-python -m mxtreme.experiments.associative run --params $P --mode connectivity --set exp_id=dry_conn --work $DRY
-python -m mxtreme.experiments.associative report $DRY/*_dry_conn.raw.h5 -o $DRY/dry_conn.png --csv $DRY/dry_conn.csv
-```
+## 5. Run, then read: a whole conditioning schedule in one file
 
 ```bash
 python -m mxtreme.experiments.associative run --params $P --set exp_id=dry_cond --work $DRY
 python -m mxtreme.experiments.associative report $DRY/*_dry_cond.raw.h5 -o $DRY/dry_cond.png --csv $DRY/dry_cond.csv
 ```
 
-About 7 minutes each. `dry_cond` is the conditioning schedule as one recording, the shape a
+About 7 minutes. `dry_cond` is the conditioning schedule as one recording, the shape a
 `--phase`-less run has; its report should show US and CS deflecting in the same frame on every
-paired pulse.
+paired pulse, and a `=== baseline gate ===` section computed from the baseline block's probes
+(all STOPs on saline, since nothing responds: the gate working).
 
 ## 6. Run, then read: the session as separate recordings
 
@@ -235,7 +237,7 @@ python -m mxtreme.experiments.associative report $DRY/*_dry_split_*.raw.h5 -o $D
 It should list the four recordings in order, count the same presentations as `dry_cond` did, and
 lay them out on one timeline with the seconds of file handling between them.
 
-## 7. Run, then read: the paths the first four miss
+## 7. Run, then read: the paths the first three miss
 
 ```bash
 python -m mxtreme.experiments.associative run --params $P --set exp_id=dry_offset --set dt_cs_us=20 --work $DRY
@@ -284,7 +286,7 @@ stimulation code any run makes.
 - [ ] `select` chose three regions from the live scan (or took `--centers`), placed the driven blocks on active electrodes, and wrote `$P` with the saline identity
 - [ ] `preview` says `$DRY`, not registered, raw traces on the regions, the three 2x2 blocks drawn
 - [ ] calibration printed the right device and ran without a routing error
-- [ ] connectivity and conditioning ran
+- [ ] conditioning ran, and its report printed the baseline gate
 - [ ] `--phase session` wrote four `dry_split_*` recordings from one command; the baseline one reported while the rest ran; one `report` over all four read them as one session, in order
 - [ ] `dry_offset` events say `units switched`; `dry_long` ran
 - [ ] `dry_cal_focal` either connected six electrodes per site and `compare` said nothing to compare, or refused and named the electrodes (note which)

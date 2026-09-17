@@ -1,11 +1,11 @@
-"""Turning a calibration or connectivity run into numbers and a verdict.
+"""Turning a calibration run, or the session's baseline block, into numbers and a verdict.
 
 These are the two gates before hours are spent conditioning a culture:
 
 - **calibration** asks, per region, which amplitude evokes a local response without setting off
   the whole culture (:func:`calibration_table`, :func:`calibration_verdicts`);
-- **connectivity** asks how much stimulating each region *alone* drives the other two
-  (:func:`crosstalk`, :func:`connectivity_verdicts`).
+- **the baseline gate** asks how much stimulating each region *alone* drives the other two
+  (:func:`crosstalk`, :func:`independence_verdicts`).
 
 Both come down to the same measurement: around every pulse, the spikes each region fired just
 after it, minus the spikes it fired just before. :func:`pulse_responses` does that and everything
@@ -26,6 +26,9 @@ import numpy as np
 
 #: Spikes per pulse a region has to evoke locally for an amplitude to count as usable.
 MIN_LOCAL = 0.5
+#: Below this a detection is a noise crossing, not a spike: the same amplitude the scans' "active
+#: electrode" definition uses. A plate whose detections are all under it is silent.
+MIN_SPIKE_UV = 20.0
 
 #: How each level is marked when a verdict is printed.
 MARKS = {"ok": "ok  ", "warn": "WARN", "stop": "STOP"}
@@ -114,7 +117,7 @@ def crosstalk(responses: dict[str, dict[str, np.ndarray]]) -> tuple[list[str], n
     ``ratio[i, j]`` is the mean evoked response in region ``j`` when region ``i`` was stimulated,
     divided by the mean evoked response in ``i`` itself. The diagonal is 1 by construction. A
     region whose local response is not positive gives a row of ``nan``: there is nothing to take a
-    ratio of, which :func:`connectivity_verdicts` reports separately.
+    ratio of, which :func:`independence_verdicts` reports separately.
 
     :returns: Region names, the mean evoked response ``(n, n)``, and the ratio ``(n, n)``.
     """
@@ -138,7 +141,7 @@ def crosstalk(responses: dict[str, dict[str, np.ndarray]]) -> tuple[list[str], n
     return names, evoked, ratio
 
 
-def connectivity_verdicts(
+def independence_verdicts(
     names: Sequence[str],
     evoked: np.ndarray,
     ratio: np.ndarray,
@@ -150,7 +153,7 @@ def connectivity_verdicts(
     us: str = "US",
     cs: str = "CS",
 ) -> list[Verdict]:
-    """Read a connectivity check: are the three sites independent enough, and is there a path?
+    """Read the baseline gate: are the three sites independent enough, and is there a path?
 
     Four things are checked, in the order they would sink a run:
 
@@ -284,8 +287,9 @@ def calibration_table(
 
     :param tokens: ``{token: (role, amplitude_mv, polarity)}``, from the schedule.
     :returns: Rows with ``role``, ``amplitude_mv``, ``polarity``, ``local`` (mean evoked spikes per
-        pulse in the stimulated region), ``remote`` (the mean over the other regions: how far the
-        pulse reaches), ``pulses`` and ``burst_rate``, sorted by role then amplitude.
+        pulse in the stimulated region), ``se`` (its standard error over the pulses), ``remote``
+        (the mean over the other regions: how far the pulse reaches), ``spread`` (remote over
+        local), ``pulses`` and ``burst_rate``, sorted by role then amplitude.
     """
     rows = []
     for token, (role, amplitude, polarity) in tokens.items():
@@ -293,13 +297,19 @@ def calibration_table(
         if values is None:
             continue
         others = [float(np.mean(v)) for name, v in responses[token].items() if name != role and len(v)]
+        local = float(np.mean(values))
+        remote = float(np.mean(others)) if others else float("nan")
         rows.append(
             {
                 "role": role,
                 "amplitude_mv": amplitude,
                 "polarity": polarity,
-                "local": float(np.mean(values)),
-                "remote": float(np.mean(others)) if others else float("nan"),
+                "local": local,
+                "se": float(np.std(values, ddof=1) / np.sqrt(len(values)))
+                if len(values) > 1
+                else float("nan"),
+                "remote": remote,
+                "spread": remote / local if local > 0 and np.isfinite(remote) else float("nan"),
                 "pulses": len(values),
                 "burst_rate": float(bursts.get(token, 0.0)),
             }
@@ -444,28 +454,50 @@ def calibration_verdicts(
     roles: Sequence[str],
     min_local: float = MIN_LOCAL,
     burst_warn: float = 0.2,
+    crosstalk_warn: float = 0.3,
+    min_pulses: int = 3,
 ) -> tuple[dict[str, dict | None], list[Verdict]]:
     """Pick each region's polarity and amplitude, and say what went wrong where it did.
 
-    Per region, a row is *usable* when it evokes at least ``min_local`` spikes per pulse locally
-    while starting a network burst on at most ``burst_warn`` of its pulses. When more than one
+    Per region, a row is *usable* when, over at least ``min_pulses`` pulses, it evokes at least
+    ``min_local`` spikes per pulse locally and that mean is at least twice its standard error (so
+    a handful of chance detections cannot pass), while the other regions respond by no more than
+    ``crosstalk_warn`` of the local response (the pulse stays a site, not a broadcast) and a
+    network burst starts on at most ``burst_warn`` of its pulses. When more than one
     polarity was swept, the polarity with the lower usable threshold wins -- it reaches neurons
     with less voltage -- with anodic-first on a tie (the more effective order in the literature).
     Within that polarity the choice is the largest usable amplitude, since a site that barely
-    responds at threshold responds unreliably. Where nothing is usable, the reason is reported
-    instead of a number.
+    responds at threshold responds unreliably. Then the three are made comparable: a region
+    whose response is more than twice the weakest region's is stepped down to the largest usable
+    amplitude within that bound. Where nothing is usable, the reason is reported instead of a
+    number.
 
     :returns: ``{role: chosen row or None}`` (the row carries ``polarity``) and the verdicts.
     """
     chosen: dict[str, dict | None] = {}
     out: list[Verdict] = []
+    usable_by_role: dict[str, list[dict]] = {}
     for role in roles:
         mine = [r for r in rows if r["role"] == role]
         if not mine:
             chosen[role] = None
             out.append(Verdict("stop", f"{role} was never stimulated in this run."))
             continue
-        usable = [r for r in mine if r["local"] >= min_local and r["burst_rate"] <= burst_warn]
+
+        def reliable(r):
+            se = r.get("se", 0.0)
+            return r.get("pulses", min_pulses) >= min_pulses and (not np.isfinite(se) or r["local"] >= 2 * se)
+
+        def focal(r):
+            spread = r.get("spread", float("nan"))
+            return not np.isfinite(spread) or spread <= crosstalk_warn
+
+        usable = [
+            r
+            for r in mine
+            if r["local"] >= min_local and reliable(r) and focal(r) and r["burst_rate"] <= burst_warn
+        ]
+        usable_by_role[role] = usable
         if usable:
             thresholds = {}
             for r in usable:
@@ -507,16 +539,39 @@ def calibration_verdicts(
                 )
             continue
         chosen[role] = None
-        responsive = [r for r in mine if r["local"] >= min_local]
+        responsive = [r for r in mine if r["local"] >= min_local and reliable(r)]
         if not responsive:
             best = max(mine, key=lambda r: r["local"])
+            few = [r for r in mine if r["local"] >= min_local and not reliable(r)]
+            if few:
+                out.append(
+                    Verdict(
+                        "stop",
+                        f"{role}: {len(few)} amplitude(s) reached {min_local} spikes per pulse but not "
+                        f"reliably (fewer than {min_pulses} pulses, or a mean under twice its standard "
+                        f"error): chance detections, or too few repeats to tell. More calibration_reps.",
+                    )
+                )
+            else:
+                out.append(
+                    Verdict(
+                        "stop",
+                        f"{role}: no amplitude up to {max(r['amplitude_mv'] for r in mine):.0f} mV "
+                        f"evoked {min_local} spikes per pulse (best was {best['local']:.2f} at "
+                        f"{best['amplitude_mv']:.0f} mV). Extend the ladder, or the site has too "
+                        f"few neurons under it and should be reselected.",
+                    )
+                )
+        elif not any(focal(r) for r in responsive):
+            tightest = min(responsive, key=lambda r: r.get("spread", float("inf")))
             out.append(
                 Verdict(
                     "stop",
-                    f"{role}: no amplitude up to {max(r['amplitude_mv'] for r in mine):.0f} mV "
-                    f"evoked {min_local} spikes per pulse (best was {best['local']:.2f} at "
-                    f"{best['amplitude_mv']:.0f} mV). Extend the ladder, or the site has too "
-                    f"few neurons under it and should be reselected.",
+                    f"{role}: every amplitude that evokes a response also drives the other regions "
+                    f"(the most confined, {tightest['amplitude_mv']:.0f} mV, spreads "
+                    f"{tightest.get('spread', float('nan')):.0%} of its local response, over "
+                    f"{crosstalk_warn:.0%}). The regions are not independent at any usable drive: "
+                    f"wider separation, or return electrodes to confine the field.",
                 )
             )
         else:
@@ -530,40 +585,44 @@ def calibration_verdicts(
                     f"sparser site; conditioning through it would drive the whole culture.",
                 )
             )
-    # CS and NS are compared with each other, so what should match between them is the drive
-    # each delivers (spikes per pulse at its site), not the voltage: a site on more neurons needs
-    # fewer mV for the same effect. Amplitudes differing is expected; responses differing by a lot
-    # is a confound, and the fix is to bring the stronger one down to the weaker's response.
-    a, b = chosen.get("CS"), chosen.get("NS")
-    if (
-        a
-        and b
-        and min(a["local"], b["local"]) > 0
-        and max(a["local"], b["local"]) > 2 * min(a["local"], b["local"])
-    ):
-        strong, weak = (("CS", a), ("NS", b)) if a["local"] > b["local"] else (("NS", b), ("CS", a))
-        options = [
-            r
-            for r in rows
-            if r["role"] == strong[0]
-            and r["polarity"] == strong[1]["polarity"]
-            and r["local"] >= min_local
-            and r["burst_rate"] <= burst_warn
-        ]
-        nearest = min(options, key=lambda r: abs(r["local"] - weak[1]["local"])) if options else None
-        out.append(
-            Verdict(
-                "warn",
-                f"CS and NS are not matched in drive: {strong[0]} evokes {strong[1]['local']:.1f} spikes "
-                f"per pulse at its amplitude, {weak[0]} {weak[1]['local']:.1f}. NS is CS's control, so "
-                f"the two should receive comparable drive"
-                + (
-                    f"; {nearest['amplitude_mv']:.0f} mV brings {strong[0]} to {nearest['local']:.1f}."
-                    if nearest and nearest["amplitude_mv"] != strong[1]["amplitude_mv"]
-                    else "; no lower rung of the ladder gets closer, so accept it and read NS against it."
-                ),
-            )
-        )
+    # The three regions are compared with each other, so what should match is the drive each
+    # delivers (spikes per pulse at its site), not the voltage: a site on more neurons needs fewer
+    # mV for the same effect. A region whose response is more than twice the weakest's is stepped
+    # down to the largest usable rung of its polarity within that bound, and flagged if there is
+    # none. No region is privileged: US is not driven harder because it is the US.
+    picked = {role: r for role, r in chosen.items() if r}
+    if len(picked) > 1:
+        weakest_role, weakest = min(picked.items(), key=lambda kv: kv[1]["local"])
+        bound = 2 * weakest["local"]
+        for role, r in picked.items():
+            if r["local"] <= bound:
+                continue
+            within = [
+                u
+                for u in usable_by_role.get(role, [])
+                if u["polarity"] == r["polarity"] and u["local"] <= bound
+            ]
+            if within:
+                step = max(within, key=lambda u: (u["amplitude_mv"], u["local"]))
+                chosen[role] = step
+                out.append(
+                    Verdict(
+                        "ok",
+                        f"{role} stepped down from {r['amplitude_mv']:.0f} to {step['amplitude_mv']:.0f} mV "
+                        f"({step['local']:.1f} spikes per pulse) to be comparable with {weakest_role} "
+                        f"({weakest['local']:.1f}): the three regions are compared with each other, so "
+                        "none should be driven much harder than another.",
+                    )
+                )
+            else:
+                out.append(
+                    Verdict(
+                        "warn",
+                        f"{role} is not matched in drive: it evokes {r['local']:.1f} spikes per pulse "
+                        f"against {weakest['local']:.1f} for {weakest_role}, and no lower usable rung of "
+                        "its ladder gets within twice that. Read its results knowing it is driven harder.",
+                    )
+                )
     return chosen, out
 
 

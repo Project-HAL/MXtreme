@@ -12,18 +12,19 @@ document assumes the hardware path is already known to work.
 | 2 | baseline: network scan of the active set | braintrix-cli | 5 min | `<stem>_network_scan.raw.h5` |
 | 3 | place the three regions | `select`, offline | seconds | nothing |
 | 4 | calibration | `run --mode calibration` | 17 min | `<stem>_assoc_cal.raw.h5` |
-| 5 | connectivity check | `run --mode connectivity` | 9 min | `<stem>_assoc_conn.raw.h5` |
-| 6 | conditioning: one command, six recordings | `run --phase session` | 180 min | `<stem>_assoc_baseline`, `_encode_1..4`, `_retrieval` `.raw.h5` |
-| 7 | read each recording back, and the session as one | `report`, offline | minutes | nothing |
+| 5 | conditioning: one command, six recordings; the first is the gate | `run --phase session` | 180 min | `<stem>_assoc_baseline`, `_encode_1..4`, `_retrieval` `.raw.h5` |
+| 6 | read each recording back, and the session as one | `report`, offline | minutes | nothing |
 
 Every recording is spikes only and small (the whole session is 0.1-0.35 GB, see below); the
 `.raw.h5` extension is MaxWell's for every file it writes, whatever the file holds.
 
-`<stem>` is the store's `plating_<date>_<batch>_chip_<chip>_well_<N>_DIV_<d>`. Steps 4 and 5 are
-gates: each can send you back to step 3 with a stated reason. Budget for that. Step 6 is one
-command but six recordings, each closed before the next opens, so each can be read as soon as it
-is done: the baseline says whether the floor is low before 100 minutes of encoding are spent, and
-each cycle's checkpoint says whether the curve is moving.
+`<stem>` is the store's `plating_<date>_<batch>_chip_<chip>_well_<N>_DIV_<d>`. Two gates: step 4
+can send you back to step 3 with a stated reason, and the first recording of step 5, the
+baseline, is read at 16 minutes and can stop the run before encoding starts. Budget for both.
+Step 5 is one command but six recordings, each closed before the next opens, so each can be read
+as soon as it is done: the baseline says whether the sites are independent and the floor is low
+before 100 minutes of encoding are spent, and each cycle's checkpoint says whether the curve is
+moving.
 
 ## Where everything goes
 
@@ -48,7 +49,7 @@ and keep raw traces as they always do.
 |---|---|---|
 | activity scan (8 min, raw) | ~2 GB | ~4 GB |
 | network scan (5 min, raw) | ~1.2 GB | ~2.4 GB |
-| calibration + connectivity (spikes only) | ~0.03 GB together | same |
+| calibration (spikes only) | ~0.02 GB | same |
 | conditioning session, 180 min over six recordings (spikes only) | **0.09 to 0.35 GB** | same |
 
 A spike costs 16 bytes on disk (frame, channel, amplitude), and the two cultures measured here fired
@@ -64,6 +65,28 @@ channel-second, 100 such channels over 180 min is ~4 GB), `"all"` every channel 
 MaxTwo, ~83 GB on a MaxOne — do not, unless you have decided to). `preview` prints the number of
 channels and the total either way.
 
+## Where the values live
+
+**Everything that shapes a run is in `$P`**, the one parameter file `select` writes for the
+culture. There is no second place: the package's `params_default.json` is only what `select`
+starts from, and the `.toml` holds the store's location and nothing about the experiment. Each key
+in `$P` has a `_key` note beside it saying what it is. Values get into `$P` three ways:
+
+| who writes | what | when |
+|---|---|---|
+| `select` | the culture's identity, `regions`, `rec_electrodes`, `stim_electrodes` | step 3; a re-run writes a fresh file |
+| `report --apply $P` | `amplitudes_mv`, `amplitudes_source`, `pulse_polarity` | after calibration |
+| `run` | `stim_electrodes` as actually connected, `routing_cfg` | after the first run on the rig |
+| you | anything else, by editing the file, or `--set key=value` on a command | any time before the run it matters to |
+
+`--set` changes a value **for that one command only** and does not touch the file, which is the
+right tool for a one-off (a shorter calibration, a test phase) and the wrong one for a decision
+about the culture: edit `$P` for those, so every later run agrees. Either way the values a run
+actually used are written into its recording, and `report` reads them from there, not from `$P`,
+so a report always describes the run as it was. `preview --params $P` prints the schedule, pulse
+counts and size for whatever `$P` (plus any `--set`) would do, before anything touches the chip.
+The sections below each end with the values most likely to need changing at that step.
+
 ## What you are checking at each step
 
 Every step prints its decision and the numbers behind it, and every recording has a `report`
@@ -78,9 +101,8 @@ carry it. What to look at, and what would stop you:
 | `select` | its terminal output and `*_regions.png`, `*_coupling.png` | three regions ≥ 1000 µm apart, coupling < 0.3, 3-4 of 4 driven electrodes active each | `--centers`, or `--separation 800` |
 | calibration `report` | the table and the verdicts | an `ok` per region with an amplitude | `STOP`: back to `select` for that region |
 | `compare` (optional) | the verdicts | a pattern named per region | ties: keep the default |
-| connectivity `report` | the cross-talk matrix and the verdicts | `ok`, or warnings you have read and accept | `STOP`: amplitude or site is wrong; a CS-US path warning: closer regions |
 | `preview` | the timeline and the size line | 180 min, spikes only, < 0.5 GB, regions drawn | anything surprising: fix `$P` first |
-| baseline `report`, at 16 min, from a second terminal | the conditioning verdict | no high-floor warning, no burst warning, "no retrieval block yet" | a high floor: Ctrl-C the run, reselect with wider separation; bursting: Ctrl-C, lower the amplitudes, start again |
+| baseline `report`, at 16 min, from a second terminal | the baseline gate (cross-talk matrix and verdicts) and "no retrieval block yet" | every region evokes a response at its own site, no region drives another over 30%, bursts under 20%, a CS-US path exists | `STOP`: Ctrl-C the run; a site with no response: back to step 4; a site driving another: back to step 3 with wider separation; bursting: lower the amplitudes |
 | encode `report`s (all files so far), whenever | the checkpoint table | a curve with one more point per cycle; bursting under 20% | bursting: Ctrl-C, lower the amplitudes, `--phase encode_<next>,retrieval` |
 | session `report` (all files) | the conditioning verdict, the table, the figure | a verdict either way: association, excitability, or null with a next step | — it is data either way |
 
@@ -190,8 +212,8 @@ triple with the smallest largest pairwise coupling is taken, then the one whose 
 matched in their coupling to US (so both conditioned sites start from the same footing), then the
 most equilateral. "Least coupled" is measured with the network bursts masked, because a burst
 sweeps every patch at once and would make any pair look coupled. It is not "unconnected": a
-culture is one network, every region reaches every other within a few synapses, and the
-connectivity check (step 5) confirms a CS pulse does evoke *something* in US at baseline. What the
+culture is one network, every region reaches every other within a few synapses, and the baseline
+gate (the first recording of step 5) confirms a CS pulse does evoke *something* in US. What the
 selection avoids is a pair that is already strongly and consistently coupled, which would either
 saturate or be indistinguishable from the pre-existing pathway.
 
@@ -217,21 +239,41 @@ guide printed across its top:
 If it refuses (`only N patches qualify`), it writes a rejection figure saying why. Lower
 `--separation`, or place the regions by hand with `--centers "x,y;x,y;x,y"`.
 
+**Values you might change here.** `select` starts from the package default every
+time and writes a fresh `$P`, so the amplitudes go back to uncalibrated and `run` refuses until
+you calibrate again, which is right, because the sites moved. Everything is on the command line
+(`select --help` lists it all); `--set key=value` overrides any key of the parameter file, whose
+`_key` notes say what each one is:
+
+| to | pass |
+|---|---|
+| space the regions further apart, or closer | `--separation 1200` (µm; default 1000, the file's `min_region_separation_um`) |
+| consider more or fewer candidate patches | `--candidates 8` (default 4) |
+| change the region's radius (what counts as its readout) | `--set region_radius_um=200` |
+| require more active electrodes per patch | `--min-active 8` (default: a quarter of the recorded, at least five) |
+| place the three regions yourself | `--centers "x,y;x,y;x,y"` in µm, US first |
+| widen the driven block | `--set 'stim_site={"shape":"grid","size":2,"gap":8}'` |
+
 ## 4. Calibration
 
 ```bash
 python -m mxtreme.experiments.associative run --params $P --config $CFG \
-  --mode calibration --set exp_id=assoc_cal --set pre_min=2 --set post_min=2 --work $WORK
+  --mode calibration --set raw_traces=regions --set pre_min=2 --set post_min=2 --work $WORK
 python -m mxtreme.experiments.associative report $CULTURE/*_assoc_cal.raw.h5 \
   -o $WORK/assoc_cal.png --csv $WORK/assoc_cal.csv --apply $P
 ```
 
-`run` first checks that the connected device matches the batch's `M1`/`M2`, and refuses if not:
+`--mode` picks what the run is (calibration, or conditioning when left off), and the file is
+named after it: `exp_id` from `$P` plus `_cal`, unless `--set exp_id=` says otherwise. `run` first checks that the connected device matches the batch's `M1`/`M2`, and refuses if not:
 that token decides which `chip_M1_...` or `chip_M2_...` directory the recording is filed under.
 It routes the electrodes, connects a stimulation unit to each driven one (swapping one for a
 routed neighbour when two land on the same unit, and printing every swap), and writes the
 electrodes it actually drove back into `$P` as `stim_electrodes`: every later run drives exactly
-those, so the sites cannot drift between calibration, connectivity and the session. When it
+those. It also saves the routing it solved as a `.cfg` in `$WORK` and writes its path into `$P`
+as `routing_cfg`; every later run loads that routing instead of solving a new one, because the
+router is not reproducible and a stimulation unit follows the channel, so only the same routing
+gives the same units and no further swaps. The sites cannot drift between calibration and the
+session. When it
 finishes it prints the `report` command for the file it wrote; MaxLab appends `_0`, `_1` to a
 name that already exists rather than overwriting, so use that command rather than a glob if a
 step was repeated.
@@ -241,18 +283,38 @@ pulses in 12.6 minutes, every repeat shuffled across all three regions so they i
 two minutes of quiet either side. The report prints, per region and amplitude,
 `local` (spikes per pulse in the stimulated region), `remote` (in the other two: how far the pulse
 reaches), `spread` (remote over local) and the burst rate, then a recommended `amplitudes_mv`: the
-largest amplitude that evokes at least 0.5 spikes per pulse locally while starting a network burst
-on at most 20% of pulses. A `STOP` says which way it failed: nothing responds even at 120 mV (the
-site has too few neurons; back to step 3), or everything that responds also bursts (back to
-step 3).
+largest amplitude that is *usable*, meaning it evokes at least 0.5 spikes per pulse locally (and
+at least twice its own standard error, so chance detections cannot pass), the other two regions
+respond by no more than 30% of that, and a network burst starts on at most 20% of pulses. The
+ideal amplitude drives its own site and nothing else, which is why spread is part of the rule and
+not only reported. Then the three are made comparable: the regions are compared with each other,
+so a region whose response is more than twice the weakest's is stepped down to the largest usable
+amplitude within that bound (the report says so), and flagged if its ladder has no such rung. No
+region is privileged; US is not driven harder for being the US. A `STOP` says which way it failed: nothing responds even at 100 mV (the site
+has too few neurons; back to step 3), responses that are not reliable (more repeats), everything
+that responds also reaches the other regions (wider separation, or return electrodes), or
+everything that responds also bursts (back to step 3).
 
 **The figure** (`assoc_cal.png`) is that table drawn: one panel per region, evoked spikes per
 pulse against amplitude, blue for anodic-first and red for cathodic-first, the region's own
-response solid and the mean of the other two dashed. What a healthy region looks like: the solid
-line rising from nothing, crossing the dotted "usable" threshold, and flattening; the dashed line
-staying low. The green vertical line is the amplitude chosen; an `x` marks a row that started
-bursts too often; a shaded panel found nothing usable. Below it, the timeline of what fired, then
-the artifact on each driven electrode at the first pulse. Zero-height response curves with a
+response solid with its standard error, and the mean of the other two dashed. What a healthy
+region looks like: the solid line rising from nothing, crossing the dotted "usable" threshold,
+and flattening; the dashed line staying low. The green vertical line is the amplitude chosen; an
+`x` marks a row that started bursts too often; a shaded panel found nothing usable. Below it, the
+timeline of what fired, then one driven electrode per region and polarity around its first pulse:
+zero is the electrode's level before the pulse, the pulse is at 0 ms, and the trace runs on a log
+time axis until the electrode is back in the green band (within 100 µV of where it started).
+That is why calibration, alone among the runs, keeps raw traces (`--set raw_traces=regions`:
+the three regions' electrodes, ~0.4 GB for 17 minutes): the artifact's shape on *this* culture is
+what licenses the 5 ms start of the readout window and the 3 s between pulses, and it cannot be
+read from spikes. Every other recording keeps spikes only, because the readout is spike counts
+and nothing in the analysis reads voltage. The terminal prints the same as numbers: how long the
+amplifier sits at its rail, when the electrode is back, and how far from its pre-pulse level the
+*next* pulse starts. That last
+number is the direct test that nothing carries over from pulse to pulse; a `WARN` names any
+electrode where it exceeds 100 µV. On saline the amplifier rails for 50-200 ms and the electrode
+is back within about a second, and the next pulse starts within a few tens of µV of the last: the
+biphasic pulse leaves nothing behind at 0.33 Hz. Zero-height response curves with a
 clean timeline and artifacts are what a dry run shows, and on a culture they mean the sites are
 not on neurons.
 
@@ -263,14 +325,28 @@ write while any region has a `STOP`, and until `amplitudes_source` is set every 
 refuses to start. If the regions disagree on polarity the report says so and takes the majority:
 `pulse_polarity` is one setting for all three.
 
+**Values you might change here** (all in `$P`; defaults in brackets):
+
+| key | what it does | when to change it |
+|---|---|---|
+| `calibration_amplitudes_mv` [10, 20, 30, 45, 60, 80, 100] | the ladder, mV per phase | nothing usable even at the top: extend upward (up to `max_amplitude_mv`); everything bursts or spreads: add rungs at the bottom |
+| `max_amplitude_mv` [120] | the ceiling `run` refuses to exceed | only deliberately; 120 per phase is 240 peak to peak, the top of the characterised range |
+| `calibration_polarities` [both] | which pulse orders are swept | `["anodic-first"]` halves the run once the rig's sign is settled |
+| `calibration_reps` [6] | pulses per region, amplitude and polarity | "not reliably" verdicts: raise to 10; each repeat adds 2.1 min |
+| `calibration_iti` [3.0 s] | time between pulses, across all regions | a recovery `WARN`, or bursts that outlast 3 s: lengthen. It is also what the session's `pulse_hz` assumes, so keep them consistent |
+| `stim_phase_us` [100] | phase width | bursts at every amplitude: shorter phases |
+| `burst_warn` [0.2], `crosstalk_warn` [0.3] | what "usable" tolerates | only with a reason you would write in the methods |
+| `raw_traces` [`none`; the command sets `regions`] | raw voltage for the artifact check | leave as the command has it |
+| `pre_min`, `post_min` [the command sets 2] | quiet either side | — |
+
 ### 4b. Which pattern to drive through: the block alone, or with return electrodes
 
 The default drives a 2x2 block with the bath as the return. Ronchi's design adds return
 electrodes carrying the inverted pulse, which confines the field — at the cost of more
 stimulation units, which the chip hands out per area of the array (about seven per area on the
 MaxOne tried so far, where a six-electrode site was refused). Whether confinement is *needed* is
-what calibration's `remote` column and the connectivity check measure, so the question is only
-worth 17 minutes if the default shows cross-talk. If it does, run calibration once more with two
+what calibration's `spread` column measures (and the baseline gate confirms), so the question is
+only worth 17 minutes if calibration shows cross-talk. If it does, run calibration once more with two
 return electrodes and set the two side by side:
 
 ```bash
@@ -295,28 +371,7 @@ that were not checked for activity; `compare` measures what they evoke regardles
 
 From here the regions, pattern and amplitudes are frozen for this culture.
 
-## 5. Connectivity check
-
-```bash
-python -m mxtreme.experiments.associative run --params $P --config $CFG \
-  --mode connectivity --set exp_id=assoc_conn --set pre_min=2 --set post_min=2 --work $WORK
-python -m mxtreme.experiments.associative report $CULTURE/*_assoc_conn.raw.h5 \
-  -o $WORK/assoc_conn.png --csv $WORK/assoc_conn.csv
-```
-
-Single pulses at the calibrated amplitudes, interleaved across the three sites. The report prints
-how much stimulating each site alone drives the other two, and a verdict:
-
-| verdict | meaning | do |
-|---|---|---|
-| a site evokes almost nothing locally | amplitude or site is wrong | back to step 4, then 3 |
-| a site's pulses start bursts >20% of the time | it drives the whole culture | lower its amplitude |
-| a site drives another >30% of its own response | the two are not independent | back to step 3, wider separation |
-| no response either way between CS and US | there may be no path to strengthen | back to step 3 |
-
-This is the last cheap moment to change your mind.
-
-## 6. Conditioning: one command, six recordings
+## 5. Conditioning: one command, six recordings; the baseline is the gate
 
 ```bash
 python -m mxtreme.experiments.associative preview --params $P --config $CFG
@@ -344,13 +399,25 @@ python -m mxtreme.experiments.associative report $CULTURE/*_assoc_baseline.raw.h
 python -m mxtreme.experiments.associative report $CULTURE/*_assoc_baseline.raw.h5 $CULTURE/*_assoc_encode_*.raw.h5
 ```
 
-The first, at 16 minutes, is the floor check with 60 pulses per role: **CS alone should evoke
-little in US** (under 30% of what US alone does) and no more than 20% of probes should start a
-network burst; "no retrieval block yet" is the expected last line. The second, any time after,
-prints the checkpoint table with one row per finished cycle: the curve of the association forming,
-as far as it has got. If the baseline shows a high floor, stop the run (Ctrl-C closes the current
-file properly and records no further phase) and reselect with a wider separation before spending
-100 minutes encoding on top of it.
+The first, at 16 minutes, is **the baseline gate**, printed under `=== baseline gate ===`. The
+baseline block probes each region alone, 60 pulses per role at the calibrated amplitudes, which
+so the session's first recording is its own go/no-go. It prints the evoked matrix (row stimulated
+alone, column measured) and a verdict per check:
+
+| verdict | meaning | do |
+|---|---|---|
+| a site evokes almost nothing at itself | amplitude or site is wrong | Ctrl-C; back to step 4, then 3 |
+| a site's pulses start bursts > 20% of the time | it drives the whole culture | Ctrl-C; lower its amplitude |
+| a site drives another > 30% of its own response | the two are not independent; CS-to-US in particular is the floor the result is read against | Ctrl-C; back to step 3, wider separation |
+| no response either way between CS and US | there may be no path to strengthen | Ctrl-C; back to step 3 |
+
+Ctrl-C closes the current file properly and records no further phase, so a stop here costs 16
+minutes rather than three hours. "no retrieval block yet" is the expected last line. The second
+command, any time after, prints the checkpoint table with one row per finished cycle: the curve of
+the association forming, as far as it has got.
+
+There is no separate connectivity run: `--phase baseline` on its own is that measurement, if
+you ever want it without the rest of the session.
 
 **One phase at a time**, if you would rather decide between them: `--phase baseline`, then
 `--phase encode_1` and so on, then `--phase retrieval`; or `--phase encode` for the four cycles
@@ -379,6 +446,25 @@ whatever you spend between them.
 Probes are kept small against the paired pulses (60 per role per block against 712 paired) because
 every probe is also a little extinction. Retrieval probes all three roles, not just CS, so that a
 general change in excitability cannot be read as learning.
+
+**Values you might change here** (all in `$P`; defaults in brackets). Change these *before*
+`--phase session` starts: every phase of a session is built from the same `$P`, and the seeded
+shuffles agree only if it does not change between them.
+
+| key | what it does | when to change it |
+|---|---|---|
+| `amplitudes_mv`, `pulse_polarity` | the drive | written by `report --apply`; by hand only to step a bursting region down a rung after the baseline gate |
+| `pulse_hz` [0.33] | pulses within a train | do not raise; lower if the artifact check warned about recovery |
+| `t_stim` [270 s], `encode_iti` [330 s] | a training train's length, and train-to-train spacing | together; `encode_iti` must exceed `t_stim` by the response window |
+| `encode_pattern` [PAIR, NS, PAIR, NS], `encode_cycles` [4], `encode_cycle_rest` [120 s] | the encoding structure | shorter day: fewer cycles; more pairing: see *The encoding structure* below |
+| `dt_cs_us` [0 ms] | CS-to-US offset within a paired pulse | a timing variant; changes the hypothesis, not just the run |
+| `t_probe` [60 s], `probe_reps` [3], `probe_iti` [75 s] | the baseline and retrieval probes: 20 pulses, three per role | noisier culture: more reps (each adds ~4 min per block, and a little extinction) |
+| `encode_probe_roles` [CS, NS], `encode_probe_sec` [30 s], `encode_probe_reps` [1] | the checkpoints | see *Checkpoints* below |
+| `num_retrievals` [3], `retrieval_interval_min` [10], `decay_min` [5] | the after measurements | shorter day: two retrievals |
+| `pre_min`, `post_min` [5] | the quiet blocks the coupling matrix is measured on | under 5 min the matrix is too noisy to compare |
+| `phase_lead_min` [1.0] | quiet at the head of each encode recording | — |
+| `pulse_window_ms` [5, 50] | the readout window | only if calibration's artifact check says the artifact outlasts 5 ms |
+| `seed` [1] | the shuffles, and which of the two conditioned sites is CS | alternate its parity across cultures (it counterbalances CS and NS) |
 
 ### Checkpoints: the association as it forms
 
@@ -456,7 +542,7 @@ retrieval are still 60 pulses per role.
 To shorten it, cut cycles or retrievals rather than presentation length:
 `--set encode_cycles=2 --set num_retrievals=2`.
 
-## 7. Reading the session back
+## 6. Reading the session back
 
 ```bash
 python -m mxtreme.experiments.associative report $CULTURE/*_assoc_*.raw.h5 \
@@ -464,8 +550,8 @@ python -m mxtreme.experiments.associative report $CULTURE/*_assoc_*.raw.h5 \
 ```
 
 Every recording of the session, in any order; `report` sorts them by their clocks. The calibration
-and connectivity recordings match that glob too and are harmless in it (each is read on its own
-terms), but name the six conditioning files if you want the output short.
+recording matches that glob too and is harmless in it (it is read on its own terms), but name the
+six conditioning files if you want the output short.
 
 The figure's top panel is the experiment: spikes in US in the pulse-locked window after each
 presentation, by what was presented. **Learning is CS-alone probes rising in US from baseline to
@@ -475,6 +561,12 @@ regions.
 
 `assoc_session.csv` has one row per presentation with every region's count in every window: the file
 to check the conclusion against independently, as a difference of group means in a spreadsheet.
+
+**Values that affect the reading.** `report` takes the readout window (`pulse_window_ms`), the
+thresholds (`burst_warn`, `crosstalk_warn`) and the regions from the protocol inside each
+recording, so editing `$P` afterwards changes nothing about a report. To re-read a session under a
+different window, copy a recording's protocol from `$WORK` (`*_protocol.json`), edit it, and pass
+it with `--protocol`; the recordings themselves are never rewritten.
 
 ## Later days
 
@@ -504,7 +596,7 @@ driven block's response; the bath is the return. The binding constraint is stimu
 on the chip, one per stimulation electrode — and, measured on a MaxOne, each *area* of the chip
 exposes only about seven of them. A 2x2 with a four-corner return ring (eight per site) could not
 be connected on the rig and one with two returns (six) failed too, so the default has none. If the
-connectivity check shows the sites driving each other, return electrodes are the next thing to
+baseline gate shows the sites driving each other, return electrodes are the next thing to
 try (`stim_site` focal, `return_points` `"diagonal"`).
 
 | site | units total | per site | driven span | connects? |

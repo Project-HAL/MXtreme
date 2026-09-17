@@ -99,8 +99,8 @@ def main(argv=None) -> None:
     )
     r.add_argument(
         "--mode",
-        choices=["conditioning", "calibration", "connectivity"],
-        help="override the file's mode; calibration and connectivity are the two short gates",
+        choices=["conditioning", "calibration"],
+        help="override the file's mode; calibration is the short run before the session",
     )
     r.add_argument(
         "--phase",
@@ -166,6 +166,10 @@ def main(argv=None) -> None:
 
         if args.mode:
             params.mode = args.mode
+            # The file name says what the run was, unless exp_id was set by hand.
+            suffix = {"calibration": "cal"}.get(args.mode)
+            if suffix and not any(o.startswith("exp_id=") for o in (args.overrides or [])):
+                params.exp_id = f"{params.exp_id}_{suffix}"
         config = None
         if args.config:
             from mxtreme.config import Config
@@ -173,6 +177,7 @@ def main(argv=None) -> None:
             config = Config.from_toml(args.config)
         result = run(params, config, phases=args.phase, work=args.work)
         on_file = AssociativeParams.from_json(args.params)
+        updates = {}
         if (
             result.stim_electrodes
             and on_file.stim_site == params.stim_site
@@ -181,12 +186,16 @@ def main(argv=None) -> None:
                 or on_file.stim_electrodes_site != params.stim_site
             )
         ):
-            AssociativeParams.update_file(
-                args.params,
-                {"stim_electrodes": result.stim_electrodes, "stim_electrodes_site": params.stim_site},
+            updates.update(
+                {"stim_electrodes": result.stim_electrodes, "stim_electrodes_site": params.stim_site}
             )
+        if result.routing_cfg and on_file.routing_cfg != result.routing_cfg:
+            updates["routing_cfg"] = result.routing_cfg
+        if updates:
+            AssociativeParams.update_file(args.params, updates)
             print(
-                f"wrote the electrodes actually driven into {args.params} as stim_electrodes, so later runs drive the same ones"
+                f"wrote {', '.join(updates)} into {args.params}: later runs drive the same electrodes "
+                "through the same routing"
             )
     elif args.command == "report":
         from mxtreme.experiments.associative.report import report

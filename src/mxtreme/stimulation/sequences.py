@@ -140,7 +140,7 @@ def build_region_sequence(
     return seq, timeline.end_frame() / STIM_CLOCK_HZ
 
 
-def init_well_regions(well: int, rec_elecs, groups: dict[str, list[int]]):
+def init_well_regions(well: int, rec_elecs, groups: dict[str, list[int]], config_path=None, save_to=None):
     """Route recording electrodes plus several named groups of stimulation electrodes.
 
     Like :func:`mxtreme.scans.mx_setup.init_well`, with the stimulation electrodes grouped so the
@@ -151,6 +151,9 @@ def init_well_regions(well: int, rec_elecs, groups: dict[str, list[int]]):
     :param well: Well number.
     :param rec_elecs: Recording electrodes, as a list or a ``.cfg`` path.
     :param groups: ``{name: [electrodes]}``, e.g. ``{"US_drive": [...], "US_return": [...]}``.
+    :param config_path: A saved routing to load instead of routing (see
+        :func:`mxtreme.scans.mx_setup.init_well_stim`).
+    :param save_to: Where to save the routing when it had to be solved.
     Where two stimulation electrodes would need the same stimulation unit, the later one is
     swapped for a neighbour (see :func:`mxtreme.scans.mx_setup.init_well_stim`), so the
     electrodes actually connected are returned alongside the units and may differ from
@@ -166,7 +169,9 @@ def init_well_regions(well: int, rec_elecs, groups: dict[str, list[int]]):
     if len(all_stim) != len(set(all_stim)):
         raise RuntimeError("a stimulation electrode is in more than one group")
 
-    array, units, used = mx_setup.init_well_stim(well, rec_elecs, all_stim)
+    array, units, used = mx_setup.init_well_stim(
+        well, rec_elecs, all_stim, config_path=config_path, save_to=save_to
+    )
 
     per_group, per_group_electrodes, i = {}, {}, 0
     for name, elecs in groups.items():

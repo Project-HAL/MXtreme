@@ -52,11 +52,12 @@ Calibration mode replaces everything between pre and post with one ``calibrate``
 the regions interleave and drift does not read as dose (Ronchi et al. 2019 shuffled amplitudes
 for the same reason).
 
-Connectivity mode is the gate between the two: one ``check`` block of single pulses at each
-region's chosen amplitude, ``check_reps`` each, interleaved. :mod:`.report` turns it into a
-cross-talk matrix -- how much stimulating each site alone drives the other two -- and says whether
-the sites are independent enough to condition, and whether a path between CS and US exists at all.
-Run it after calibration and before committing hours to conditioning.
+The session's baseline block is the gate between the two: each region probed alone at its
+chosen amplitude, 60 pulses per role, interleaved. :mod:`.report` turns it into a cross-talk
+matrix -- how much stimulating each site alone drives the other two -- and says whether the sites
+are independent enough to condition, and whether a path between CS and US exists at all. It is
+read 16 minutes into the session, before encoding starts; ``--phase baseline`` alone is the same
+measurement.
 """
 
 from __future__ import annotations
@@ -429,11 +430,8 @@ def stimulus_for(
     polarity = polarity or params.pulse_polarity
     geometry = geometry_of(params)
     if num_events is None:
-        if kind == "check":
-            num_events = 1  # one pulse, so the response to it is unambiguous
-        else:
-            length = {"probe": params.t_probe, "checkpoint": params.encode_probe_sec}.get(kind, params.t_stim)
-            num_events = max(1, round(length * params.pulse_hz))
+        length = {"probe": params.t_probe, "checkpoint": params.encode_probe_sec}.get(kind, params.t_stim)
+        num_events = max(1, round(length * params.pulse_hz))
     delays = {role: 0.0 for role in roles}
     if list(roles) == ["CS", "US"]:
         dt = params.dt_cs_us / 1000.0
@@ -618,25 +616,6 @@ def build_schedule(params: AssociativeParams) -> tuple[list[Block], dict[str, St
             k = int(params.phase.removeprefix("encode_"))
             blocks = [Block("lead", params.phase_lead_min * 60.0), cycles[k - 1]]
             return blocks, _used(stimuli, blocks)
-
-    elif params.mode == "connectivity":
-        # One pulse per region at its chosen amplitude, many times, interleaved: how much does
-        # stimulating each site alone drive the other two? Single pulses rather than trains so
-        # each response belongs to one stimulus, and interleaved so drift cannot look like a
-        # difference between regions.
-        for role in ROLES:
-            check = stimulus_for(params, [role], "check")
-            stimuli[check.token] = check
-        block = Block("check", 0.0)
-        t = 0.0
-        for _ in range(params.check_reps):
-            order = list(ROLES)
-            rng.shuffle(order)
-            for role in order:
-                block.presentations.append(Presentation(t, token_for([role], "check"), [role]))
-                t += params.check_iti
-        block.duration_sec = t
-        blocks.append(block)
 
     else:  # calibration
         # Every (region, amplitude, polarity) once per repeat, the whole set shuffled together, so

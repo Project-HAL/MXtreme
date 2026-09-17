@@ -415,7 +415,7 @@ def select(
             if shared < max(5, 0.2 * len(bursts)):
                 on_progress(
                     f"  note: {a} and {b} took part in the same network burst only {shared} of {len(bursts)} "
-                    f"times. They may not be well connected; the connectivity check will say."
+                    f"times. They may not be well connected; the baseline gate will say."
                 )
 
     # --- 4: the stimulation sites, on electrodes that have shown spikes ---

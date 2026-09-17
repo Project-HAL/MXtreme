@@ -116,9 +116,20 @@ def _once(key, message):
 
 
 def _trace(data, channel, frame, before, after):
-    """Raw voltage in uV on one channel around one frame, or (None, None) when the recording kept
-    no raw trace there: a spikes-only recording, a channel outside the raw group, or MaxWell's
-    HDF5 compression filter missing on this machine."""
+    """Raw voltage in uV on one channel around one frame, zero being the level just before the
+    pulse (when the window has any), so what the pulse leaves behind is read directly; or
+    (None, None) when the recording kept no raw trace there."""
+    t, v = _raw(data, channel, frame, before, after)
+    if t is None:
+        return None, None
+    pre = v[t < -0.2]
+    return t, v - (np.median(pre) if len(pre) >= 4 else np.median(v))
+
+
+def _raw(data, channel, frame, before, after):
+    """Raw voltage in uV, as recorded, on one channel around one frame, or (None, None) when the
+    recording kept no raw trace there: a spikes-only recording, a channel outside the raw group,
+    or MaxWell's HDF5 compression filter missing on this machine."""
     if not data["segments"]:
         _once(
             "none",
@@ -146,7 +157,7 @@ def _trace(data, channel, frame, before, after):
             )
             return None, None
         t = (frame_nos[i0:i1].astype(np.int64) - int(frame)) / data["fps"] * 1000.0
-        return t, (v - np.median(v)) * data["lsb"] * 1e6
+        return t, v * data["lsb"] * 1e6
     return None, None
 
 
@@ -310,8 +321,40 @@ def _pulses_and_regions(data, record):
     return pulses, regions
 
 
+def _crosstalk(frames, elecs, regions, fps, by_role, window, params) -> list:
+    """The independence checks on single pulses to one region at a time: the evoked matrix (row
+    stimulated, column measured), each region's own response, bursts, and whether CS and US are
+    connected at all. Run on the baseline block's probes, where it gates the session."""
+    from mxtreme.experiments.associative import checks
+    from mxtreme.scans import region_selection
+
+    bursts = region_selection.network_bursts(frames, fps)
+    responses = checks.pulse_responses(frames, elecs, regions, fps, by_role, window)
+    rates = checks.burst_rate(by_role, bursts, fps, within_ms=500.0)
+    names, evoked, ratio = checks.crosstalk(responses)
+    counts = {role: sum(1 for r, _ in by_role if r == role) for role in names}
+    print(
+        "evoked spikes per pulse (row stimulated alone, column measured), above the matching "
+        "window before each pulse; pulses per row: " + ", ".join(f"{k} {v}" for k, v in counts.items())
+    )
+    for name, row in zip(names, evoked):
+        print(f"  {name:<4}" + "".join(f"{v:8.2f}" for v in row))
+    print("as a fraction of the stimulated region's own response:")
+    for name, row in zip(names, ratio):
+        print(f"  {name:<4}" + "".join(("     nan" if np.isnan(v) else f"{v:8.0%}") for v in row))
+    print("network bursts started: " + ", ".join(f"{k} {v:.0%}" for k, v in rates.items()))
+    return checks.independence_verdicts(
+        names,
+        evoked,
+        ratio,
+        rates,
+        crosstalk_warn=params.get("crosstalk_warn", 0.3),
+        burst_warn=params.get("burst_warn", 0.2),
+    )
+
+
 def _gate(data, record) -> list:
-    """The calibration or connectivity analysis for a run in one of those modes.
+    """The calibration analysis: the table the verdicts are drawn from, then the verdicts.
 
     Prints the table the verdicts are drawn from, then returns the verdicts themselves; see
     :mod:`mxtreme.experiments.associative.checks`.
@@ -329,37 +372,15 @@ def _gate(data, record) -> list:
     if not pulses:
         return [checks.Verdict("stop", "no stimulation events in this recording.")]
 
-    silent = checks.silent_recording(checks.outside_artifacts(frames, [f for _, f in pulses], fps), fps)
+    # Only detections large enough to be spikes count towards "not silent": the detector fires on
+    # noise crossings of a few uV on every channel, and on the artifact everywhere a pulse reaches.
+    real = frames[np.abs(spikes["amplitude"]) >= checks.MIN_SPIKE_UV]
+    silent = checks.silent_recording(checks.outside_artifacts(real, [f for _, f in pulses], fps), fps)
     if silent is not None:
         return [silent]
 
     window = tuple(params["pulse_window_ms"])
     bursts = region_selection.network_bursts(frames, fps)
-
-    if params["mode"] == "connectivity":
-        # Grouped by the region stimulated rather than by token.
-        by_role = [(protocol.roles_in(t)[0], f) for t, f in pulses if protocol.roles_in(t)]
-        responses = checks.pulse_responses(frames, elecs, regions, fps, by_role, window)
-        rates = checks.burst_rate(by_role, bursts, fps, within_ms=500.0)
-        names, evoked, ratio = checks.crosstalk(responses)
-        print(
-            "\nevoked spikes per pulse (row stimulated, column measured), above the matching "
-            "window before each pulse:"
-        )
-        for name, row in zip(names, evoked):
-            print(f"  {name:<4}" + "".join(f"{v:8.2f}" for v in row))
-        print("as a fraction of the stimulated region's own response:")
-        for name, row in zip(names, ratio):
-            print(f"  {name:<4}" + "".join(("     nan" if np.isnan(v) else f"{v:8.0%}") for v in row))
-        print("network bursts started: " + ", ".join(f"{k} {v:.0%}" for k, v in rates.items()))
-        return checks.connectivity_verdicts(
-            names,
-            evoked,
-            ratio,
-            rates,
-            crosstalk_warn=params.get("crosstalk_warn", 0.3),
-            burst_warn=params.get("burst_warn", 0.2),
-        )
 
     responses = checks.pulse_responses(frames, elecs, regions, fps, pulses, window)
     rates = checks.burst_rate(pulses, bursts, fps, within_ms=500.0)
@@ -371,7 +392,10 @@ def _gate(data, record) -> list:
     rows = checks.calibration_table(responses, rates, tokens)
     _print_calibration(rows)
     chosen, verdicts = checks.calibration_verdicts(
-        rows, list(record["regions"]), burst_warn=params.get("burst_warn", 0.2)
+        rows,
+        list(record["regions"]),
+        burst_warn=params.get("burst_warn", 0.2),
+        crosstalk_warn=params.get("crosstalk_warn", 0.3),
     )
     picked = {role: (row["amplitude_mv"] if row else None) for role, row in chosen.items()}
     if all(v is not None for v in picked.values()):
@@ -414,19 +438,29 @@ def apply_calibration(params_path: str, pick: dict) -> None:
 
 
 def _print_calibration(rows):
-    print("\ncalibration, per region and amplitude (spikes per pulse above the window before it):")
     print(
-        f"  {'role':<5}{'mV':>7}{'polarity':>16}{'local':>9}{'remote':>9}{'spread':>8}{'bursts':>9}{'pulses':>8}"
+        "\ncalibration, per region and amplitude (evoked spikes per pulse: the count 5-50 ms after the "
+        "pulse minus the count in the same window before it):"
+    )
+    print(
+        f"  {'role':<5}{'mV':>7}{'polarity':>16}{'local':>9}{'+/-':>6}{'remote':>9}{'spread':>8}"
+        f"{'bursts':>9}{'pulses':>8}"
     )
     for r in rows:
-        spread = (r["remote"] / r["local"]) if r["local"] > 0 and np.isfinite(r["remote"]) else float("nan")
+        spread = r.get("spread", float("nan"))
+        se = r.get("se", float("nan"))
         print(
             f"  {r['role']:<5}{r['amplitude_mv']:7.0f}{r['polarity']:>16}{r['local']:9.2f}"
-            f"{r['remote']:9.2f}"
+            + (f"{se:6.2f}" if np.isfinite(se) else f"{'-':>6}")
+            + f"{r['remote']:9.2f}"
             + (f"{spread:8.0%}" if np.isfinite(spread) else f"{'-':>8}")
             + f"{r['burst_rate']:9.0%}{r['pulses']:8d}"
         )
-    print("  local = the stimulated region; remote = the mean of the other two; spread = remote / local")
+    print(
+        "  local = the stimulated region, +/- its standard error over the pulses; remote = the mean of the "
+        "other two; spread = remote / local.\n  usable = local >= 0.5 and >= 2 x its error, spread <= 30%, "
+        "bursts <= 20%, at least 3 pulses"
+    )
 
 
 def site_label(record: dict) -> str:
@@ -527,6 +561,32 @@ def _draw_compare(tables, roles, out_png):
     print(f"wrote {out_png}")
 
 
+#: How far after a pulse the driven electrode's trace is read, at most.
+RECOVERY_MS = 1500.0
+#: Back to baseline means within this of the pre-pulse level for the rest of the window, on a
+#: 5 ms running mean; and a shift larger than this from one pulse's baseline to the next's is
+#: something the pulse left behind.
+SETTLED_UV = 100.0
+#: A recovery taking more than this fraction of the interval between pulses is warned about.
+RECOVERY_FRACTION = 0.8
+
+
+def _recovery(t, v, full_scale_uv) -> tuple[float, float | None]:
+    """How long after the event the trace sits at the amplifier's rail, and when it is back
+    within :data:`SETTLED_UV` of the pre-pulse level for good (``None`` if not within the trace)."""
+    after = t >= 0
+    railed = after & (np.abs(v) >= 0.9 * full_scale_uv)
+    rail_ms = float(t[railed].max()) if railed.any() else 0.0
+    # Settling is judged on a 5 ms running mean, so single noise crossings do not count.
+    width = max(1, round(5.0 / max(float(t[1] - t[0]), 1e-9)))
+    smooth = np.convolve(v, np.ones(width) / width, mode="same")
+    off = after & (np.abs(smooth) >= SETTLED_UV)
+    if not off.any():
+        return rail_ms, 0.0
+    last = int(np.flatnonzero(off).max())
+    return rail_ms, (float(t[last + 1]) if last + 1 < len(t) else None)
+
+
 def _panel_tokens(tokens, stimuli: dict) -> set:
     """Which presentations get an artifact panel in the figure. The panels are a hardware check
     (did the pulse reach the electrode?), not a response, so one per case is enough: in a
@@ -596,7 +656,13 @@ def _read_one(h5_path: str, protocol_path: str | None, threshold_uv: float) -> d
             inspect[f"{role} drive"] = r["drive_electrodes"][0]
         if r.get("return_electrodes"):
             inspect[f"{role} return"] = r["return_electrodes"][0]
-    before, after = int(0.001 * fps), int(0.004 * fps)
+    # The trace runs from 2 ms before the event to well after the pulse, bounded by the next one:
+    # what the pulse leaves on the electrode, and how long it takes to go, is the question.
+    all_pulses = sorted(f for f, _ in starts)
+    interval_ms = float(np.median(np.diff(all_pulses)) / fps * 1000.0) if len(all_pulses) > 1 else RECOVERY_MS
+    span_ms = min(RECOVERY_MS, 0.9 * interval_ms)
+    before, after = int(0.002 * fps), int(span_ms / 1000 * fps)
+    full_scale_uv = 512 * data["lsb"] * 1e6
     if not data["segments"]:
         # Said once, here, rather than only if a stimulation electrode happens to be routed.
         _once(
@@ -605,38 +671,81 @@ def _read_one(h5_path: str, protocol_path: str | None, threshold_uv: float) -> d
             "needs. The artifact check below needs raw_traces 'regions' or 'all'.",
         )
     print(
-        f"\nfirst deflection beyond {threshold_uv:.0f} uV after the sequence event, on one electrode of each site:"
+        f"\nthe pulse on one driven electrode of each site: first deflection beyond {threshold_uv:.0f} uV "
+        f"after the sequence event (its sign is the first phase's), how long the amplifier stays at its "
+        f"rail (+/-{full_scale_uv / 1000:.1f} mV), when the electrode is back within {SETTLED_UV:.0f} uV of "
+        f"where it was, and how far from that the next pulse starts (pulses {interval_ms / 1000:.1f} s apart):"
     )
     drawn = _panel_tokens(tokens, record["stimuli"])
     panels = []
+    slowest, carry = {}, {}
     for token, frames in tokens.items():
         roles = protocol.roles_in(token.rsplit("_", 1)[0])
         for label, electrode in inspect.items():
             if label.split()[0] not in roles or electrode not in chan:
                 continue
-            found = []
+            found, recovery, carried = [], [], []
             for frame in frames[:5]:
                 t, v = _trace(data, chan[electrode], frame, before, after)
                 if t is None:
                     break
-                hit = np.flatnonzero((t >= 0) & (np.abs(v) >= threshold_uv))
+                hit = np.flatnonzero((t >= 0) & (t < 5.0) & (np.abs(v) >= threshold_uv))
                 found.append((float(t[hit[0]]), float(v[hit[0]])) if len(hit) else None)
+                recovery.append(_recovery(t, v, full_scale_uv))
+                # The level just before the next pulse against the level just before this one:
+                # the direct test of whether anything carries over.
+                nxt = (
+                    all_pulses[int(np.searchsorted(all_pulses, frame, side="right"))]
+                    if frame < all_pulses[-1]
+                    else None
+                )
+                if nxt is not None:
+                    _, here = _raw(data, chan[electrode], frame, before, 0)
+                    _, there = _raw(data, chan[electrode], nxt, before, 0)
+                    if here is not None and there is not None and len(here) and len(there):
+                        carried.append(float(np.median(there) - np.median(here)))
                 if token in drawn and frame == frames[0]:
                     panels.append((f"artifact: {token}, {label} e{electrode}, first pulse", t, v))
             seen = [x for x in found if x]
             if seen:
+                rails = [r[0] for r in recovery]
+                settles = [r[1] for r in recovery]
+                settled = max(settles, key=lambda x: (x is None, x or 0))
+                slowest[electrode] = max(
+                    slowest.get(electrode, 0.0), float("inf") if settled is None else settled
+                )
+                shift = float(np.median(carried)) if carried else float("nan")
+                if np.isfinite(shift):
+                    carry[electrode] = max(carry.get(electrode, 0.0), abs(shift))
                 print(
                     f"  {token:<24} {label:<12} e{electrode:<6} at {np.median([x[0] for x in seen]):6.2f} ms, "
-                    f"{'+' if np.median([x[1] for x in seen]) > 0 else '-'}{abs(np.median([x[1] for x in seen])):.0f} uV  ({len(seen)}/{len(found)})"
+                    f"{'+' if np.median([x[1] for x in seen]) > 0 else '-'}{abs(np.median([x[1] for x in seen])):.0f} uV  "
+                    f"({len(seen)}/{len(found)}); rail {np.median(rails):.0f} ms; back "
+                    + (f"at {settled:.0f} ms" if settled is not None else f"not within {span_ms:.0f} ms")
+                    + (f"; next pulse starts {shift:+.0f} uV from this one" if np.isfinite(shift) else "")
                 )
             elif found:
                 print(
                     f"  {token:<24} {label:<12} e{electrode:<6} nothing above threshold in {len(found)} presentations"
                 )
+    for electrode, shift in carry.items():
+        if shift > SETTLED_UV:
+            print(
+                f"  WARN e{electrode} starts a pulse up to {shift:.0f} uV away from where it started the "
+                f"previous one: what a pulse leaves on the electrode is carrying over across the "
+                f"{interval_ms / 1000:.1f} s between pulses. Longer intervals, or a smaller amplitude."
+            )
+    for electrode, settled in slowest.items():
+        if settled > RECOVERY_FRACTION * interval_ms and carry.get(electrode, 0.0) <= SETTLED_UV:
+            print(
+                f"  note: e{electrode} is still more than {SETTLED_UV:.0f} uV from its pre-pulse level "
+                + (f"{settled / 1000:.1f} s" if np.isfinite(settled) else f"{span_ms / 1000:.1f} s")
+                + " after a pulse, but is back by the next one."
+            )
 
-    # --- the gates: calibration and connectivity ---
+    # --- the calibration verdict ---
     mode = params.get("mode", "conditioning")
-    if mode in ("calibration", "connectivity"):
+    if mode == "calibration":
         verdicts = _gate(data, record)
         print(f"\n=== {mode} verdict ===")
         for verdict in verdicts:
@@ -674,6 +783,47 @@ def _read_one(h5_path: str, protocol_path: str | None, threshold_uv: float) -> d
         for key in m:
             if key.endswith("_start") or key == "end_experiment":
                 marks.setdefault(key.replace("_start", ""), frame)
+    # --- the baseline gate: the independence checks, on the baseline block's probes ---
+    # Each role is probed alone there (60 pulses per role), so the session's first recording is
+    # its own go/no-go; `--phase baseline` on its own is the same measurement.
+    if mode == "conditioning" and "baseline" in marks and len(frames_all):
+        a = marks["baseline"]
+        later = [f for f in marks.values() if f > a]
+        b = min(later) if later else int(frames_all.max()) + 1
+        pulses_base, regions_base = _pulses_and_regions(data, record)
+        by_role = [
+            (protocol.roles_in(t)[0], f)
+            for t, f in pulses_base
+            if a <= f < b and t.startswith(ALONE) and len(protocol.roles_in(t)) == 1
+        ]
+        if by_role:
+            from mxtreme.experiments.associative import checks
+
+            print("\n=== baseline gate: each region probed alone, from the baseline block ===")
+            real = frames_all[np.abs(spikes["amplitude"]) >= checks.MIN_SPIKE_UV]
+            silent = checks.silent_recording(
+                checks.outside_artifacts(real, [f for _, f in by_role], fps), fps
+            )
+            verdicts = (
+                [silent]
+                if silent is not None
+                else _crosstalk(
+                    frames_all,
+                    elecs_all,
+                    regions_base,
+                    fps,
+                    by_role,
+                    tuple(params["pulse_window_ms"]),
+                    params,
+                )
+            )
+            for verdict in verdicts:
+                print(f"  {verdict}")
+            if any(v.level == "stop" for v in verdicts):
+                print(
+                    "  A [STOP] here means: stop the run before encoding starts (Ctrl-C) and fix the cause."
+                )
+
     for label in ("pre", "post"):
         if label not in marks or not len(frames_all):
             continue
@@ -948,7 +1098,15 @@ def _draw_calibration(fig, cell, record, roles):
                 continue
             colour = colours.get(polarity, "#111827")
             amps = [r["amplitude_mv"] for r in mine]
-            ax.plot(amps, [r["local"] for r in mine], "o-", color=colour, label=f"{polarity}: local")
+            ax.errorbar(
+                amps,
+                [r["local"] for r in mine],
+                yerr=[r.get("se", 0.0) if np.isfinite(r.get("se", 0.0)) else 0.0 for r in mine],
+                fmt="o-",
+                color=colour,
+                capsize=3,
+                label=f"{polarity}: local (+/- standard error)",
+            )
             ax.plot(
                 amps,
                 [r["remote"] for r in mine],
@@ -990,16 +1148,22 @@ def _draw_calibration(fig, cell, record, roles):
             ax.set_facecolor("#fff7ed")
         ax.set_title(f"{role}: evoked spikes per pulse, by amplitude", fontsize=9, loc="left")
         ax.set_xlabel("mV per phase")
-    axes[0].set_ylabel("spikes per pulse, above the matching window before it")
+    axes[0].set_ylabel(
+        "evoked spikes per pulse\n(count 5-50 ms after the pulse, minus the count in the 45 ms before it)"
+    )
     axes[0].legend(fontsize=7, loc="upper left")
     fig.text(
         0.01,
         0.985,
         "calibration: how hard each region responds to its own pulses (solid) and how far the pulse "
-        "reaches (dashed). Read left to right: the curve should rise from nothing to a plateau; "
-        "the choice is the largest amplitude on the solid line above the dotted threshold without an x "
-        f"(a pulse that starts a network burst more than {burst_warn:.0%} of the time). Between "
-        "polarities, the one that crosses the threshold first wins. A shaded panel found nothing usable.",
+        "reaches (dashed). Each point is the mean over that amplitude's pulses of: spikes the region fired "
+        "5-50 ms after the pulse, minus spikes it fired in the same-length window just before, so 0 means "
+        "the pulse added nothing and a negative value is chance. Read left to right: the curve should rise "
+        "from nothing to a plateau while the dashed line stays low. The choice is the largest amplitude whose "
+        "solid point is above the dotted threshold by at least two error bars, whose dashed point is under "
+        "30% of it (the pulse stays in its region), and without an x (a pulse that starts a network burst "
+        f"more than {burst_warn:.0%} of the time). Between polarities, the one that crosses the threshold "
+        "first wins. A shaded panel found nothing usable.",
         fontsize=8,
         color="#374151",
         wrap=True,
@@ -1015,9 +1179,10 @@ def _draw(files, rows, out_png, timed):
     record = files[0]["record"]
     panels = [p for f in files for p in f["panels"]]
     n_panels = min(len(panels), 8)
-    fig = plt.figure(figsize=(15, 10 + 1.5 * n_panels))
-    grid = fig.add_gridspec(2 + n_panels, 1, height_ratios=[3, 1.4] + [0.8] * n_panels, hspace=0.45)
     calibrating = record["params"]["mode"] == "calibration"
+    top = 0.6 if calibrating and not record.get("_calibration_rows") else 3
+    fig = plt.figure(figsize=(15, 7 + top + 1.5 * n_panels))
+    grid = fig.add_gridspec(2 + n_panels, 1, height_ratios=[top, 1.4] + [0.8] * n_panels, hspace=0.45)
     ax_time = fig.add_subplot(grid[1])
     if calibrating:
         _draw_calibration(fig, grid[0], record, list(record["regions"]))
@@ -1066,15 +1231,18 @@ def _draw(files, rows, out_png, timed):
         ax = fig.add_subplot(grid[2 + k])
         ax.plot(t, v, lw=0.8, color="#333333")
         ax.axvline(0, color="#ef4444", lw=0.6)
+        ax.axhspan(-SETTLED_UV, SETTLED_UV, color="#dcfce7", lw=0)
+        ax.set_xscale("symlog", linthresh=1.0)
+        ax.set_xlim(t[0], t[-1])
         if k == 0:
             title += (
-                "   [raw trace on one driven electrode of the site around the sequence event (red): "
-                "a deflection at 0 ms is the pulse arriving, a hardware check, not a response]"
+                "   [raw trace on one driven electrode, zero = its level before the pulse; the pulse at 0 ms "
+                "(red), then what it leaves behind and how long until the trace is back in the green band]"
             )
         ax.set_title(title, fontsize=8, loc="left")
         ax.set_ylabel("uV", fontsize=7)
         if k == n_panels - 1:
-            ax.set_xlabel("ms after the sequence event")
+            ax.set_xlabel("ms after the sequence event (log scale beyond 1 ms)")
     fig.savefig(out_png, dpi=110, facecolor="white", bbox_inches="tight")
     plt.close(fig)
     print(f"\nwrote {out_png}")
