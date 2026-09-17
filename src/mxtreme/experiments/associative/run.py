@@ -382,7 +382,8 @@ def release(mx, well: int, tokens) -> None:
     """
     for token in tokens:
         try:
-            mx.Sequence(f"{token}_{well}", persistent=False).close()
+            # A Sequence deletes its server-side twin in shutdown() (and __del__) when not persistent.
+            mx.Sequence(f"{token}_{well}", persistent=False, initial_delay=0).shutdown()
         except Exception as e:  # noqa: BLE001 -- clean-up; the recording is already safe
             print(f"could not delete sequence {token}_{well}: {e}")
     try:

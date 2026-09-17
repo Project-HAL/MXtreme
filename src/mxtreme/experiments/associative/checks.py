@@ -24,6 +24,9 @@ from dataclasses import dataclass
 
 import numpy as np
 
+#: Spikes per pulse a region has to evoke locally for an amplitude to count as usable.
+MIN_LOCAL = 0.5
+
 #: How each level is marked when a verdict is printed.
 MARKS = {"ok": "ok  ", "warn": "WARN", "stop": "STOP"}
 
@@ -142,7 +145,7 @@ def connectivity_verdicts(
     bursts: dict[str, float],
     crosstalk_warn: float = 0.3,
     burst_warn: float = 0.2,
-    min_local: float = 0.5,
+    min_local: float = MIN_LOCAL,
     min_path: float = 0.02,
     us: str = "US",
     cs: str = "CS",
@@ -229,30 +232,45 @@ def connectivity_verdicts(
     return out
 
 
-def silent_recording(spike_frames: np.ndarray, fps: float, per_second: float = 1.0) -> Verdict | None:
-    """A verdict when a recording has almost no spikes in it, or ``None`` when it does.
+def outside_artifacts(
+    spike_frames: np.ndarray, pulse_frames, fps: float, before_ms: float = 1.0, after_ms: float = 5.0
+) -> np.ndarray:
+    """The spikes not within the stimulation artifact's window around any pulse.
 
-    On a saline plate nothing fires, so every biological check below would report each site as
-    dead -- true, but not what the run was testing. Saying so once, at the top, keeps a dry run
-    from reading like a failure: what a saline run tests is that the pulses fired where and when
-    they were meant to, which :mod:`.report` checks against the schedule regardless.
+    The detector fires on the artifact on every channel a pulse reaches, so a calibration holds
+    tens of thousands of such "spikes" whatever is on the plate, and they would make a silent one
+    look lively to :func:`silent_recording`.
     """
+    frames = np.sort(np.asarray(spike_frames, dtype=np.int64))
+    if not len(frames) or not len(pulse_frames):
+        return frames
+    starts = np.sort(np.asarray(pulse_frames, dtype=np.int64)) - int(before_ms / 1000 * fps)
+    ends = starts + int((before_ms + after_ms) / 1000 * fps)
+    # For each spike, the last pulse window that starts at or before it; the spike is inside an
+    # artifact if that window has not ended.
+    k = np.searchsorted(starts, frames, side="right") - 1
+    inside = (k >= 0) & (frames < ends[np.clip(k, 0, len(ends) - 1)])
+    return frames[~inside]
+
+
+def silent_recording(spike_frames: np.ndarray, fps: float, per_second: float = 1.0) -> Verdict | None:
+    """A verdict when a recording has almost no spikes outside the stimulation artifacts, or
+    ``None`` when it has plenty: on a silent plate the response checks cannot mean anything, and
+    saying so once at the top is clearer than three dead-site verdicts."""
     if len(spike_frames) == 0:
         return Verdict(
-            "ok",
-            "no spikes at all in this recording. On saline that is expected; the "
-            "response checks below cannot mean anything, so read the schedule and "
-            "artifact sections instead.",
+            "stop",
+            "no spikes outside the stimulation artifacts: the plate is silent, so the response "
+            "checks below cannot mean anything. The schedule and artifact sections still can.",
         )
     span = (float(np.max(spike_frames)) - float(np.min(spike_frames))) / fps
     rate = len(spike_frames) / span if span > 0 else float("inf")
     if rate < per_second:
         return Verdict(
-            "ok",
-            f"only {len(spike_frames)} spikes in {span:.0f} s ({rate:.2f}/s across the "
-            f"whole array). On saline that is expected; the response checks below cannot "
-            f"mean anything, so read the schedule and artifact sections instead. On a "
-            f"culture it means the plate is silent, which is its own problem.",
+            "stop",
+            f"only {len(spike_frames)} spikes outside the stimulation artifacts in {span:.0f} s "
+            f"({rate:.2f}/s across the whole array): the plate is silent, so the response checks "
+            f"below cannot mean anything. The schedule and artifact sections still can.",
         )
     return None
 
@@ -292,7 +310,7 @@ def calibration_table(
 def compare_calibrations(
     tables: dict[str, Sequence[dict]],
     roles: Sequence[str],
-    min_local: float = 0.5,
+    min_local: float = MIN_LOCAL,
     burst_warn: float = 0.2,
 ) -> tuple[list[dict], list[Verdict]]:
     """Set two or more calibration runs of the same regions side by side -- typically the same
@@ -424,17 +442,20 @@ def compare_calibrations(
 def calibration_verdicts(
     rows: Sequence[dict],
     roles: Sequence[str],
-    min_local: float = 0.5,
+    min_local: float = MIN_LOCAL,
     burst_warn: float = 0.2,
 ) -> tuple[dict[str, dict | None], list[Verdict]]:
-    """Pick each region's amplitude, and say what went wrong where it did.
+    """Pick each region's polarity and amplitude, and say what went wrong where it did.
 
-    The choice is the largest amplitude that evokes at least ``min_local`` spikes per pulse
-    locally while starting a network burst on at most ``burst_warn`` of its pulses -- the same
-    rule by hand, made explicit. Where no amplitude satisfies both, the reason is reported instead
-    of a number.
+    Per region, a row is *usable* when it evokes at least ``min_local`` spikes per pulse locally
+    while starting a network burst on at most ``burst_warn`` of its pulses. When more than one
+    polarity was swept, the polarity with the lower usable threshold wins -- it reaches neurons
+    with less voltage -- with anodic-first on a tie (the more effective order in the literature).
+    Within that polarity the choice is the largest usable amplitude, since a site that barely
+    responds at threshold responds unreliably. Where nothing is usable, the reason is reported
+    instead of a number.
 
-    :returns: ``{role: chosen row or None}`` and the verdicts.
+    :returns: ``{role: chosen row or None}`` (the row carries ``polarity``) and the verdicts.
     """
     chosen: dict[str, dict | None] = {}
     out: list[Verdict] = []
@@ -446,17 +467,34 @@ def calibration_verdicts(
             continue
         usable = [r for r in mine if r["local"] >= min_local and r["burst_rate"] <= burst_warn]
         if usable:
-            best = max(usable, key=lambda r: (r["amplitude_mv"], r["local"]))
+            thresholds = {}
+            for r in usable:
+                thresholds[r["polarity"]] = min(
+                    thresholds.get(r["polarity"], r["amplitude_mv"]), r["amplitude_mv"]
+                )
+            polarity = min(thresholds, key=lambda pol: (thresholds[pol], pol != "anodic-first"))
+            best = max(
+                (r for r in usable if r["polarity"] == polarity),
+                key=lambda r: (r["amplitude_mv"], r["local"]),
+            )
             chosen[role] = best
+            others = {pol: t for pol, t in thresholds.items() if pol != polarity}
+            why = (
+                f" ({polarity} reaches threshold at {thresholds[polarity]:.0f} mV, "
+                + ", ".join(f"{pol} at {t:.0f}" for pol, t in others.items())
+                + ")"
+                if others
+                else ""
+            )
             out.append(
                 Verdict(
                     "ok",
-                    f"{role}: {best['amplitude_mv']:.0f} mV {best['polarity']} evokes "
-                    f"{best['local']:.1f} spikes per pulse, bursts on {best['burst_rate']:.0%}.",
+                    f"{role}: {best['amplitude_mv']:.0f} mV {polarity} evokes "
+                    f"{best['local']:.1f} spikes per pulse, bursts on {best['burst_rate']:.0%}{why}.",
                 )
             )
             top = max(r["amplitude_mv"] for r in mine)
-            if min(r["amplitude_mv"] for r in usable) == top:
+            if thresholds[polarity] == top:
                 # Responds only at the top rung: the site is on few neurons, and the amplitude
                 # has nowhere to go if the response fades. Say so now, while reselecting is cheap.
                 out.append(

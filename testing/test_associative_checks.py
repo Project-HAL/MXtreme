@@ -141,9 +141,9 @@ def test_calibration_says_why_when_nothing_works():
 
 def test_silent_recording_is_named_rather_than_reported_as_dead_sites():
     fps = 20000.0
-    assert checks.silent_recording(np.array([]), fps).level == "ok"
+    assert checks.silent_recording(np.array([]), fps).level == "stop"
     quiet = np.arange(0, 300 * fps, 2 * fps)  # 0.5 spikes/s over five minutes
     verdict = checks.silent_recording(quiet, fps)
-    assert verdict is not None and "On saline that is expected" in verdict.message
+    assert verdict is not None and "the plate is silent" in verdict.message
     busy = np.arange(0, 300 * fps, fps / 50)  # 50 spikes/s
     assert checks.silent_recording(busy, fps) is None

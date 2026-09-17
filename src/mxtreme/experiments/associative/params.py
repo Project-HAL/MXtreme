@@ -101,14 +101,19 @@ class AssociativeParams:
     :param retrieval_interval_min: Minutes of nothing between them.
     :param post_min: Minutes of nothing at the end.
     :param seed: For the shuffles within probe blocks.
-    :param calibration_amplitudes_mv: The amplitude ladder, mV per phase.
-    :param calibration_polarities: Polarities swept.
+    :param calibration_amplitudes_mv: The amplitude ladder, mV per phase. Starts low (10, 20 mV
+        per phase) because thresholds on these arrays can sit near the bottom of Ronchi's range.
+    :param calibration_polarities: Polarities swept. Both by default: the report picks, per
+        region, the polarity that reaches threshold with less voltage, and writes it to
+        ``pulse_polarity``. Anodic-first is the literature's answer (Wagenaar 2004, Ronchi 2019),
+        but which DAC direction is "anodic" at the electrode on this rig has not been confirmed,
+        so the sweep is what decides rather than the label.
     :param calibration_reps: Times each (amplitude, polarity) is presented per region.
     :param calibration_iti: Seconds between calibration pulses.
-    :param max_amplitude_mv: Refuse any amplitude above this, in mV per phase. The default of 150
-        (300 mV peak to peak) sits a little above the 40-240 mV peak-to-peak range Ronchi et al.
-        2019 characterised on these arrays, and well inside the water window that keeps voltage
-        stimulation from electrolysing the electrode. Raising it is a deliberate act: nothing in
+    :param max_amplitude_mv: Refuse any amplitude above this, in mV per phase. The default of 120
+        (240 mV peak to peak) is the top of the range Ronchi et al. 2019 characterised on these
+        arrays, and well inside the water window that keeps voltage stimulation from electrolysing
+        the electrode. Raising it is a deliberate act: nothing in
         this package knows your electrodes' impedance or history.
     :param check_reps: Connectivity mode: single pulses per region.
     :param check_iti: Connectivity mode: seconds between pulses.
@@ -176,11 +181,11 @@ class AssociativeParams:
     retrieval_interval_min: float = 15.0
     post_min: float = 10.0
     seed: int = 1
-    calibration_amplitudes_mv: list[float] = field(default_factory=lambda: [20, 40, 60, 80, 100, 120])
+    calibration_amplitudes_mv: list[float] = field(default_factory=lambda: [10, 20, 30, 45, 60, 80, 100])
     calibration_polarities: list[str] = field(default_factory=lambda: ["anodic-first", "cathodic-first"])
-    calibration_reps: int = 10
+    calibration_reps: int = 6
     calibration_iti: float = 3.0
-    max_amplitude_mv: float = 150.0
+    max_amplitude_mv: float = 120.0
     check_reps: int = 20
     check_iti: float = 5.0
     crosstalk_warn: float = 0.3

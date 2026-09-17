@@ -47,9 +47,10 @@ for 10-15 min, four cycles an hour apart (le Feber 2015); 0.3-1 Hz until the res
 within tens of minutes (Shahaf & Marom 2001). The cycle parameters exist so that regime can be
 written without touching code.
 
-Calibration mode replaces everything between pre and post with one block per region, stepping
-through ``calibration_amplitudes_mv`` and ``calibration_polarities`` with single pulses in a
-shuffled order, as Ronchi et al. 2019 did so drift does not read as dose.
+Calibration mode replaces everything between pre and post with one ``calibrate`` block: every
+(region, amplitude, polarity) once per repeat, single pulses, the whole set shuffled together so
+the regions interleave and drift does not read as dose (Ronchi et al. 2019 shuffled amplitudes
+for the same reason).
 
 Connectivity mode is the gate between the two: one ``check`` block of single pulses at each
 region's chosen amplitude, ``check_reps`` each, interleaved. :mod:`.report` turns it into a
@@ -627,29 +628,36 @@ def build_schedule(params: AssociativeParams) -> tuple[list[Block], dict[str, St
         blocks.append(block)
 
     else:  # calibration
+        # Every (region, amplitude, polarity) once per repeat, the whole set shuffled together, so
+        # the regions are interleaved: no region takes a pulse every 3 s for minutes on end, and
+        # drift over the run cannot read as a difference between regions or amplitudes.
         iti = params.calibration_iti
         polarities = list(params.calibration_polarities)
-        for role in ROLES:
-            block = Block(f"calibrate_{role.lower()}", 0.0)
-            t = 0.0
-            for _ in range(params.calibration_reps):
-                grid = [(amp, pol) for amp in params.calibration_amplitudes_mv for pol in polarities]
-                rng.shuffle(grid)
-                for amp, pol in grid:
-                    stim = stimulus_for(
-                        params,
-                        [role],
-                        "stim",
-                        amplitude_mv=amp,
-                        num_events=1,
-                        polarity=pol,
-                        tag_polarity=len(polarities) > 1,
-                    )
-                    stimuli.setdefault(stim.token, stim)
-                    block.presentations.append(Presentation(t, stim.token, [role]))
-                    t += iti
-            block.duration_sec = t
-            blocks.append(block)
+        block = Block("calibrate", 0.0)
+        t = 0.0
+        for _ in range(params.calibration_reps):
+            grid = [
+                (role, amp, pol)
+                for role in ROLES
+                for amp in params.calibration_amplitudes_mv
+                for pol in polarities
+            ]
+            rng.shuffle(grid)
+            for role, amp, pol in grid:
+                stim = stimulus_for(
+                    params,
+                    [role],
+                    "stim",
+                    amplitude_mv=amp,
+                    num_events=1,
+                    polarity=pol,
+                    tag_polarity=len(polarities) > 1,
+                )
+                stimuli.setdefault(stim.token, stim)
+                block.presentations.append(Presentation(t, stim.token, [role]))
+                t += iti
+        block.duration_sec = t
+        blocks.append(block)
 
     blocks.append(Block("post", params.post_min * 60.0))
     return blocks, (_used(stimuli, blocks) if params.phase != "all" else stimuli)

@@ -97,8 +97,8 @@ regions are that culture's, which is fine: the saline chip is only going to fire
 The two scans play different parts, and using both is not a mismatch. The **recording** set is
 the network scan's electrodes (the active set braintrix-cli chose, 100 µm apart) plus every
 electrode the activity scan found active inside the three regions, so the readout counts on as
-many electrodes as the culture has there. The **stimulation** electrodes — four driven and four
-return per site — are routed separately, on top of that set, and need not be in it; they are the
+many electrodes as the culture has there. The **stimulation** electrodes — four driven per site
+— are routed separately, on top of that set, and need not be in it; they are the
 ones the activity scan is used to place, because it is the only recording that covers every
 electrode and can say whether a particular one has a neuron under it. Expect "3 of 4" or "4 of 4
 driven electrodes active" per region.
@@ -127,35 +127,18 @@ python -m mxtreme.experiments.associative preview --params $P
 It should say the recording goes to `$DRY`, "not registered", raw traces on the three regions,
 and draw the sites, the schedule and the waveform.
 
-## 4. The three runs
+## 4. Run, then read: calibration
+
+Every run below is followed by its own `report` before the next run starts. Each recording
+carries its own checks, and reading them in order is how the dry run is *walked* rather than run
+blind: a routing problem in calibration shows in calibration's report, not after three more runs.
 
 ```bash
 python -m mxtreme.experiments.associative run --params $P --mode calibration --set exp_id=dry_cal --work $DRY
-python -m mxtreme.experiments.associative run --params $P --mode connectivity --set exp_id=dry_conn --work $DRY
-python -m mxtreme.experiments.associative run --params $P --set exp_id=dry_cond --work $DRY
+python -m mxtreme.experiments.associative report $DRY/*_dry_cal.raw.h5 -o $DRY/dry_cal.png --csv $DRY/dry_cal.csv
 ```
 
-About 6, 7 and 6 minutes. Then the same conditioning schedule the way the real day runs it: one
-command, one recording per phase — a baseline, one per encode cycle, a retrieval — with the rig
-set up once and the files closed one after another, and the session read as one at the end:
-
-```bash
-python -m mxtreme.experiments.associative run --params $P --set exp_id=dry_split --phase session --work $DRY
-python -m mxtreme.experiments.associative report $DRY/*_dry_split_*.raw.h5
-```
-
-About 7 minutes for the four files. While it runs, from a second terminal, read the baseline file
-as soon as it exists — the mid-session read the real day uses:
-
-```bash
-python -m mxtreme.experiments.associative report $DRY/*_dry_split_baseline.raw.h5
-```
-
-It should end with "no retrieval block yet". The session `report` afterwards should list the four
-recordings in order, count the same presentations as `dry_cond` did, and lay them out on one
-timeline with the seconds of file handling between them.
-
-Calibration is the step most likely to fail, so watch it:
+About 6 minutes. Calibration is the step most likely to fail, so watch the run:
 
 - `run` prints the connected device and refuses if it does not match the batch's `M1`/`M2`;
 - `maxlab` has to accept every sequence;
@@ -178,53 +161,116 @@ Calibration is the step most likely to fail, so watch it:
 - `run` reports whether the protocol went into the recording. If it says it did not, the copy in
   `$DRY` is what `report` needs (`--protocol`).
 
-## 5. Two variants for the paths the first three miss
+### Reading a dry-run report
 
-```bash
-python -m mxtreme.experiments.associative run --params $P --set exp_id=dry_offset --set dt_cs_us=20 --work $DRY
-python -m mxtreme.experiments.associative run --params $P --set exp_id=dry_long --work $DRY \
-  --set t_stim=600 --set encode_iti=660 --set 'encode_pattern=["PAIR"]' --set encode_cycles=1
-python -m mxtreme.experiments.associative run --params $P --mode calibration --set exp_id=dry_cal_grid --work $DRY \
-  --set 'stim_site={"shape":"grid","size":3,"gap":2}'
-python -m mxtreme.experiments.associative compare $DRY/*_dry_cal.raw.h5 $DRY/*_dry_cal_grid.raw.h5
-```
-
-`dry_cal_grid` is the other stimulation pattern the real day may calibrate (a 3x3 grid, 27
-stimulation units, three DACs and no return ring), so routing and sequence building for it get
-exercised too; `compare` on two silent recordings should say there is nothing to compare, which
-is that path working.
-
-`dry_offset` exercises per-pulse unit switching: its start events should read `units switched`,
-and the two regions' deflections should be 20 ms apart. `dry_long` builds a sequence of about 2000
-commands, where a sequence-length limit would show: 198 pulse events over ten minutes, more than
-twice the real run's 89-event trains, at the same amplitude as any other. It tests length, not
-dose, and bounds what the real run will ask of the sequencer.
-
-## 6. Read each recording back
-
-For each of `dry_cal`, `dry_conn`, `dry_cond`, `dry_offset`, `dry_long`, `dry_cal_grid`, and the
-four `dry_split_*` files together:
-
-```bash
-python -m mxtreme.experiments.associative report $DRY/*_dry_cal.raw.h5 -o $DRY/dry_cal.png --csv $DRY/dry_cal.csv
-python -m mxtreme.experiments.associative report $DRY/*_dry_split_*.raw.h5 -o $DRY/dry_split.png --csv $DRY/dry_split.csv
-```
-
-No `--protocol`: `report` reads it from inside the recording, which is itself a check that
-embedding worked. It notices the recording is silent and skips the response verdicts. Read
-instead:
+The same sections come back for every recording. No `--protocol`: `report` reads it from inside
+the recording, which is itself a check that embedding worked. With no cells the plate is silent
+outside the stimulation artifacts, so the verdict says so and the response numbers are all zero;
+that is the artifact-versus-readout check passing (the detector fires on the artifact, none of it
+lands in the 5-50 ms window). Read:
 
 | section | a healthy dry run |
 |---|---|
 | presentations against the schedule | every token fired the expected number of times, `ok` on each row |
 | interval median | matches `probe_iti` / `encode_iti` to within a fraction of a second |
-| first deflection, driven electrode | positive first (anodic-first), a few hundred µV |
-| first deflection, return electrode | the mirror image, same moment |
+| first deflection, driven electrode | at 0.0-0.2 ms on every pulse; the same sign for every pulse of one polarity and the opposite sign for the other; saturating the amplifier (~±3.3 mV) above ~40 mV is normal on saline, since nothing attenuates the pulse |
+| first deflection, return electrode (`dry_cal_focal` only) | the mirror image, same moment |
 | the pair | US and CS deflect in the same frame in `dry_cond`; 20 ms apart in `dry_offset` |
 | artifact vs readout window | spikes in 0-2 ms, near-none in 5-50 ms. If not, the artifact outlasts the window and `pulse_window_ms` needs a later start |
+| the verdicts | one `STOP` saying the plate is silent, which is the truth here; anything about the schedule or the artifact is real |
+| the figure | on saline only the timeline and the artifact panels carry information: every presentation drawn where it was planned, and an artifact on each driven electrode at 0 ms. Calibration's top row (response against amplitude) is empty by construction, and the readout panel of any other run is flat zeros |
 
 The raw traces need MaxWell's HDF5 compression filter, which MaxLab installs on the rig; elsewhere
 the artifact section says it cannot read them.
+
+**Which sign is "anodic" at the electrode is not something saline settles.** In the code,
+`anodic-first` means the DAC code steps *up* first (`DAC_REST + bits`); on the first dry run the
+driven electrode's own amplifier recorded that as a *negative* first deflection and
+`cathodic-first` as positive. Either the stimulation buffer or the recording chain inverts, and
+MaxWell's documentation does not say which, so the labels may be swapped relative to the
+electrode's potential. It does not matter for the experiment — calibration sweeps both polarities
+and picks the one that reaches threshold with less voltage, whatever it is called — but it matters
+for reading the literature's "anodic-first is more effective" onto ours, so note the winner's sign
+as recorded.
+
+## 5. Run, then read: connectivity and a whole conditioning schedule in one file
+
+```bash
+python -m mxtreme.experiments.associative run --params $P --mode connectivity --set exp_id=dry_conn --work $DRY
+python -m mxtreme.experiments.associative report $DRY/*_dry_conn.raw.h5 -o $DRY/dry_conn.png --csv $DRY/dry_conn.csv
+```
+
+```bash
+python -m mxtreme.experiments.associative run --params $P --set exp_id=dry_cond --work $DRY
+python -m mxtreme.experiments.associative report $DRY/*_dry_cond.raw.h5 -o $DRY/dry_cond.png --csv $DRY/dry_cond.csv
+```
+
+About 7 minutes each. `dry_cond` is the conditioning schedule as one recording, the shape a
+`--phase`-less run has; its report should show US and CS deflecting in the same frame on every
+paired pulse.
+
+## 6. Run, then read: the session as separate recordings
+
+The same conditioning schedule the way the real day runs it: one command, one recording per phase
+— a baseline, one per encode cycle, a retrieval — with the rig set up once and the files closed
+one after another:
+
+```bash
+python -m mxtreme.experiments.associative run --params $P --set exp_id=dry_split --phase session --work $DRY
+```
+
+About 7 minutes for the four files. While it runs, from a second terminal, read the baseline file
+as soon as it exists — the mid-session read the real day uses:
+
+```bash
+python -m mxtreme.experiments.associative report $DRY/*_dry_split_baseline.raw.h5
+```
+
+It should end with "no retrieval block yet". When the run finishes, read the session as one:
+
+```bash
+python -m mxtreme.experiments.associative report $DRY/*_dry_split_*.raw.h5 -o $DRY/dry_split.png --csv $DRY/dry_split.csv
+```
+
+It should list the four recordings in order, count the same presentations as `dry_cond` did, and
+lay them out on one timeline with the seconds of file handling between them.
+
+## 7. Run, then read: the paths the first four miss
+
+```bash
+python -m mxtreme.experiments.associative run --params $P --set exp_id=dry_offset --set dt_cs_us=20 --work $DRY
+python -m mxtreme.experiments.associative report $DRY/*_dry_offset.raw.h5 -o $DRY/dry_offset.png --csv $DRY/dry_offset.csv
+```
+
+`dry_offset` exercises per-pulse unit switching: its start events should read `units switched`,
+and the two regions' deflections should be 20 ms apart in the artifact section.
+
+```bash
+python -m mxtreme.experiments.associative run --params $P --set exp_id=dry_long --work $DRY \
+  --set t_stim=600 --set encode_iti=660 --set 'encode_pattern=["PAIR"]' --set encode_cycles=1
+python -m mxtreme.experiments.associative report $DRY/*_dry_long.raw.h5 -o $DRY/dry_long.png --csv $DRY/dry_long.csv
+```
+
+`dry_long` builds a sequence of about 2000 commands, where a sequence-length limit would show: 198
+pulse events over ten minutes, more than twice the real run's 89-event trains, at the same
+amplitude as any other. It tests length, not dose, and bounds what the real run will ask of the
+sequencer. Its report should count all 198.
+
+```bash
+python -m mxtreme.experiments.associative run --params $P --mode calibration --set exp_id=dry_cal_focal --work $DRY \
+  --set 'stim_site={"shape":"focal","inner":2,"inner_gap":6,"return_radius":8,"return_points":"diagonal"}'
+python -m mxtreme.experiments.associative report $DRY/*_dry_cal_focal.raw.h5 -o $DRY/dry_cal_focal.png
+python -m mxtreme.experiments.associative compare $DRY/*_dry_cal.raw.h5 $DRY/*_dry_cal_focal.raw.h5
+```
+
+`dry_cal_focal` is the other stimulation pattern the real day may try: the same 2x2 block with
+two return electrodes carrying the inverted pulse (six stimulation units per site, two DACs).
+It is **allowed to fail**: the chip hands stimulation units out per area of the array, about
+seven each on the MaxOne tried so far, and a six-electrode site was already refused there. If it
+connects, its report's artifact section should show the return electrodes as the mirror image of
+the driven ones, and `compare` on two silent recordings should say there is nothing to compare,
+which is that path working; if it does not, the message names the electrodes and that is the
+answer for this chip. Either way the default (four per site) is what the day runs.
 
 ## What a dry run cannot tell you
 
@@ -236,14 +282,14 @@ stimulation code any run makes.
 ## Checklist
 
 - [ ] `select` chose three regions from the live scan (or took `--centers`), placed the driven blocks on active electrodes, and wrote `$P` with the saline identity
-- [ ] `preview` says `$DRY`, not registered, raw traces on the regions, rings centred
+- [ ] `preview` says `$DRY`, not registered, raw traces on the regions, the three 2x2 blocks drawn
 - [ ] calibration printed the right device and ran without a routing error
 - [ ] connectivity and conditioning ran
 - [ ] `--phase session` wrote four `dry_split_*` recordings from one command; the baseline one reported while the rest ran; one `report` over all four read them as one session, in order
 - [ ] `dry_offset` events say `units switched`; `dry_long` ran
-- [ ] `dry_cal_grid` routed 27 stimulation electrodes and ran; `compare` said nothing to compare
-- [ ] every `report` ran with no `--protocol`
+- [ ] `dry_cal_focal` either connected six electrodes per site and `compare` said nothing to compare, or refused and named the electrodes (note which)
+- [ ] every run was followed by its `report`, none needing `--protocol`
 - [ ] every presentation fired on schedule
-- [ ] driven and return deflections have opposite signs at the same moment
+- [ ] every driven electrode shows a deflection at the sequence event (and, in `dry_cal_focal`, the returns the mirror image)
 - [ ] the 5-50 ms readout window is empty
 - [ ] nothing new under `recordings/` or in `registry.csv`

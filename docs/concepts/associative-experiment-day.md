@@ -11,7 +11,7 @@ document assumes the hardware path is already known to work.
 | 1 | activity scan | braintrix-cli | ~8 min | `<stem>_activity_scan.raw.h5` |
 | 2 | baseline: network scan of the active set | braintrix-cli | 5 min | `<stem>_network_scan.raw.h5` |
 | 3 | place the three regions | `select`, offline | seconds | nothing |
-| 4 | calibration | `run --mode calibration` | 22 min | `<stem>_assoc_cal.raw.h5` |
+| 4 | calibration | `run --mode calibration` | 17 min | `<stem>_assoc_cal.raw.h5` |
 | 5 | connectivity check | `run --mode connectivity` | 9 min | `<stem>_assoc_conn.raw.h5` |
 | 6 | conditioning: one command, six recordings | `run --phase session` | 180 min | `<stem>_assoc_baseline`, `_encode_1..4`, `_retrieval` `.raw.h5` |
 | 7 | read each recording back, and the session as one | `report`, offline | minutes | nothing |
@@ -66,9 +66,11 @@ channels and the total either way.
 
 ## What you are checking at each step
 
-Every step prints its decision and the numbers behind it; every recording has a `report`; nothing
-past step 3 needs the terminal scrollback, since the parameter file and the recordings carry it.
-What to look at, and what would stop you:
+Every step prints its decision and the numbers behind it, and every recording has a `report`
+that is run **before the next step starts**: each one carries the checks that decide whether the
+next step is worth its minutes, and the session's own files are read while it is still running.
+Nothing past step 3 needs the terminal scrollback, since the parameter file and the recordings
+carry it. What to look at, and what would stop you:
 
 | after | look at | go on if | stop and do instead |
 |---|---|---|---|
@@ -165,7 +167,7 @@ stimulation sites: each driven block moved by up to 70 um so its electrodes sit 
 A region being dense does not make its four particular electrodes live, and a driven electrode
 over glass stimulates nothing. **Three or four of four is what you want; two is workable; zero
 gets a warning and means calibration will most likely find nothing there** — give that region
-another centre with `--centers` rather than spend 22 minutes confirming it. The activity scan is
+another centre with `--centers` rather than spend 17 minutes confirming it. The activity scan is
 the right source because it covers every electrode; the baseline covers only its thousand.
 
 It then routes every electrode the baseline recorded, plus every electrode the activity scan found
@@ -175,16 +177,39 @@ apart, which leaves only a handful in a region, and the readout is counted on th
 If a scan was repeated that day the globs match two files; name the one you mean instead.
 
 `$P` is the culture's parameter file. **Every later command points at it**, and it carries the
-culture's identity, so none of them repeats it. Read the two figures `select` wrote into `$WORK`
-before continuing:
+culture's identity, so none of them repeats it.
 
-| look at | good | bad |
-|---|---|---|
-| correlation, bursts left out | below ~0.1 for the three chosen | any chosen pair above ~0.3 |
-| burst order | near 50% for the chosen pairs | one patch first in most bursts (it drives the others) |
-| triangle | ratio above 0.6, US-CS and US-NS within ~15% | one region between the other two |
-| coupling vs distance | no clear trend | rising with distance |
-| driven electrodes | 3-4 of 4 active per region | 0 of 4 anywhere |
+**Why the least-coupled triple.** The result is a CS-to-US response that grows with pairing and
+does not with NS, so the three regions should start as independent of each other as the culture
+allows: a pair that already fires together has no headroom to show a new association, and a
+control region that is already coupled to US is no control. So among the dense candidates the
+triple with the smallest largest pairwise coupling is taken, then the one whose CS and NS are best
+matched in their coupling to US (so both conditioned sites start from the same footing), then the
+most equilateral. "Least coupled" is measured with the network bursts masked, because a burst
+sweeps every patch at once and would make any pair look coupled. It is not "unconnected": a
+culture is one network, every region reaches every other within a few synapses, and the
+connectivity check (step 5) confirms a CS pulse does evoke *something* in US at baseline. What the
+selection avoids is a pair that is already strongly and consistently coupled, which would either
+saturate or be indistinguishable from the pre-existing pathway.
+
+Read the two figures `select` wrote into `$WORK` before continuing. `*_regions.png` is the
+decision: the scan with every candidate patch drawn (green chosen, orange qualifies but too close
+to a chosen one), the coupling matrix, the three roles on the array with their triangle and the
+electrodes to route, and the candidates ranked by density. Its firing-rate colour saturates at
+the 95th percentile of the active electrodes, so a few electrodes at tens of hertz do not push
+every ordinary one to black. `*_coupling.png` is the evidence behind the matrix, with a reading
+guide printed across its top:
+
+| panel | what it is | good | bad |
+|---|---|---|---|
+| rates over time | each candidate's rate with the network bursts shaded | bursts are the spikes that rise together; that is what gets masked | a culture with no quiet between bursts: nothing to measure coupling on |
+| correlation, all bins | what every bursting culture shows: everything correlated | — | — (it is there to show why the next matrix is the one that counts) |
+| correlation, bursts left out | the selection's number | below ~0.1 for the three chosen | any chosen pair above ~0.3 |
+| burst order | how often the row patch enters a burst before the column patch | near 50% for the chosen pairs | one patch first in most bursts: it drives the others |
+| correlograms, one per pair | correlation at every lag from -250 to +250 ms, grey with bursts, black without | the black line flat | a black peak off zero: one patch leads the other by that many ms |
+| which patch enters each burst first | one dot per burst per patch: ms after the first to join | the tally spread across patches | one patch at zero on most bursts |
+| coupling against distance | every candidate pair | a falling trend means separation is doing most of the work, which is fine | coupling *rising* with distance is worth a look: something other than proximity links those patches |
+| driven electrodes (terminal) | activity under the four stimulation electrodes | 3-4 of 4 active per region | 0 of 4 anywhere |
 
 If it refuses (`only N patches qualify`), it writes a rejection figure saying why. Lower
 `--separation`, or place the regions by hand with `--centers "x,y;x,y;x,y"`.
@@ -195,14 +220,15 @@ If it refuses (`only N patches qualify`), it writes a rejection figure saying wh
 python -m mxtreme.experiments.associative run --params $P --config $CFG \
   --mode calibration --set exp_id=assoc_cal --set pre_min=2 --set post_min=2 --work $WORK
 python -m mxtreme.experiments.associative report $CULTURE/*_assoc_cal.raw.h5 \
-  -o $WORK/assoc_cal.png --csv $WORK/assoc_cal.csv
+  -o $WORK/assoc_cal.png --csv $WORK/assoc_cal.csv --apply $P
 ```
 
 `run` first checks that the connected device matches the batch's `M1`/`M2`, and refuses if not:
 that token decides which `chip_M1_...` or `chip_M2_...` directory the recording is filed under.
 
-Six amplitudes (20 to 120 mV per phase) times two polarities times ten repeats per region,
-shuffled, with two minutes of quiet either side. The report prints, per region and amplitude,
+Seven amplitudes (10 to 100 mV per phase), both polarities, six repeats per region: 252 single
+pulses in 12.6 minutes, every repeat shuffled across all three regions so they interleave, with
+two minutes of quiet either side. The report prints, per region and amplitude,
 `local` (spikes per pulse in the stimulated region), `remote` (in the other two: how far the pulse
 reaches), `spread` (remote over local) and the burst rate, then a recommended `amplitudes_mv`: the
 largest amplitude that evokes at least 0.5 spikes per pulse locally while starting a network burst
@@ -210,31 +236,47 @@ on at most 20% of pulses. A `STOP` says which way it failed: nothing responds ev
 site has too few neurons; back to step 3), or everything that responds also bursts (back to
 step 3).
 
-**Copy the two lines the report prints** — `amplitudes_mv` and `amplitudes_source` — into `$P`.
-Without the second, every later `run` refuses to start.
+**The figure** (`assoc_cal.png`) is that table drawn: one panel per region, evoked spikes per
+pulse against amplitude, blue for anodic-first and red for cathodic-first, the region's own
+response solid and the mean of the other two dashed. What a healthy region looks like: the solid
+line rising from nothing, crossing the dotted "usable" threshold, and flattening; the dashed line
+staying low. The green vertical line is the amplitude chosen; an `x` marks a row that started
+bursts too often; a shaded panel found nothing usable. Below it, the timeline of what fired, then
+the artifact on each driven electrode at the first pulse. Zero-height response curves with a
+clean timeline and artifacts are what a dry run shows, and on a culture they mean the sites are
+not on neurons.
 
-### 4b. Which pattern to drive through: focal 2x2 or grid 3x3
+Nothing is copied by hand: the report picks each region's polarity (the one that reaches
+threshold with less voltage) and amplitude, prints them, and `--apply $P` (already in the command
+above) writes `amplitudes_mv`, `amplitudes_source` and `pulse_polarity` into `$P`. It refuses to
+write while any region has a `STOP`, and until `amplitudes_source` is set every later `run`
+refuses to start. If the regions disagree on polarity the report says so and takes the majority:
+`pulse_polarity` is one setting for all three.
 
-The default drives a 2x2 block with a return ring, which confines the field. A 3x3 grid with no
-ring drives nine electrodes, reaches more tissue, and spreads further. Which is the better trade
-on this culture is an empirical question, and the same calibration answers it: run it once more
-with the other pattern on the same sites, then set the two side by side.
+### 4b. Which pattern to drive through: the block alone, or with return electrodes
+
+The default drives a 2x2 block with the bath as the return. Ronchi's design adds return
+electrodes carrying the inverted pulse, which confines the field — at the cost of more
+stimulation units, which the chip hands out per area of the array (about seven per area on the
+MaxOne tried so far, where a six-electrode site was refused). Whether confinement is *needed* is
+what calibration's `remote` column and the connectivity check measure, so the question is only
+worth 17 minutes if the default shows cross-talk. If it does, run calibration once more with two
+return electrodes and set the two side by side:
 
 ```bash
 python -m mxtreme.experiments.associative run --params $P --config $CFG \
-  --mode calibration --set exp_id=assoc_cal_grid --set pre_min=2 --set post_min=2 --work $WORK \
-  --set 'stim_site={"shape":"grid","size":3,"gap":2}'
+  --mode calibration --set exp_id=assoc_cal_focal --set pre_min=2 --set post_min=2 --work $WORK \
+  --set 'stim_site={"shape":"focal","inner":2,"inner_gap":6,"return_radius":8,"return_points":"diagonal"}'
 python -m mxtreme.experiments.associative compare \
-  $CULTURE/*_assoc_cal.raw.h5 $CULTURE/*_assoc_cal_grid.raw.h5 -o $WORK/assoc_cal_compare.png
+  $CULTURE/*_assoc_cal.raw.h5 $CULTURE/*_assoc_cal_focal.raw.h5 -o $WORK/assoc_cal_compare.png
 ```
 
 `compare` prints each run's table, then per region: the threshold amplitude for each pattern, the
 local response at the largest amplitude both reached, and the spread there, and a verdict — the
 pattern with the lower threshold, or the same threshold and more local response, or the same of
 both and less spread; flagged instead of decided when the harder-driving pattern also spreads more
-than a third further. Another 22 minutes; skip it on a culture you are short of time with, and
-the default stands on the argument in the rationale (a confined field is the cheapest way to three
-independent sites).
+than a third further. If the focal run cannot connect its electrodes on this chip, that is the
+answer, and the default stands.
 
 **Copy the winning pattern's `stim_site`, its `amplitudes_mv` and its `amplitudes_source` into
 `$P`.** The sites' centres
@@ -467,9 +509,10 @@ Widen a site with `gap` (or `inner_gap`), never `size` (or `inner`).
 
 ## Safety notes
 
-- **Amplitude is in mV per phase; peak to peak is twice that.** The ladder is 20 to 120 mV per
-  phase, 40 to 240 peak to peak, the range Ronchi et al. 2019 characterised on these arrays.
-  `max_amplitude_mv` refuses anything above 150 per phase unless raised deliberately.
+- **Amplitude is in mV per phase; peak to peak is twice that.** The ladder is 10 to 100 mV per
+  phase, 20 to 200 peak to peak, inside the range Ronchi et al. 2019 characterised on these
+  arrays (40 to 240). `max_amplitude_mv` refuses anything above 120 per phase unless raised
+  deliberately.
 - **Pulses are charge balanced** in time (equal and opposite phases); the bath is the return.
 - **The duty cycle is very low.** The conditioning run delivers about 1400 pulses to each of US and
   CS; at 100 µs per phase that is under a third of a second of driven electrode across the day.

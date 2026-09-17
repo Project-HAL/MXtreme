@@ -81,7 +81,9 @@ def _load_well(h5_path, well):
                 segments.append(
                     {
                         "raw": (h5_path, group["raw"].name),
-                        "frame_nos": group["frame_nos"][:],
+                        # Signed: MaxWell stores these uint64, and the samples before an event
+                        # would otherwise wrap to 2^64 when the event's frame is subtracted.
+                        "frame_nos": np.asarray(group["frame_nos"][:]).astype(np.int64),
                         "channels": group["channels"][:],
                     }
                 )
@@ -143,7 +145,8 @@ def _trace(data, channel, frame, before, after):
                 "is missing; run this on the rig for the artifact check)",
             )
             return None, None
-        return (frame_nos[i0:i1] - frame) / data["fps"] * 1000.0, (v - np.median(v)) * data["lsb"] * 1e6
+        t = (frame_nos[i0:i1].astype(np.int64) - int(frame)) / data["fps"] * 1000.0
+        return t, (v - np.median(v)) * data["lsb"] * 1e6
     return None, None
 
 
@@ -326,7 +329,7 @@ def _gate(data, record) -> list:
     if not pulses:
         return [checks.Verdict("stop", "no stimulation events in this recording.")]
 
-    silent = checks.silent_recording(frames, fps)
+    silent = checks.silent_recording(checks.outside_artifacts(frames, [f for _, f in pulses], fps), fps)
     if silent is not None:
         return [silent]
 
@@ -372,11 +375,44 @@ def _gate(data, record) -> list:
     )
     picked = {role: (row["amplitude_mv"] if row else None) for role, row in chosen.items()}
     if all(v is not None for v in picked.values()):
-        print("\n  for the parameter file:")
+        polarities = [row["polarity"] for row in chosen.values() if row and row.get("polarity")]
+        majority = max(set(polarities), key=polarities.count) if polarities else params.get("pulse_polarity")
+        if len(set(polarities)) > 1:
+            verdicts.append(
+                checks.Verdict(
+                    "warn",
+                    "the regions prefer different polarities ("
+                    + ", ".join(f"{role} {row['polarity']}" for role, row in chosen.items() if row)
+                    + f"); pulse_polarity is one setting for all three, so {majority} is taken for all.",
+                )
+            )
+        record["_calibration_pick"] = {
+            "amplitudes_mv": picked,
+            "amplitudes_source": data.get("name", "this calibration"),
+            "pulse_polarity": majority,
+        }
+        print("\n  for the parameter file (report --apply <params.json> writes them):")
         print(f"    amplitudes_mv = {picked}")
         print(f"    amplitudes_source = {data.get('name', 'this calibration')!r}")
+        print(f"    pulse_polarity = {majority!r}")
     record["_calibration_rows"] = rows  # for compare()
     return verdicts
+
+
+def apply_calibration(params_path: str, pick: dict) -> None:
+    """Write a calibration's choice -- amplitudes, their source, the polarity -- into a parameter
+    file in place, keeping its other keys and its ``_`` notes as they are."""
+    with open(params_path) as f:
+        current = json.load(f)
+    for key in ("amplitudes_mv", "amplitudes_source", "pulse_polarity"):
+        current[key] = pick[key]
+    with open(params_path, "w") as f:
+        json.dump(current, f, indent=2)
+        f.write("\n")
+    print(
+        f"\nwrote amplitudes_mv {pick['amplitudes_mv']}, amplitudes_source {pick['amplitudes_source']!r} "
+        f"and pulse_polarity {pick['pulse_polarity']!r} into {params_path}"
+    )
 
 
 def _print_calibration(rows):
@@ -676,6 +712,7 @@ def report(
     out_png: str | None = None,
     threshold_uv: float = 200.0,
     out_csv: str | None = None,
+    apply_to: str | None = None,
 ) -> list[dict]:
     """Read one recording, or the recordings of one session, back against the protocol each was
     made with.
@@ -692,6 +729,9 @@ def report(
     :param out_csv: Where to write the per-presentation counts. Nothing is written without it.
         Both are analysis, which can be regenerated from the recording, so neither is written
         unless asked for -- and never into the store unless you point them there.
+    :param apply_to: A parameter file to write a calibration's choice into (amplitudes, their
+        source, the polarity), so nothing has to be copied by hand. Refused unless every region
+        got an amplitude.
     :returns: The per-presentation rows, over the whole session.
     """
     paths = [h5_paths] if isinstance(h5_paths, (str, os.PathLike)) else list(h5_paths)
@@ -720,6 +760,17 @@ def report(
             rows.append(row)
         if not timed:
             offset += f["duration_sec"]
+    if apply_to is not None:
+        picks = [
+            f["record"].get("_calibration_pick")
+            for f in files
+            if f["record"]["params"].get("mode") == "calibration"
+        ]
+        if not picks:
+            raise ValueError("--apply needs a calibration recording")
+        if picks[-1] is None:
+            raise ValueError("this calibration chose no amplitude for at least one region; nothing written")
+        apply_calibration(apply_to, picks[-1])
     if len(files) > 1:
         print(
             f"\n=== session: {len(files)} recordings, {len(rows)} presentations ===\n  "
@@ -793,25 +844,10 @@ def report(
     return rows
 
 
-def _draw(files, rows, out_png, timed):
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
+def _draw_readout(ax_read, files, rows):
     record = files[0]["record"]
-    panels = [p for f in files for p in f["panels"]]
-    n_panels = min(len(panels), 6)
-    fig = plt.figure(figsize=(15, 10 + 1.5 * n_panels))
-    grid = fig.add_gridspec(2 + n_panels, 1, height_ratios=[3, 1.4] + [0.8] * n_panels, hspace=0.45)
-    ax_read = fig.add_subplot(grid[0])
-    ax_time = fig.add_subplot(grid[1])
-
-    calibrating = record["params"]["mode"] == "calibration"
     ax_read.set_title(
-        "evoked response in the stimulated region, by amplitude"
-        if calibrating
-        else "readout: spikes in US after each presentation",
+        "readout: spikes in US in the pulse-locked window after each presentation, by what was presented",
         loc="left",
         fontsize=10,
     )
@@ -821,7 +857,7 @@ def _draw(files, rows, out_png, timed):
     series = {}
     for row in rows:
         stimulated = protocol.roles_in(row["token"])
-        read = stimulated[0] if calibrating and stimulated else "US"
+        read = "US"
         series.setdefault(row["token"], []).append((row["index"], row[f"{read}_pulse"]))
     for token, points in series.items():
         stimulated = protocol.roles_in(token)
@@ -831,18 +867,14 @@ def _draw(files, rows, out_png, timed):
             else display.ROLE_COLOURS.get(stimulated[0] if stimulated else "US", "#888888")
         )
         label = (
-            token
-            if calibrating
-            else (
-                "+".join(stimulated)
-                + (" (pairing)" if len(stimulated) > 1 else " alone")
-                + (
-                    " checkpoint"
-                    if token.startswith("checkpoint")
-                    else " probe"
-                    if token.startswith("probe")
-                    else " training"
-                )
+            "+".join(stimulated)
+            + (" (pairing)" if len(stimulated) > 1 else " alone")
+            + (
+                " checkpoint"
+                if token.startswith("checkpoint")
+                else " probe"
+                if token.startswith("probe")
+                else " training"
             )
         )
         xs, ys = zip(*points)
@@ -859,6 +891,120 @@ def _draw(files, rows, out_png, timed):
                 ax_read.axvline(edge - 0.5, color="#111827", lw=0.8, ls=":")
     if series:
         ax_read.legend(fontsize=7, loc="upper left")
+
+
+def _draw_calibration(fig, cell, record, roles):
+    """Calibration's figure: per region, evoked spikes per pulse against amplitude, one line per
+    polarity, the local response solid and the remote one dashed, with the usable threshold, the
+    burst limit and the chosen amplitude marked. This is the table drawn, so the choice can be
+    checked by eye."""
+    from mxtreme.experiments.associative import checks
+
+    rows = record.get("_calibration_rows") or []
+    pick = record.get("_calibration_pick") or {}
+    chosen = pick.get("amplitudes_mv", {})
+    burst_warn = record["params"].get("burst_warn", 0.2)
+    sub = cell.subgridspec(1, max(1, len(roles)), wspace=0.25)
+    axes = [fig.add_subplot(sub[0, k]) for k in range(max(1, len(roles)))]
+    if not rows:
+        axes[0].text(
+            0.0,
+            0.5,
+            "no evoked response to plot: the recording has no spikes outside the stimulation artifacts",
+            transform=axes[0].transAxes,
+            fontsize=9,
+        )
+        for ax in axes:
+            ax.axis("off")
+        return
+    polarities = sorted({r["polarity"] for r in rows})
+    colours = {"anodic-first": "#2563eb", "cathodic-first": "#dc2626"}
+    for ax, role in zip(axes, roles):
+        for polarity in polarities:
+            mine = sorted(
+                (r for r in rows if r["role"] == role and r["polarity"] == polarity),
+                key=lambda r: r["amplitude_mv"],
+            )
+            if not mine:
+                continue
+            colour = colours.get(polarity, "#111827")
+            amps = [r["amplitude_mv"] for r in mine]
+            ax.plot(amps, [r["local"] for r in mine], "o-", color=colour, label=f"{polarity}: local")
+            ax.plot(
+                amps,
+                [r["remote"] for r in mine],
+                "s--",
+                color=colour,
+                alpha=0.5,
+                ms=4,
+                label=f"{polarity}: remote (mean of the other two)",
+            )
+            for r in mine:
+                if r["burst_rate"] > burst_warn:
+                    ax.plot(r["amplitude_mv"], r["local"], "x", color="#111827", ms=10, mew=2)
+        ax.axhline(checks.MIN_LOCAL, color="#9ca3af", lw=0.8, ls=":")
+        ax.text(
+            0.01,
+            checks.MIN_LOCAL,
+            f" usable above {checks.MIN_LOCAL:g} spikes/pulse",
+            transform=ax.get_yaxis_transform(),
+            fontsize=7,
+            color="#6b7280",
+            va="bottom",
+        )
+        amplitude = chosen.get(role)
+        if amplitude is not None:
+            ax.axvline(amplitude, color="#16a34a", lw=1.2)
+            amps_here = [r["amplitude_mv"] for r in rows if r["role"] == role] or [amplitude]
+            on_right = amplitude > (min(amps_here) + max(amps_here)) / 2
+            ax.text(
+                amplitude,
+                0.02,
+                f" chosen {amplitude:g} mV ({pick.get('pulse_polarity', '')}) ",
+                transform=ax.get_xaxis_transform(),
+                fontsize=7,
+                color="#16a34a",
+                va="bottom",
+                ha="right" if on_right else "left",
+            )
+        else:
+            ax.set_facecolor("#fff7ed")
+        ax.set_title(f"{role}: evoked spikes per pulse, by amplitude", fontsize=9, loc="left")
+        ax.set_xlabel("mV per phase")
+    axes[0].set_ylabel("spikes per pulse, above the matching window before it")
+    axes[0].legend(fontsize=7, loc="upper left")
+    fig.text(
+        0.01,
+        0.985,
+        "calibration: how hard each region responds to its own pulses (solid) and how far the pulse "
+        "reaches (dashed). Read left to right: the curve should rise from nothing to a plateau; "
+        "the choice is the largest amplitude on the solid line above the dotted threshold without an x "
+        f"(a pulse that starts a network burst more than {burst_warn:.0%} of the time). Between "
+        "polarities, the one that crosses the threshold first wins. A shaded panel found nothing usable.",
+        fontsize=8,
+        color="#374151",
+        wrap=True,
+    )
+
+
+def _draw(files, rows, out_png, timed):
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    record = files[0]["record"]
+    panels = [p for f in files for p in f["panels"]]
+    n_panels = min(len(panels), 6)
+    fig = plt.figure(figsize=(15, 10 + 1.5 * n_panels))
+    grid = fig.add_gridspec(2 + n_panels, 1, height_ratios=[3, 1.4] + [0.8] * n_panels, hspace=0.45)
+    calibrating = record["params"]["mode"] == "calibration"
+    ax_time = fig.add_subplot(grid[1])
+    if calibrating:
+        _draw_calibration(fig, grid[0], record, list(record["regions"]))
+    else:
+        ax_read = fig.add_subplot(grid[0])
+        _draw_readout(ax_read, files, rows)
 
     # The session's blocks end to end, each recording's blocks placed by its own markers where it
     # has them, the recordings themselves by their clocks when every one has one.

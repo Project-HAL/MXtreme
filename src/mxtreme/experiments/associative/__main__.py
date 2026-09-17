@@ -117,6 +117,12 @@ def main(argv=None) -> None:
         "--csv",
         help="write the per-presentation counts here, for checking by hand; nothing is written without it",
     )
+    t.add_argument(
+        "--apply",
+        metavar="PARAMS",
+        help="a calibration recording's choice (amplitudes_mv, amplitudes_source, pulse_polarity) is "
+        "written into this parameter file",
+    )
 
     c = sub.add_parser(
         "compare",
@@ -169,7 +175,7 @@ def main(argv=None) -> None:
     elif args.command == "report":
         from mxtreme.experiments.associative.report import report
 
-        report(args.h5, args.protocol, args.out, out_csv=args.csv)
+        report(args.h5, args.protocol, args.out, out_csv=args.csv, apply_to=args.apply)
     elif args.command == "compare":
         from mxtreme.experiments.associative.report import compare
 

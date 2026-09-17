@@ -629,3 +629,82 @@ def test_report_reads_a_split_session_as_one_curve(tmp_path, capsys):
     # One recording alone still reads, and says the session is not over.
     report(paths[0])
     assert "no retrieval block yet" in capsys.readouterr().out
+
+
+def test_the_silence_check_ignores_the_stimulation_artifact():
+    from mxtreme.experiments.associative.checks import outside_artifacts, silent_recording
+
+    pulses = [int(k * 3 * FPS) for k in range(1, 61)]  # 60 pulses, 3 s apart, over 3 min
+    # Ten artifact "spikes" 0-4 ms after every pulse, and five real spikes in the whole run.
+    artifact = [p + int(0.0004 * FPS) * j for p in pulses for j in range(10)]
+    real = [int(FPS * 7.5), int(FPS * 40.2), int(FPS * 90.9), int(FPS * 120.4), int(FPS * 170.1)]
+    frames = np.array(sorted(artifact + real))
+    assert silent_recording(frames, FPS) is None  # 605 spikes in 3 min looks lively
+    kept = outside_artifacts(frames, pulses, FPS)
+    assert sorted(kept.tolist()) == sorted(real)
+    assert silent_recording(kept, FPS) is not None and silent_recording(kept, FPS).level == "stop"
+
+
+def test_calibration_picks_the_polarity_that_reaches_threshold_with_less_voltage():
+    from mxtreme.experiments.associative.checks import calibration_verdicts
+
+    def row(role, mv, pol, local):
+        return {
+            "role": role,
+            "amplitude_mv": mv,
+            "polarity": pol,
+            "local": local,
+            "remote": 0.0,
+            "pulses": 6,
+            "burst_rate": 0.0,
+        }
+
+    rows = [
+        # US: cathodic reaches 0.5 at 30 mV, anodic only at 60 -> cathodic, then its largest usable rung.
+        row("US", 30, "cathodic-first", 0.6),
+        row("US", 60, "cathodic-first", 1.4),
+        row("US", 100, "cathodic-first", 2.0),
+        row("US", 30, "anodic-first", 0.2),
+        row("US", 60, "anodic-first", 0.9),
+        row("US", 100, "anodic-first", 1.8),
+        # CS: a tie at 45 -> anodic-first.
+        row("CS", 45, "cathodic-first", 0.7),
+        row("CS", 45, "anodic-first", 0.6),
+        row("CS", 80, "anodic-first", 1.0),
+    ]
+    chosen, verdicts = calibration_verdicts(rows, ["US", "CS"])
+    assert chosen["US"]["polarity"] == "cathodic-first" and chosen["US"]["amplitude_mv"] == 100
+    assert chosen["CS"]["polarity"] == "anodic-first" and chosen["CS"]["amplitude_mv"] == 80
+    us = next(v for v in verdicts if v.message.startswith("US:"))
+    assert "cathodic-first reaches threshold at 30 mV, anodic-first at 60" in us.message
+
+
+def test_apply_calibration_writes_the_pick_into_the_parameter_file(tmp_path):
+    from mxtreme.experiments.associative.report import apply_calibration
+
+    path = tmp_path / "p.json"
+    path.write_text(
+        json.dumps(
+            {
+                "_note": "kept",
+                "amplitudes_mv": {"US": 80, "CS": 80, "NS": 80},
+                "amplitudes_source": "default",
+                "pulse_polarity": "anodic-first",
+                "seed": 3,
+            },
+            indent=2,
+        )
+    )
+    apply_calibration(
+        str(path),
+        {
+            "amplitudes_mv": {"US": 60, "CS": 45, "NS": 60},
+            "amplitudes_source": "x_cal",
+            "pulse_polarity": "cathodic-first",
+        },
+    )
+    after = json.loads(path.read_text())
+    assert after["amplitudes_mv"] == {"US": 60, "CS": 45, "NS": 60}
+    assert after["amplitudes_source"] == "x_cal" and after["pulse_polarity"] == "cathodic-first"
+    assert after["_note"] == "kept" and after["seed"] == 3
+    AssociativeParams.from_json(path).validate()

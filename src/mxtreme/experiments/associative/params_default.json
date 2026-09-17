@@ -15,7 +15,7 @@
   "rec_electrodes": null,
   "_regions": "Centres in um, x along the long axis (0-3832), y along the short (0-2082). Filled in by `select`; then keep them fixed for the culture.",
   "regions": {},
-  "_amplitudes_mv": "Per role, mV PER PHASE; peak to peak is twice this. Ronchi et al. 2019 characterised 40-240 mV peak to peak (20-120 per phase) on these arrays, so the ladder stays in that range and max_amplitude_mv refuses anything above 150 per phase unless raised deliberately.",
+  "_amplitudes_mv": "Per role, mV PER PHASE; peak to peak is twice this. Ronchi et al. 2019 characterised 40-240 mV peak to peak (20-120 per phase) on these arrays; the ladder runs 10-100 per phase and max_amplitude_mv refuses anything above 120 per phase unless raised deliberately.",
   "amplitudes_mv": {
     "US": 80.0,
     "CS": 80.0,
@@ -87,21 +87,25 @@
   "retrieval_interval_min": 10.0,
   "post_min": 5.0,
   "seed": 1,
+  "_calibration_amplitudes_mv": "mV per phase (peak to peak is twice). Seven rungs from 10 to 100: starts low because thresholds on these arrays can sit near the bottom of Ronchi's 40-240 mV peak-to-peak range, and stops at 100 because above that the response saturates and pulses start bursts. max_amplitude_mv 120 (240 pp, the top of Ronchi's range) is the hard stop.",
   "calibration_amplitudes_mv": [
+    10,
     20,
-    40,
+    30,
+    45,
     60,
     80,
-    100,
-    120
+    100
   ],
+  "_calibration_polarities": "Both. The report picks, per region, the polarity that reaches threshold with less voltage (anodic-first on a tie) and writes it to pulse_polarity with --apply. Anodic-first is the literature's answer, but which DAC direction is 'anodic' at the electrode on this rig is unconfirmed, so the sweep decides rather than the label.",
   "calibration_polarities": [
     "anodic-first",
     "cathodic-first"
   ],
-  "calibration_reps": 10,
+  "_calibration_reps": "Repeats of the whole (region x amplitude x polarity) set; each repeat is shuffled and the regions interleaved. 6 repeats x 7 amplitudes x 2 polarities = 84 single pulses per region, 252 in all, 12.6 min at calibration_iti 3 s -- about a twelfth of the conditioning session's pulses.",
+  "calibration_reps": 6,
   "calibration_iti": 3.0,
-  "max_amplitude_mv": 150.0,
+  "max_amplitude_mv": 120.0,
   "check_reps": 20,
   "check_iti": 5.0,
   "crosstalk_warn": 0.3,

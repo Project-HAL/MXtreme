@@ -551,8 +551,27 @@ def _draw_coupling(baseline_data, patches, centres, bursts, corr_raw, outside, l
     n = len(names)
     colours = plt.cm.tab10(np.linspace(0, 1, 10))[:n]
 
-    fig = plt.figure(figsize=(17, 4.2 * n + 7))
-    grid = fig.add_gridspec(4, 3, height_ratios=[1.1, 1.0, 1.6 * n / 3, 1.0], hspace=0.42, wspace=0.28)
+    fig = plt.figure(figsize=(17, 4.2 * n + 7.5))
+    grid = fig.add_gridspec(
+        4, 3, height_ratios=[1.1, 1.0, 1.6 * n / 3, 1.0], hspace=0.42, wspace=0.28, top=0.93
+    )
+    fig.text(
+        0.01,
+        0.985,
+        "How to read this figure. The question is which three candidate patches are the most independent of "
+        "each other at baseline, so that a CS-to-US response that grows later is new. Row 1: the candidates' "
+        "rates over time; network bursts (shaded) sweep every patch at once and would make any pair look "
+        "coupled, so they are masked. Row 2: the coupling numbers; the middle matrix is the one that "
+        "counts, and the right one says whether one patch consistently enters bursts ahead of another "
+        "(near 50% = no consistent order). Row 3: the same pairs as time-lagged correlograms; a flat line is "
+        "independence, a peak off zero is one patch leading the other by that many ms. Row 4, left: which "
+        "patch enters each burst first; right: whether the coupling numbers just track how far apart the "
+        "patches are.",
+        fontsize=8.5,
+        color="#374151",
+        wrap=True,
+        va="top",
+    )
 
     # 1. Rates over time, with the detected bursts shaded.
     ax = fig.add_subplot(grid[0, :])
@@ -584,8 +603,22 @@ def _draw_coupling(baseline_data, patches, centres, bursts, corr_raw, outside, l
                 "RdBu_r",
                 "{:.2f}",
             ),
-            ("correlation, network bursts left out\n(what counts)", outside, -1, 1, "RdBu_r", "{:.2f}"),
-            ("burst order: row fired first in\nthis fraction of shared bursts", lead, 0, 1, "PuOr", "{:.0%}"),
+            (
+                "correlation, network bursts left out\n(what the selection uses; want near 0)",
+                outside,
+                -1,
+                1,
+                "RdBu_r",
+                "{:.2f}",
+            ),
+            (
+                "burst order: row entered the burst before column\nin this fraction of shared bursts (want near 50%)",
+                lead,
+                0,
+                1,
+                "PuOr",
+                "{:.0%}",
+            ),
         )
     ):
         ax = fig.add_subplot(grid[1, k])
@@ -661,15 +694,20 @@ def _draw_coupling(baseline_data, patches, centres, bursts, corr_raw, outside, l
         firsts = [names[int(i)] for i in np.nanargmin(np.where(np.isnan(onsets), np.inf, onsets), axis=1)]
         tally = ", ".join(f"{name} {firsts.count(name)}" for name in names if firsts.count(name))
         ax.set_title(
-            f"burst initiation: first to join is {tally} (of {len(onsets)} bursts)", fontsize=9, loc="left"
+            f"which patch enters each network burst first: {tally} (of {len(onsets)} bursts)",
+            fontsize=9,
+            loc="left",
         )
         ax.text(
             0.0,
-            -0.28,
-            "A patch that leads most bursts is driving the others rather than being independent of them.",
+            -0.2,
+            "Each dot is one burst: how many ms after the first patch that patch joined in.\nA patch sitting at "
+            "0 for most bursts is where the bursts start, so it drives the others rather than being independent "
+            "of them.",
             transform=ax.transAxes,
             fontsize=8,
             color="#6b7280",
+            va="top",
         )
 
     # 5. Is coupling just distance?
@@ -686,14 +724,17 @@ def _draw_coupling(baseline_data, patches, centres, bursts, corr_raw, outside, l
     ax.set_xlabel("centre-to-centre distance (um)")
     ax.set_ylabel("coupling")
     ax.set_ylim(-0.05, 1.05)
-    ax.set_title("coupling against distance", fontsize=9, loc="left")
+    ax.set_title("coupling against distance, every candidate pair", fontsize=9, loc="left")
     ax.text(
         0.0,
-        -0.28,
-        "A rising trend would mean the measure is only reading distance.",
+        -0.2,
+        "Coupling normally falls with distance. If it does here, the least-coupled\ntriple is mostly the "
+        "widest one and separation is doing the work; if not,\ncoupling is telling you something separation "
+        "cannot.",
         transform=ax.transAxes,
         fontsize=8,
         color="#6b7280",
+        va="top",
     )
 
     fig.savefig(png, dpi=105, facecolor="white", bbox_inches="tight")
@@ -718,18 +759,21 @@ def _draw_scan(ax, well_data, ranked, radius, fig=None):
     is_active = np.array([e in active for e in rate.index])
     ax.set_facecolor(display.ARRAY_BG)
     ax.scatter(xs[~is_active], ys[~is_active], s=5, c="#444455", marker="s")
+    # A few electrodes fire at tens of Hz; a linear scale up to the maximum would leave every
+    # ordinary electrode black, so the colour saturates at the 95th percentile of the active ones.
+    cap = max(1.0, float(np.percentile(rate[is_active], 95))) if is_active.any() else 1.0
     sc = ax.scatter(
         xs[is_active],
         ys[is_active],
         s=9,
-        c=np.clip(rate[is_active], 0, 5),
+        c=np.clip(rate[is_active], 0, cap),
         cmap="magma",
         vmin=0,
-        vmax=5,
+        vmax=cap,
         marker="s",
     )
     if fig is not None:
-        fig.colorbar(sc, ax=ax, shrink=0.7, label="firing rate (Hz, capped at 5)")
+        fig.colorbar(sc, ax=ax, shrink=0.7, label=f"firing rate (Hz), saturating at {cap:.1f} (95th pct)")
     for r in ranked:
         colour = {"chosen": "#22c55e", "edge": "#888888"}.get(
             r["status"], "#f97316" if r["status"].startswith("too close") else None

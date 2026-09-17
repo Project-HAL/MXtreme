@@ -165,7 +165,17 @@ def test_return_ring_is_centred_on_the_driven_block(inner, gap):
 
 
 def test_regions_take_focal_dacs_and_refuse_close_centres():
-    regions = protocol.regions_for(_params())
+    regions = protocol.regions_for(
+        _params(
+            stim_site={
+                "shape": "focal",
+                "inner": 2,
+                "inner_gap": 4,
+                "return_radius": 6,
+                "return_points": "corners",
+            }
+        )
+    )
     assert regions["US"].drive_dac == 0 and regions["US"].return_dac == 1
     assert regions["CS"].return_dac == 1
     assert len(regions["US"].rec_electrodes) > 0
@@ -254,17 +264,32 @@ def test_pairing_offset_and_negative_offset():
     assert stim.delays_sec == {"CS": 0.02, "US": 0.0}
 
 
-def test_calibration_sweeps_amplitude_and_polarity_shuffled():
+def test_calibration_interleaves_regions_and_shuffles_amplitudes():
     params = _params(
-        mode="calibration", calibration_amplitudes_mv=[50, 100], calibration_reps=2, calibration_iti=3
+        mode="calibration",
+        calibration_amplitudes_mv=[50, 100],
+        calibration_polarities=["anodic-first", "cathodic-first"],
+        calibration_reps=2,
+        calibration_iti=3,
     )
     blocks, stimuli = protocol.build_schedule(params)
-    cal = [b for b in blocks if b.label.startswith("calibrate_")]
-    assert [b.label for b in cal] == ["calibrate_us", "calibrate_cs", "calibrate_ns"]
+    cal = [b for b in blocks if b.label.startswith("calibrat")]
+    assert [b.label for b in cal] == ["calibrate"]
     tokens = {p.token for p in cal[0].presentations}
-    assert tokens == {"stim_us_a50_ac", "stim_us_a50_ca", "stim_us_a100_ac", "stim_us_a100_ca"}
-    assert len(cal[0].presentations) == 2 * 2 * 2
+    assert tokens == {
+        f"stim_{r}_a{a}_{p}" for r in ("us", "cs", "ns") for a in (50, 100) for p in ("ac", "ca")
+    }
+    assert len(cal[0].presentations) == 3 * 2 * 2 * 2
     assert all(stimuli[p.token].num_events == 1 for p in cal[0].presentations)
+    # Within each repeat every region appears, and the order mixes them rather than blocking by region.
+    per_rep = len(tokens)
+    first = [p.roles[0] for p in cal[0].presentations[:per_rep]]
+    assert set(first) == {"US", "CS", "NS"} and first != sorted(first, key=["US", "CS", "NS"].index)
+    # One polarity: tokens carry no polarity tag, and the pulse count halves.
+    one, _ = protocol.build_schedule(_params(**{**vars(params), "calibration_polarities": ["anodic-first"]}))
+    assert len(one[1].presentations) == 3 * 2 * 2 and all(
+        "_a" in p.token and not p.token.endswith(("_ac", "_ca")) for p in one[1].presentations
+    )
 
 
 def test_summary_reports_duty():
@@ -598,12 +623,14 @@ def test_a_session_run_sets_the_rig_up_once_and_opens_one_recording_per_phase(mo
         deleted = []
 
         class ServerObject:
-            def __init__(self, token, persistent=False):
+            def __init__(self, token, persistent=False, initial_delay=100):
                 self.token, self.persistent = token, persistent
 
-            def close(self):
+            def close(self):  # maxlab.Array
                 if not self.persistent:
                     deleted.append(self.token)
+
+            shutdown = close  # maxlab.Sequence
 
         mx = types.SimpleNamespace(
             Saving=Saving,
