@@ -138,7 +138,11 @@ python -m mxtreme.experiments.associative run --params $P --mode calibration --s
 python -m mxtreme.experiments.associative report $DRY/*_dry_cal.raw.h5 -o $DRY/dry_cal.png --csv $DRY/dry_cal.csv
 ```
 
-About 6 minutes. Calibration is the step most likely to fail, so watch the run:
+About 6 minutes. Each run ends by printing the `report` command for the file it actually wrote:
+MaxLab never overwrites, so a name that exists gets `_0`, `_1` appended, and a glob like
+`*_dry_cal.raw.h5` would then read the *old* file. Use the printed command, or a fresh `exp_id`.
+
+Calibration is the step most likely to fail, so watch the run:
 
 - `run` prints the connected device and refuses if it does not match the batch's `M1`/`M2`;
 - `maxlab` has to accept every sequence;
@@ -155,33 +159,29 @@ About 6 minutes. Calibration is the step most likely to fail, so watch the run:
   neighbours on the spot (connect, query, disconnect if taken), and only routes again -- with the
   clashing electrodes' neighbourhoods routed as candidates -- when none is free. It prints each
   substitution and, once done, every electrode's `channel -> unit`; the protocol in the
-  recording carries the electrodes actually driven. If it gives up after 8 routings, spread the
-  site out: `gap` lives in `$P` under `stim_site`, or on the command line as one value, e.g.
-  `--set 'stim_site={"shape":"grid","size":2,"gap":8}'`;
+  recording carries the electrodes actually driven, and so does `$P`: `run` writes them back as
+  `stim_electrodes`, so every later run with the same `$P` drives exactly those and prints no
+  substitutions. If it gives up after 8 routings, spread the site out: `gap` lives in `$P` under
+  `stim_site`, or on the command line as one value, e.g.
+  `--set 'stim_site={"shape":"grid","size":2,"gap":8}'` (a different site ignores the written-back
+  electrodes and starts from the centres);
 - `run` reports whether the protocol went into the recording. If it says it did not, the copy in
   `$DRY` is what `report` needs (`--protocol`).
 
 ### Reading a dry-run report
 
-The same sections come back for every recording. No `--protocol`: `report` reads it from inside
-the recording, which is itself a check that embedding worked. With no cells the plate is silent
-outside the stimulation artifacts, so the verdict says so and the response numbers are all zero;
-that is the artifact-versus-readout check passing (the detector fires on the artifact, none of it
-lands in the 5-50 ms window). Read:
+No `--protocol`: `report` reads it from inside the recording, which is itself a check that
+embedding worked. With no cells the plate is silent outside the stimulation artifacts, so the
+verdict says so and every response number is zero. What a dry run *can* pass or fail:
 
-| section | a healthy dry run |
+| | healthy |
 |---|---|
-| presentations against the schedule | every token fired the expected number of times, `ok` on each row |
-| interval median | matches `probe_iti` / `encode_iti` to within a fraction of a second |
-| first deflection, driven electrode | at 0.0-0.2 ms on every pulse; the same sign for every pulse of one polarity and the opposite sign for the other; saturating the amplifier (~±3.3 mV) above ~40 mV is normal on saline, since nothing attenuates the pulse |
-| first deflection, return electrode (`dry_cal_focal` only) | the mirror image, same moment |
-| the pair | US and CS deflect in the same frame in `dry_cond`; 20 ms apart in `dry_offset` |
-| artifact vs readout window | spikes in 0-2 ms, near-none in 5-50 ms. If not, the artifact outlasts the window and `pulse_window_ms` needs a later start |
-| the verdicts | one `STOP` saying the plate is silent, which is the truth here; anything about the schedule or the artifact is real |
-| the figure | on saline only the timeline and the artifact panels carry information: every presentation drawn where it was planned, and an artifact on each driven electrode at 0 ms. Calibration's top row (response against amplitude) is empty by construction, and the readout panel of any other run is flat zeros |
+| presentations against the schedule | every token `ok`, intervals matching the parameters |
+| artifact on each driven electrode | a deflection at 0 ms on every pulse, one sign per polarity (saturating at ~±3.3 mV is normal on saline) |
+| the 5-50 ms readout window | empty: the artifact does not outlast it |
 
-The raw traces need MaxWell's HDF5 compression filter, which MaxLab installs on the rig; elsewhere
-the artifact section says it cannot read them.
+In the figure the same three things are the timeline, the artifact panels, and a flat response
+curve. The raw traces need MaxWell's HDF5 compression filter, which MaxLab installs on the rig.
 
 **Which sign is "anodic" at the electrode is not something saline settles.** In the code,
 `anodic-first` means the DAC code steps *up* first (`DAC_REST + bits`); on the first dry run the

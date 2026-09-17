@@ -708,3 +708,76 @@ def test_apply_calibration_writes_the_pick_into_the_parameter_file(tmp_path):
     assert after["amplitudes_source"] == "x_cal" and after["pulse_polarity"] == "cathodic-first"
     assert after["_note"] == "kept" and after["seed"] == 3
     AssociativeParams.from_json(path).validate()
+
+
+def test_routing_budget_thins_the_array_evenly_rather_than_cutting_its_bottom_rows():
+    """Electrode numbers run row by row, so a tail cut would leave the bottom of the chip
+    unrecorded (seen on the first dry run: nothing below row 106)."""
+    from mxtreme.experiments.associative.select import _experiment_routing
+
+    pool = list(range(0, protocol.NUM_ELECTRODES, 20))  # 1320 electrodes over every row
+    roles = {"US": CENTRES[0], "CS": CENTRES[1], "NS": CENTRES[2]}
+    rec, _regions = _experiment_routing(pool, roles, 150.0, None, 1000, ())
+    assert len(rec) == 1000
+    rows = np.array(rec) // protocol.COLS
+    assert rows.max() >= protocol.ROWS - 2
+    per_band = np.histogram(rows, bins=range(0, protocol.ROWS + 10, 10))[0]
+    assert per_band.min() > 0.6 * per_band.max()
+
+
+def test_regions_for_drives_the_electrodes_written_back_for_the_same_site():
+    params = _params(regions={"US": list(CENTRES[0]), "CS": list(CENTRES[1]), "NS": list(CENTRES[2])})
+    planned = {r: list(s.drive_electrodes) for r, s in protocol.regions_for(params).items()}
+    swapped = dict(planned)
+    swapped["US"] = planned["US"][:3] + [planned["US"][3] + 1]  # a neighbour, as a unit clash would give
+    honoured = protocol.regions_for(
+        _params(regions=params.regions, stim_electrodes=swapped, stim_electrodes_site=dict(params.stim_site))
+    )
+    assert honoured["US"].drive_electrodes == swapped["US"]
+    # A different site is built from the centres again; the written-back electrodes are ignored.
+    other = _params(
+        regions=params.regions,
+        stim_electrodes=swapped,
+        stim_electrodes_site=dict(params.stim_site),
+        stim_site={"shape": "grid", "size": 2, "gap": 8},
+    )
+    assert protocol.regions_for(other)["US"].drive_electrodes != swapped["US"]
+    # Electrodes nowhere near the centre are refused rather than driven.
+    with pytest.raises(ValueError, match="stim_electrodes"):
+        protocol.regions_for(
+            _params(
+                regions=params.regions,
+                stim_electrodes={**swapped, "US": [0, 1, 2, 3]},
+                stim_electrodes_site=dict(params.stim_site),
+            )
+        )
+
+
+def test_update_file_keeps_the_notes_and_other_keys(tmp_path):
+    path = tmp_path / "p.json"
+    _params().to_json(path, {"regions": "a note"})
+    AssociativeParams.update_file(path, {"stim_electrodes": {"US": [1, 2, 3, 4]}})
+    with open(path) as f:
+        raw = json.load(f)
+    assert raw["_regions"] == "a note"
+    assert raw["stim_electrodes"] == {"US": [1, 2, 3, 4]}
+    assert AssociativeParams.from_json(path).chip == "M07459"
+
+
+def test_artifact_panels_show_one_case_each():
+    from mxtreme.experiments.associative.report import _panel_tokens
+
+    stimuli = {
+        "stim_us_a20_ac": {"amplitude_mv": 20, "polarity": "anodic-first"},
+        "stim_us_a80_ac": {"amplitude_mv": 80, "polarity": "anodic-first"},
+        "stim_us_a80_ca": {"amplitude_mv": 80, "polarity": "cathodic-first"},
+        "stim_cs_a80_ac": {"amplitude_mv": 80, "polarity": "anodic-first"},
+    }
+    fired = {f"{t}_0": [1] for t in stimuli}
+    assert _panel_tokens(fired, stimuli) == {"stim_us_a80_ac_0", "stim_us_a80_ca_0", "stim_cs_a80_ac_0"}
+    # Conditioning: no amplitudes on the tokens, so the first presentation of each combination.
+    plain = {"probe_us": {}, "stim_cs_us": {}}
+    assert _panel_tokens({"probe_us_0": [1], "probe_us_1": [2], "stim_cs_us_0": [3]}, plain) == {
+        "probe_us_0",
+        "stim_cs_us_0",
+    }

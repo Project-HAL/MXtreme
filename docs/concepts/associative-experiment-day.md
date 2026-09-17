@@ -172,7 +172,10 @@ the right source because it covers every electrode; the baseline covers only its
 
 It then routes every electrode the baseline recorded, plus every electrode the activity scan found
 active inside the three chosen regions: standard electrode selection keeps electrodes 100 µm
-apart, which leaves only a handful in a region, and the readout is counted on these.
+apart, which leaves only a handful in a region, and the readout is counted on these. The chip
+reads 1024 channels at once, so if the baseline's set plus the regions' additions exceed the
+budget the surplus is thinned evenly over the array, never cut from one end. The four driven
+electrodes per region go into `$P` as `stim_electrodes`.
 
 If a scan was repeated that day the globs match two files; name the one you mean instead.
 
@@ -225,6 +228,13 @@ python -m mxtreme.experiments.associative report $CULTURE/*_assoc_cal.raw.h5 \
 
 `run` first checks that the connected device matches the batch's `M1`/`M2`, and refuses if not:
 that token decides which `chip_M1_...` or `chip_M2_...` directory the recording is filed under.
+It routes the electrodes, connects a stimulation unit to each driven one (swapping one for a
+routed neighbour when two land on the same unit, and printing every swap), and writes the
+electrodes it actually drove back into `$P` as `stim_electrodes`: every later run drives exactly
+those, so the sites cannot drift between calibration, connectivity and the session. When it
+finishes it prints the `report` command for the file it wrote; MaxLab appends `_0`, `_1` to a
+name that already exists rather than overwriting, so use that command rather than a glob if a
+step was repeated.
 
 Seven amplitudes (10 to 100 mV per phase), both polarities, six repeats per region: 252 single
 pulses in 12.6 minutes, every repeat shuffled across all three regions so they interleave, with

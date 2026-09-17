@@ -402,13 +402,11 @@ def _gate(data, record) -> list:
 def apply_calibration(params_path: str, pick: dict) -> None:
     """Write a calibration's choice -- amplitudes, their source, the polarity -- into a parameter
     file in place, keeping its other keys and its ``_`` notes as they are."""
-    with open(params_path) as f:
-        current = json.load(f)
-    for key in ("amplitudes_mv", "amplitudes_source", "pulse_polarity"):
-        current[key] = pick[key]
-    with open(params_path, "w") as f:
-        json.dump(current, f, indent=2)
-        f.write("\n")
+    from mxtreme.experiments.associative.params import AssociativeParams
+
+    AssociativeParams.update_file(
+        params_path, {key: pick[key] for key in ("amplitudes_mv", "amplitudes_source", "pulse_polarity")}
+    )
     print(
         f"\nwrote amplitudes_mv {pick['amplitudes_mv']}, amplitudes_source {pick['amplitudes_source']!r} "
         f"and pulse_polarity {pick['pulse_polarity']!r} into {params_path}"
@@ -529,6 +527,26 @@ def _draw_compare(tables, roles, out_png):
     print(f"wrote {out_png}")
 
 
+def _panel_tokens(tokens, stimuli: dict) -> set:
+    """Which presentations get an artifact panel in the figure. The panels are a hardware check
+    (did the pulse reach the electrode?), not a response, so one per case is enough: in a
+    calibration, per region the largest amplitude of each polarity; otherwise the first
+    presentation of each combination of regions.
+
+    :param tokens: ``{fired token: frames}`` in the order they fired.
+    :param stimuli: The protocol's stimuli by token.
+    """
+    best = {}
+    for token in tokens:
+        base = token.rsplit("_", 1)[0]
+        stim = stimuli.get(base, {})
+        key = (tuple(protocol.roles_in(base)), stim.get("polarity"))
+        amplitude = stim.get("amplitude_mv") or 0.0
+        if key not in best or amplitude > best[key][0]:
+            best[key] = (amplitude, token)
+    return {token for _, token in best.values()}
+
+
 def _read_one(h5_path: str, protocol_path: str | None, threshold_uv: float) -> dict:
     """Read one recording back: print what fired against its schedule, the artifact check, the
     gate verdict if it is a gate, the per-presentation readout and the pre/post coupling; return
@@ -589,6 +607,7 @@ def _read_one(h5_path: str, protocol_path: str | None, threshold_uv: float) -> d
     print(
         f"\nfirst deflection beyond {threshold_uv:.0f} uV after the sequence event, on one electrode of each site:"
     )
+    drawn = _panel_tokens(tokens, record["stimuli"])
     panels = []
     for token, frames in tokens.items():
         roles = protocol.roles_in(token.rsplit("_", 1)[0])
@@ -602,8 +621,8 @@ def _read_one(h5_path: str, protocol_path: str | None, threshold_uv: float) -> d
                     break
                 hit = np.flatnonzero((t >= 0) & (np.abs(v) >= threshold_uv))
                 found.append((float(t[hit[0]]), float(v[hit[0]])) if len(hit) else None)
-                if len(panels) < 12 and frame == frames[0]:
-                    panels.append((f"{token} {label} (e{electrode})", t, v))
+                if token in drawn and frame == frames[0]:
+                    panels.append((f"artifact: {token}, {label} e{electrode}, first pulse", t, v))
             seen = [x for x in found if x]
             if seen:
                 print(
@@ -995,7 +1014,7 @@ def _draw(files, rows, out_png, timed):
 
     record = files[0]["record"]
     panels = [p for f in files for p in f["panels"]]
-    n_panels = min(len(panels), 6)
+    n_panels = min(len(panels), 8)
     fig = plt.figure(figsize=(15, 10 + 1.5 * n_panels))
     grid = fig.add_gridspec(2 + n_panels, 1, height_ratios=[3, 1.4] + [0.8] * n_panels, hspace=0.45)
     calibrating = record["params"]["mode"] == "calibration"
@@ -1047,6 +1066,11 @@ def _draw(files, rows, out_png, timed):
         ax = fig.add_subplot(grid[2 + k])
         ax.plot(t, v, lw=0.8, color="#333333")
         ax.axvline(0, color="#ef4444", lw=0.6)
+        if k == 0:
+            title += (
+                "   [raw trace on one driven electrode of the site around the sequence event (red): "
+                "a deflection at 0 ms is the pulse arriving, a hardware check, not a response]"
+            )
         ax.set_title(title, fontsize=8, loc="left")
         ax.set_ylabel("uV", fontsize=7)
         if k == n_panels - 1:

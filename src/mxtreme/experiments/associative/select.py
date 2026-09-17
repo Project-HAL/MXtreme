@@ -212,10 +212,15 @@ def _experiment_routing(pool, roles, radius, scan_data, budget, stim_electrodes=
             active = scan_data["active_electrodes"]["electrode"].unique().tolist()
             inside |= set(protocol.within(active, centre, radius))
         region_sets[role] = sorted(inside - stim)
-    first = [e for role in ROLES for e in region_sets[role]]
+    first = list(dict.fromkeys(e for role in ROLES for e in region_sets[role]))
     rest = [e for e in pool if e not in set(first) and e not in stim]
-    ordered = list(dict.fromkeys(first + rest))
-    return sorted(ordered[:budget]), region_sets
+    excess = len(first) + len(rest) - budget
+    if excess > 0:
+        # Thin the rest evenly along the array rather than cutting its tail: electrode numbers run
+        # row by row, so a tail cut would leave the bottom rows of the chip unrecorded.
+        drop = set(np.linspace(0, len(rest) - 1, num=min(excess, len(rest)), dtype=int).tolist())
+        rest = [e for k, e in enumerate(rest) if k not in drop]
+    return sorted(first + rest), region_sets
 
 
 def select(
@@ -459,6 +464,12 @@ def select(
         near = sorted({e for c in roles.values() for e in protocol.within(every, c, radius)})
         pool = near + _lattice(set(near), budget - len(near))
     rec_electrodes, region_sets = _experiment_routing(pool, roles, radius, scan_data, budget, stim_electrodes)
+    if len(pool) > budget:
+        on_progress(
+            f"experiment routing: the baseline's {len(pool)} electrodes exceed the budget of {budget} "
+            f"({ROUTING_BUDGET} less {stim_units} stimulation), so {len(pool) - budget} outside the regions "
+            "are dropped, spread evenly over the array"
+        )
     on_progress(
         f"experiment routing: {len(rec_electrodes)} electrodes plus {stim_units} stimulation; in the regions "
         + ", ".join(f"{r} {len(v)}" for r, v in region_sets.items())
@@ -473,6 +484,8 @@ def select(
     chosen = replace(
         params,
         regions={r: [float(c[0]), float(c[1])] for r, c in roles.items()},
+        stim_electrodes={r: list(spec.drive_electrodes) for r, spec in sites.items()},
+        stim_electrodes_site=dict(params.stim_site),
         rec_electrodes=rec_electrodes,
     )
     params_path = os.path.join(out_dir, f"{_stem(params)}_params.json")
@@ -803,8 +816,28 @@ def _draw_scan(ax, well_data, ranked, radius, fig=None):
     ax.set_ylabel("y (um)")
 
 
-def _draw_ranking(ax, ranked, radius):
-    considered = [r for r in ranked if r["status"] != "not needed"][:25]
+def _draw_ranking(ax, ranked, radius, centres=(), roles=None):
+    """Every candidate, densest first: the chosen ones (with the role each got) always shown,
+    then the densest of the rest up to 25 bars. Labelled by patch number and centre in um, the
+    same names the map uses."""
+    chosen = [r for r in ranked if r["status"] == "chosen"]
+    others = [r for r in ranked if r["status"] not in ("chosen", "not needed")]
+    considered = sorted(chosen + others[: max(0, 25 - len(chosen))], key=lambda r: -r["count"])
+    index = {tuple(c): k for k, c in enumerate(centres)}
+    role_of = {}
+    for role, centre in (roles or {}).items():
+        near = min(centres, key=lambda c: protocol.separation_um(c, centre), default=None)
+        if near is not None:
+            role_of[tuple(near)] = role
+
+    def label(r):
+        c = tuple(r["center_um"])
+        name = f"patch_{index[c]} " if c in index else ""
+        status = r["status"]
+        if status == "chosen" and c in role_of:
+            status = f"chosen -> {role_of[c]}"
+        return f"{name}({c[0]:.0f},{c[1]:.0f}) {status}"
+
     colours = [
         "#22c55e"
         if r["status"] == "chosen"
@@ -816,14 +849,14 @@ def _draw_ranking(ax, ranked, radius):
     ax.barh(range(len(considered)), [r["count"] for r in considered], color=colours)
     for i, r in enumerate(considered):
         ax.plot([r["recorded"]], [i], "|", color="#555555", ms=8)
-    ax.set_yticks(
-        range(len(considered)),
-        [f"({r['center_um'][0]:.0f},{r['center_um'][1]:.0f}) {r['status']}" for r in considered],
-        fontsize=7,
-    )
+    ax.set_yticks(range(len(considered)), [label(r) for r in considered], fontsize=7)
     ax.invert_yaxis()
     ax.set_xlabel(f"active electrodes within {radius:.0f} um (tick = recorded)")
-    ax.set_title("candidate patches, densest first", fontsize=9, loc="left")
+    ax.set_title(
+        "candidate patches, densest first (green = the candidates; the roles went to the least-coupled triple)",
+        fontsize=9,
+        loc="left",
+    )
 
 
 def _draw_rejection(well_data, ranked, radius, png, separation):
@@ -853,7 +886,7 @@ def _draw_decision(params, well_data, ranked, centres, names, matrix, lead, base
     ax_map, ax_rank = fig.add_subplot(grid[1, 0]), fig.add_subplot(grid[1, 1])
     if well_data is not None:
         _draw_scan(ax_scan, well_data, ranked, radius, fig)
-        _draw_ranking(ax_rank, ranked, radius)
+        _draw_ranking(ax_rank, ranked, radius, [tuple(c) for c in centres], params.regions)
     else:
         ax_scan.text(0.5, 0.5, "centres given by hand", ha="center", transform=ax_scan.transAxes)
         ax_rank.axis("off")

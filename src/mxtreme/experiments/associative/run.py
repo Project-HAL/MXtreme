@@ -52,6 +52,7 @@ class RunResult:
     protocol_copy: Path | None = None  # in ``work``, when one was given
     fired_copy: Path | None = None
     phases: list[RunResult] = field(default_factory=list)  # every phase's result, in order
+    stim_electrodes: dict[str, list[int]] = field(default_factory=dict)  # per role, as actually driven
 
 
 #: What the MaxLab server's system type means, in the batch id's terms.
@@ -361,6 +362,7 @@ def run(
     finally:
         release(mx, well, list(registered))
     results[-1].phases = results
+    results[-1].stim_electrodes = {role: list(spec.drive_electrodes) for role, spec in regions.items()}
     if len(results) > 1:
         on_progress(
             f"session: {len(results)} recordings\n  "
@@ -478,4 +480,10 @@ def _record_phase(
     if registry_path is not None:
         io.register_scan(params, registry_path, kind="experiment")
     on_progress(f"{'stopped early' if stopped else 'done'}: {len(fired)} presentation(s); {h5_path}")
+    out = Path(work) if work is not None else h5_path.parent
+    on_progress(
+        f"read it back: python -m mxtreme.experiments.associative report {h5_path} "
+        f"-o {out / stem}.png --csv {out / stem}.csv"
+        + (" --apply <params.json>" if params.mode == "calibration" else "")
+    )
     return RunResult(Path(h5_path), fired, stopped, protocol_copy, fired_copy)

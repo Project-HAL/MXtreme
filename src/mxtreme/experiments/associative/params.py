@@ -47,6 +47,12 @@ class AssociativeParams:
 
     :param rec_electrodes: Every electrode to record. Must be set to run.
     :param regions: ``{"US": [x, y], "CS": [...], "NS": [...]}`` centres in um.
+    :param stim_electrodes: ``{"US": [e, e, e, e], ...}``: the electrodes each region is driven
+        through, as ``select`` planned them and as ``run`` last connected them (a driven electrode
+        can be swapped for a routed neighbour to get a stimulation unit of its own, and the swap is
+        written back here so every later run drives the same electrodes). Honoured only while
+        ``stim_electrodes_site`` still equals ``stim_site``; a different site is built from the
+        centres again.
     :param amplitudes_mv: Per role, **mV per phase**, from a calibration run. Peak to peak is
         twice this, which is the number stimulation papers usually quote: 80 here is 160 mV
         peak to peak.
@@ -145,6 +151,8 @@ class AssociativeParams:
 
     rec_electrodes: list[int] | None = None
     regions: dict[str, list[float]] = field(default_factory=dict)
+    stim_electrodes: dict[str, list[int]] = field(default_factory=dict)
+    stim_electrodes_site: dict = field(default_factory=dict)
     amplitudes_mv: dict[str, float] = field(default_factory=lambda: {r: 80.0 for r in ROLES})
     amplitudes_source: str = "default"
     min_region_separation_um: float = 1000.0
@@ -230,6 +238,18 @@ class AssociativeParams:
                 value = raw
             setattr(out, key, value)
         return out
+
+    @staticmethod
+    def update_file(path: str | Path, updates: dict) -> None:
+        """Change a few keys of a parameter file in place, keeping every other key and the ``_``
+        notes as they are. Used after calibration (the amplitudes) and after a run (the electrodes
+        actually driven)."""
+        with open(path) as f:
+            current = json.load(f)
+        current.update(updates)
+        with open(path, "w") as f:
+            json.dump(current, f, indent=2)
+            f.write("\n")
 
     def to_json(self, path: str | Path, notes: dict[str, str] | None = None) -> None:
         """Write the parameters, with optional ``_comment`` entries placed before the keys they

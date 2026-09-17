@@ -289,7 +289,9 @@ class RegionSpec:
 def regions_for(params: AssociativeParams, rec_electrodes=None) -> dict[str, RegionSpec]:
     """The three regions from the parameters.
 
-    ``regions`` gives each role a centre in um; the stimulation site is ``stim_site`` around it;
+    ``regions`` gives each role a centre in um; the stimulation site is ``stim_site`` around it,
+    unless ``stim_electrodes`` names the driven electrodes for that same site, in which case those
+    are used as they are (they are what a previous run actually connected);
     recording electrodes are those of ``rec_electrodes`` (default the parameters' own) within
     ``region_radius_um``. A grid site takes its role's DAC from ``region_dacs``; a focal site uses
     ``drive_dac`` and ``return_dac``, the same two for every region.
@@ -304,6 +306,15 @@ def regions_for(params: AssociativeParams, rec_electrodes=None) -> dict[str, Reg
             raise ValueError(f"regions has no centre for {role}")
         center = tuple(params.regions[role])
         drive, ring = stim_site(center, params.stim_site)
+        own = params.stim_electrodes.get(role) if params.stim_electrodes_site == params.stim_site else None
+        if own:
+            far = [e for e in own if separation_um(electrode_xy(e), center) > params.region_radius_um]
+            if far or len(own) != len(drive):
+                raise ValueError(
+                    f"stim_electrodes for {role} ({own}) do not fit its centre {center} and stim_site: "
+                    "run select again, or delete stim_electrodes from the parameter file"
+                )
+            drive = [int(e) for e in own]
         if ring:
             drive_dac, return_dac = int(params.drive_dac), int(params.return_dac)
         else:

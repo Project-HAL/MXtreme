@@ -171,7 +171,23 @@ def main(argv=None) -> None:
             from mxtreme.config import Config
 
             config = Config.from_toml(args.config)
-        run(params, config, phases=args.phase, work=args.work)
+        result = run(params, config, phases=args.phase, work=args.work)
+        on_file = AssociativeParams.from_json(args.params)
+        if (
+            result.stim_electrodes
+            and on_file.stim_site == params.stim_site
+            and (
+                on_file.stim_electrodes != result.stim_electrodes
+                or on_file.stim_electrodes_site != params.stim_site
+            )
+        ):
+            AssociativeParams.update_file(
+                args.params,
+                {"stim_electrodes": result.stim_electrodes, "stim_electrodes_site": params.stim_site},
+            )
+            print(
+                f"wrote the electrodes actually driven into {args.params} as stim_electrodes, so later runs drive the same ones"
+            )
     elif args.command == "report":
         from mxtreme.experiments.associative.report import report
 

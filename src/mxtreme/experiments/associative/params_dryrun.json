@@ -14,6 +14,9 @@
   "rec_electrodes": null,
   "_regions": "Centres in um, x along the long axis (0-3832), y along the short (0-2082). Filled in by `select`; then keep them fixed for the culture.",
   "regions": {},
+  "_stim_electrodes": "Filled in by `select` (the planned 2x2 per region) and rewritten by `run` with the electrodes it actually connected, when a stimulation unit clash made it swap one for a routed neighbour. Honoured only while stim_electrodes_site equals stim_site; delete both to rebuild the sites from the centres.",
+  "stim_electrodes": {},
+  "stim_electrodes_site": {},
   "_amplitudes_mv": "Per role, mV PER PHASE; peak to peak is twice this. Ronchi et al. 2019 characterised 40-240 mV peak to peak (20-120 per phase) on these arrays; the ladder runs 10-100 per phase and max_amplitude_mv refuses anything above 120 per phase unless raised deliberately.",
   "amplitudes_mv": {
     "US": 80.0,
