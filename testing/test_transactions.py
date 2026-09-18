@@ -101,6 +101,98 @@ def test_fold_culture_and_batch_marks(config):
     )
 
 
+def test_treatment_applied_validates_and_derives_div(config):
+    with pytest.raises(ValueError, match="applied_at"):
+        tx.record(config, "treatment.applied", batch_id=BATCH, plate_date=260813, chip="P1", well=0)
+    with pytest.raises(ValueError, match="ISO 8601"):
+        tx.record(
+            config,
+            "treatment.applied",
+            batch_id=BATCH,
+            plate_date=260813,
+            chip="P1",
+            well=0,
+            data={"applied_at": "yesterday-ish"},
+        )
+    t = tx.record(
+        config,
+        "treatment.applied",
+        batch_id=BATCH,
+        plate_date=260813,
+        chip="P1",
+        well=0,
+        actor="kam",
+        note="bath applied after the DIV 21 scan",
+        data={"applied_at": "2026-09-03T14:30", "name": " ATP ", "dose": 100, "units": "µM", "group": "g1"},
+    )
+    assert t.div == 21  # 2026-08-13 is DIV 0
+    assert t.data["name"] == "ATP" and t.data["dose"] == "100" and t.data["units"] == "µM"
+    assert t.data["applied_at"].startswith("2026-09-03T14:30:00")  # local offset appended
+    assert "+" in t.data["applied_at"] or "-" in t.data["applied_at"][10:]
+    # An explicit DIV is kept; a missing optional field reads back empty.
+    t2 = tx.record(
+        config,
+        "treatment.applied",
+        batch_id=BATCH,
+        plate_date=260813,
+        chip="P1",
+        well=0,
+        div=5,
+        data={"applied_at": "2026-09-03T14:30:00+02:00"},
+    )
+    assert t2.div == 5 and t2.data["name"] == "" and t2.data["group"] == ""
+
+
+def test_div_on():
+    from datetime import date, datetime
+
+    assert tx.div_on(260813, date(2026, 8, 13)) == 0
+    assert tx.div_on(260813, datetime(2026, 9, 3, 23, 59)) == 21  # noqa: DTZ001 -- naive means local, by design
+    assert tx.div_on(260813, date(2026, 8, 1)) == 0  # before plating clamps rather than going negative
+
+
+def test_treatments_fold(config):
+    common = {"batch_id": BATCH, "plate_date": 260813, "chip": "P1"}
+    tx.record(
+        config, "treatment.applied", well=0, data={"applied_at": "2026-09-05T10:00", "name": "ATP"}, **common
+    )
+    tx.record(
+        config,
+        "treatment.applied",
+        well=0,
+        data={"applied_at": "2026-09-01T10:00", "name": "TTX", "dose": "1", "units": "µM"},
+        note="pilot",
+        **common,
+    )
+    tx.record(
+        config, "treatment.applied", well=1, data={"applied_at": "2026-09-05T10:00", "name": "ATP"}, **common
+    )
+    tx.record(config, "culture.mark_dead", well=0, **common)  # other ops are not treatments
+    folded = tx.treatments(config)
+    assert set(folded) == {(BATCH, 260813, "P1", 0), (BATCH, 260813, "P1", 1)}
+    well0 = folded[(BATCH, 260813, "P1", 0)]
+    assert [e.name for e in well0] == ["TTX", "ATP"]  # by application time, not record order
+    assert well0[0].label == "TTX 1 µM" and well0[0].div == 19 and well0[0].note == "pilot"
+    assert well0[1].label == "ATP"
+    assert tx.Treatment(applied_at="x", div=None, note="media change").label == "media change"
+    assert tx.treatments(config, []) == {}
+
+
+def test_treatments_follow_a_rename(config):
+    tx.record(
+        config,
+        "treatment.applied",
+        batch_id=BATCH,
+        plate_date=260813,
+        chip="P1",
+        well=0,
+        data={"applied_at": "2026-09-05T10:00", "name": "ATP"},
+    )
+    new = "fall2026_batch2_DRG_M1"
+    tx.record(config, "batch.renamed", batch_id=new, plate_date=260813, data={"old": BATCH, "new": new})
+    assert list(tx.treatments(config)) == [(new, 260813, "P1", 0)]
+
+
 def test_chip_devices(config):
     assert tx.default_device(BATCH) == "MaxOne"
     assert tx.default_device("fall2026_batch2_DRG_M2") == "MaxTwo"
@@ -229,7 +321,9 @@ def test_reading_follows_a_batch_rename(config):
     tx.record(config, "activity_scan.registered", batch_id=old, plate_date=260813, chip="P1", well=0, div=7)
     tx.record(config, "preprocessed.saved", exp_id=old, chip="P1", well=0, div=7)  # older flow: exp id only
     tx.record(config, "culture.mark_dead", batch_id=old, plate_date=260813, chip="P1", well=0)
-    tx.record(config, "chip.set_device", batch_id=old, plate_date=260813, chip="P1", data={"device": "MaxOne+"})
+    tx.record(
+        config, "chip.set_device", batch_id=old, plate_date=260813, chip="P1", data={"device": "MaxOne+"}
+    )
     tx.record(config, "batch.renamed", batch_id=new, plate_date=260813, data={"old": old, "new": new})
     tx.record(config, "bursts.saved", batch_id=new, plate_date=260813, chip="P1", well=0, div=7)
     tx.record(config, "note", batch_id=old, plate_date=270101, note="a later batch reusing the old id")
@@ -240,8 +334,12 @@ def test_reading_follows_a_batch_rename(config):
     assert log[4].data == {"old": old, "new": new}  # the rename record remembers what it was
     assert log[6].batch_id == old  # a record after the rename is left as written
     assert [t.op for t in tx.for_culture(log, new, 260813, "P1", 0)] == [
-        "activity_scan.registered", "preprocessed.saved", "culture.mark_dead", "chip.set_device",
-        "batch.renamed", "bursts.saved",
+        "activity_scan.registered",
+        "preprocessed.saved",
+        "culture.mark_dead",
+        "chip.set_device",
+        "batch.renamed",
+        "bursts.saved",
     ]
     assert tx.for_batch(log, old, 260813) == []
     assert tx.is_dead(tx.batch_states(config), tx.culture_states(config), new, 260813, "P1", 0).dead

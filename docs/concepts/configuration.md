@@ -193,15 +193,18 @@ spike order repaired (`preprocessed.repaired`), bursts detected (`bursts.saved`)
 (`report.written`, one per culture in it), the registry rebuilt (`registry.rebuilt`), a recording
 removed (`recording.removed`), a batch renamed (`batch.renamed`). A front end
 records people's decisions in the same file: `culture.mark_dead` / `culture.mark_alive`,
-`batch.mark_dead` / `batch.mark_alive`, `chip.set_device`, `note`. The full vocabulary is
-{data}`mxtreme.transactions.OPS`.
+`batch.mark_dead` / `batch.mark_alive`, `chip.set_device`, `note`, and what was done to a culture
+at the bench that no recording captures -- `treatment.applied`, one line per well, carrying when
+it went on (`applied_at`, distinct from when it was written down), what and how much (`name`,
+`dose`, `units`) and the DIV that day. The full vocabulary is {data}`mxtreme.transactions.OPS`.
 
 Every record carries as much identity as the writer had — `batch_id`, `plate_date`, `exp_id`,
 `chip`, `well`, `div` — plus `actor` (the OS user, for MXtreme's own entries), a `note` and
 op-specific `data` (paths written, counts). One culture's history is
 {func}`mxtreme.transactions.for_culture`; the alive/dead state of the decision records is a fold,
 {func}`~mxtreme.transactions.batch_states` / {func}`~mxtreme.transactions.culture_states` /
-{func}`~mxtreme.transactions.is_dead`, computed on read.
+{func}`~mxtreme.transactions.is_dead`, computed on read, and what each culture has been exposed to
+is another, {func}`~mxtreme.transactions.treatments`.
 
 Nothing is edited or deleted; a correction is another line. A store that predates the log gets a
 history once from its registry and burst logs with {func}`mxtreme.transactions.backfill`, which

@@ -3,9 +3,10 @@
 Two kinds of thing land here. What MXtreme *did* to the store -- a scan registered, an outside
 recording ingested, a well preprocessed, bursts detected, a report written, the registry rebuilt --
 journaled by the function that did it, right after it did it. And what people *decided* about
-their data that no file records -- a culture marked dead, a batch ended, a chip declared a MaxOne+ --
-recorded by a front end on their behalf. Both are the same record shape, in the same file, in the
-order they happened, so a culture's history reads top to bottom: scanned, analysed, reported, died.
+their data, or *did* to the cultures, that no file records -- a culture marked dead, a batch ended,
+a chip declared a MaxOne+, a treatment applied to a well -- recorded by a front end on their
+behalf. Both are the same record shape, in the same file, in the order they happened, so a
+culture's history reads top to bottom: scanned, treated, analysed, reported, died.
 
 The file is ``<data_root>/transactions.jsonl`` (:attr:`~mxtreme.config.Config.transactions_path`):
 one JSON object per line, appended under an advisory lock and never rewritten. Nothing is edited or
@@ -27,8 +28,9 @@ written under the old id reads back under the new one (:func:`iter_transactions`
 is never rewritten -- the early lines still say the old name, and the rename record says what it was.
 
 The current state of the decision-type records is a fold, computed on read: :func:`batch_states`,
-:func:`culture_states`, :func:`chip_devices`, combined by :func:`is_dead`. The file is small enough
-(a handful of lines per recording) that there is no index and no cache to invalidate.
+:func:`culture_states`, :func:`chip_devices`, combined by :func:`is_dead`; :func:`treatments` is
+the fold for what each culture has been exposed to. The file is small enough (a handful of lines
+per recording) that there is no index and no cache to invalidate.
 """
 
 from __future__ import annotations
@@ -37,7 +39,7 @@ import getpass
 import json
 from collections.abc import Iterable, Iterator
 from dataclasses import asdict, dataclass, field, replace
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 from mxtreme.store import Batch, _validate_plate_date
@@ -57,6 +59,7 @@ OPS: dict[str, str] = {
     "batch.mark_alive": "batch",  # correction of the above; cultures keep their own marks
     "chip.set_device": "chip",  # data: {"device": one of DEVICES}
     "note": "batch",  # a remark against a batch, chip or culture; changes no state
+    "treatment.applied": "culture",  # data: {"applied_at", "name", "dose", "units", "group"}; see below
     # -- what MXtreme did to the store, journaled by the function that did it ---------------------
     "activity_scan.registered": "recording",  # data: {"path"}; one per well
     "network_scan.registered": "recording",  # data: {"path"}; one per well
@@ -82,8 +85,19 @@ STRICT_OPS = frozenset(
         "batch.mark_alive",
         "chip.set_device",
         "note",
+        "treatment.applied",
     }
 )
+
+#: The ``data`` a ``treatment.applied`` record carries. ``applied_at`` is when the treatment went
+#: on the culture (ISO 8601) -- distinct from the record's ``time``, which is when someone wrote it
+#: down, because writing it down days later is the normal case. It is the one required field; the
+#: record's ``div`` is the culture's DIV on that date, derived from the plate date when the writer
+#: does not give it. ``name`` (what was applied: ``"ATP"``), ``dose`` and ``units`` are free text
+#: and optional; the free-form account of what was done goes in the record's ``note``. ``group``
+#: ties together the records of one application to several wells -- one bench event, one id, one
+#: line per culture -- so a reader can tell three dishes treated together from three treatments.
+TREATMENT_FIELDS = ("applied_at", "name", "dose", "units", "group")
 
 #: What a chip can be declared to be through ``chip.set_device``. The batch id's ``system`` field
 #: (``M1``/``M2``) only tells MaxOne from MaxTwo apart; a MaxOne+ is a MaxOne as far as the id
@@ -255,6 +269,10 @@ def record(
         raise ValueError(f"{op} needs a batch id or an exp id.")
     if op == "chip.set_device" and data.get("device") not in DEVICES:
         raise ValueError(f"chip.set_device needs data['device'] in {DEVICES}, got {data.get('device')!r}.")
+    if op == "treatment.applied":
+        data, applied = _clean_treatment(data)
+        if div is None:
+            div = div_on(plate_date, applied)
 
     tx = Transaction(
         time=time or _now(),
@@ -273,6 +291,47 @@ def record(
         _resolve_path(config), json.dumps(asdict(tx), ensure_ascii=False, separators=(",", ":"), default=str)
     )
     return tx
+
+
+def _parse_time(value, what: str) -> datetime:
+    """An ISO 8601 stamp as a local, aware :class:`datetime`; a naive one is taken as local time."""
+    if isinstance(value, datetime):
+        stamp = value
+    else:
+        try:
+            stamp = datetime.fromisoformat(str(value))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{what} must be an ISO 8601 date-time, got {value!r}.") from exc
+    return (
+        stamp.astimezone()
+        if stamp.tzinfo is not None
+        else stamp.replace(tzinfo=datetime.now().astimezone().tzinfo)
+    )
+
+
+def _clean_treatment(data: dict) -> tuple[dict, datetime]:
+    """Validate a ``treatment.applied`` record's ``data`` (see :data:`TREATMENT_FIELDS`)."""
+    if not data.get("applied_at"):
+        raise ValueError("treatment.applied needs data['applied_at'], when the treatment went on.")
+    applied = _parse_time(data["applied_at"], "data['applied_at']")
+    clean = {"applied_at": applied.isoformat(timespec="seconds")}
+    for key in ("name", "dose", "units", "group"):
+        value = data.get(key)
+        clean[key] = "" if value is None else str(value).strip()
+    extra = {k: v for k, v in data.items() if k not in TREATMENT_FIELDS}
+    return {**clean, **extra}, applied
+
+
+def div_on(plate_date, when: datetime | date) -> int:
+    """The DIV a culture plated on ``plate_date`` (``YYMMDD``) is on at ``when``: plating day is 0.
+
+    An aware datetime is read in local time, since DIVs are counted in bench days.
+    """
+    plate_date = _validate_plate_date(plate_date)
+    plated = date(2000 + plate_date // 10000, plate_date // 100 % 100, plate_date % 100)
+    if isinstance(when, datetime):
+        when = (when.astimezone() if when.tzinfo is not None else when).date()
+    return max(0, (when - plated).days)
 
 
 def _append(path: Path, line: str) -> None:
@@ -631,6 +690,76 @@ def chip_devices(config, transactions: list[Transaction] | None = None) -> dict[
         if tx.op == "chip.set_device":
             devices[tx.chip_key] = str(tx.data["device"])
     return devices
+
+
+@dataclass(frozen=True)
+class Treatment:
+    """One thing applied to one culture, from a ``treatment.applied`` record.
+
+    :param applied_at: When it went on the culture (ISO 8601, local time with offset).
+    :param div: The culture's DIV on that date.
+    :param name: What was applied, e.g. ``"ATP"``; ``""`` when the record did not say.
+    :param dose: Free text, e.g. ``"100"``; ``""`` when not given.
+    :param units: Free text, e.g. ``"µM"``; ``""`` when not given.
+    :param note: The writer's account of what was done.
+    :param actor: Who recorded it.
+    :param time: When it was recorded.
+    :param group: Shared by the records of one application to several wells; ``""`` if none.
+    """
+
+    applied_at: str
+    div: int | None
+    name: str = ""
+    dose: str = ""
+    units: str = ""
+    note: str = ""
+    actor: str = ""
+    time: str = ""
+    group: str = ""
+
+    @property
+    def label(self) -> str:
+        """``"ATP 100 µM"``-style one-liner: the name, then dose and units when present; the
+        note stands in when there is no name."""
+        head = " ".join(part for part in (self.name, self.dose, self.units) if part)
+        return head or self.note or "treatment"
+
+
+def treatments(
+    config, transactions: list[Transaction] | None = None
+) -> dict[tuple[str, int, str, int], list[Treatment]]:
+    """``{(batch_id, plate_date, chip, well): [Treatment, ...]}`` -- every culture's treatments,
+    oldest application first. A culture absent from the result has none recorded."""
+    out: dict[tuple[str, int, str, int], list[Treatment]] = {}
+    for t in transactions if transactions is not None else iter_transactions(config):
+        if t.op != "treatment.applied" or not t.data.get("applied_at"):
+            continue
+        d = t.data
+        out.setdefault(t.culture_key, []).append(
+            Treatment(
+                applied_at=str(d["applied_at"]),
+                div=t.div,
+                name=str(d.get("name") or ""),
+                dose=str(d.get("dose") or ""),
+                units=str(d.get("units") or ""),
+                note=t.note,
+                actor=t.actor,
+                time=t.time,
+                group=str(d.get("group") or ""),
+            )
+        )
+    for entries in out.values():
+        entries.sort(key=lambda e: _applied_stamp(e.applied_at))
+    return out
+
+
+def _applied_stamp(value: str) -> float:
+    """An ``applied_at`` as seconds since the epoch, for ordering; a hand-edited stamp that does
+    not parse sorts first rather than raising."""
+    try:
+        return _parse_time(value, "applied_at").timestamp()
+    except ValueError:
+        return float("-inf")
 
 
 def default_device(batch: Batch | str) -> str:
