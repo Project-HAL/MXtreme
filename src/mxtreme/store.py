@@ -17,6 +17,12 @@ A *batch* is one plating event, named at the bench when it happens -- see :class
 ``<exp_id>`` tail is a free string naming one experiment, supplied when an exogenous recording is
 ingested (see :func:`ingest_recording`); scans carry no exp id, their kind is the tail instead.
 
+A culture can be network-scanned more than once on one DIV. The first such file is
+``..._network_scan.raw.h5``; when a second is ingested the two are numbered in arrival order,
+``..._network_scan_0.raw.h5`` and ``..._network_scan_1.raw.h5``, and later ones take the next
+index (:func:`network_scan_slot`). Every one of them is a network scan -- the number is not an
+experiment name -- and the readers here accept either form.
+
 Each file in the tree holds exactly one well, so one culture's whole history sits in one directory.
 A multi-well recording (a MaxTwo) is recorded as a single ``.h5`` and then broken apart by
 :func:`split_by_well`.
@@ -55,8 +61,13 @@ _BATCH_ID = re.compile(
 )
 
 #: Matches the scan-kind tail of a store file name (``..._activity_scan.raw.h5``,
-#: ``..._network_scan_1.raw.h5`` -- the numeric suffix is MaxLab's collision rename).
+#: ``..._network_scan_1.raw.h5`` -- the numeric suffix numbers several scans of one DIV, see
+#: :func:`network_scan_slot`; MaxLab's own collision rename produces the same shape).
 _SCAN_TAIL = re.compile(r"_(activity|network)_scan(_\d+)?\.raw\.h5$")
+
+#: The index a network scan file carries: ``None`` for the unnumbered ``_network_scan``, else the
+#: number after it.
+_NETWORK_INDEX = re.compile(r"_network_scan(?:_(\d+))?\.raw\.h5$")
 
 #: Extracts the experiment-id tail of a store file name: everything after the ``DIV_<div>_`` marker.
 _EXP_TAIL = re.compile(r"_DIV_\d+_(?P<exp_id>.+?)\.raw\.h5$")
@@ -185,6 +196,55 @@ def recording_stem(batch: Batch | str, plate_date, chip: str, well, div: int) ->
         f"plating_{_validate_plate_date(plate_date)}_{Batch.parse(batch).id}"
         f"_chip_{chip}_well_{well}_DIV_{int(div)}"
     )
+
+
+def network_scan_index(h5_path: str | Path) -> int | None:
+    """Where a network scan file sits among its DIV's: ``0`` for the unnumbered
+    ``..._network_scan.raw.h5``, ``n`` for ``..._network_scan_<n>.raw.h5``, ``None`` for a file
+    that is not a network scan. Sorting a DIV's network scans by this gives arrival order."""
+    match = _NETWORK_INDEX.search(Path(h5_path).name)
+    if match is None:
+        return None
+    return 0 if match.group(1) is None else int(match.group(1))
+
+
+def network_scan_slot(div_dir: str | Path, stem: str) -> tuple[str, list[tuple[Path, Path]]]:
+    """The tail the next network scan of one well and DIV takes, and the renames that make room.
+
+    A DIV with no network scan gets the plain ``network_scan`` tail. A DIV that already has one
+    numbers them from zero in arrival order: the existing unnumbered file is renamed to
+    ``network_scan_0`` and the new one becomes ``network_scan_1``; a DIV whose scans are already
+    numbered hands out the next free index. Nothing is renamed here -- the caller applies the
+    renames it is handed (:func:`ingest_recording` does, and journals them) -- so a front end can
+    ask where a file *would* land.
+
+    :param div_dir: The culture's ``DIV_<n>`` directory (need not exist yet).
+    :param stem: The well's file stem for that DIV, from :func:`recording_stem`.
+    :returns: ``(tail, renames)``: the tail to put after ``<stem>_`` and the ``(old, new)`` pairs
+        to move first, in order.
+    """
+    div_dir = Path(div_dir)
+    numbered: dict[int, Path] = {}
+    plain = None
+    for path in div_dir.glob(f"{stem}_network_scan*.raw.h5") if div_dir.is_dir() else []:
+        match = _NETWORK_INDEX.search(path.name)
+        if match is None:
+            continue
+        if match.group(1) is None:
+            plain = path
+        else:
+            numbered[int(match.group(1))] = path
+    if plain is None and not numbered:
+        return "network_scan", []
+    renames: list[tuple[Path, Path]] = []
+    if plain is not None:
+        index = 0
+        while index in numbered:  # a stray ``_0`` beside the plain file: give the plain one the next gap
+            index += 1
+        target = div_dir / f"{stem}_network_scan_{index}.raw.h5"
+        renames.append((plain, target))
+        numbered[index] = target
+    return f"network_scan_{max(numbered) + 1}", renames
 
 
 @dataclass(frozen=True)
@@ -1060,7 +1120,11 @@ def ingest_recording(
     -- electrode selection, the analysis chain and a registry rebuild all read it the same way.
     An activity scan lacking ``/assay/inputs/record_time`` gets it derived from its own
     timestamps (:func:`mxtreme.scans.activity_scan.ensure_record_time`), since the selection
-    pipeline needs it.
+    pipeline needs it. A network scan may join others of the same well and DIV: they are
+    numbered in arrival order (:func:`network_scan_slot`), the DIV's existing unnumbered scan
+    becoming ``_network_scan_0`` as the new one lands as ``_network_scan_1``; that rename is
+    noted in the new file's journal record. The registry keeps one ``network_scan`` row per well
+    and DIV whichever way, as it does for a scan MaxLab re-ran.
 
     A file holding several wells is split into one file per well on the way in (see
     :func:`split_by_well`), so each culture's directory holds its own data; ``wells`` narrows that
@@ -1104,7 +1168,8 @@ def ingest_recording(
     :param on_progress: Called with each progress line.
     :returns: ``{well: destination path}`` for every well ingested.
     :raises FileNotFoundError: If ``h5_path`` does not exist.
-    :raises FileExistsError: If a destination file already exists -- nothing is overwritten.
+    :raises FileExistsError: If a destination file already exists -- nothing is overwritten. A
+        network scan never collides (it takes the next index instead).
     :raises ValueError: On a malformed batch id, plate date, kind or exp id, a file with no wells,
         or ``wells`` naming one the file lacks.
     """
@@ -1141,9 +1206,29 @@ def ingest_recording(
         if not chosen:
             raise ValueError("wells is empty: nothing to ingest.")
 
+    slots: dict[int, tuple[str, list[tuple[Path, Path]]]] = {}
+
     def destination(well: int) -> Path:
         stem = recording_stem(batch, plate_date, chip, well, div)
-        return recording_dir(config, batch, plate_date, chip, well, div) / f"{stem}_{tail}.raw.h5"
+        div_dir = recording_dir(config, batch, plate_date, chip, well, div)
+        well_tail = tail
+        if kind == "network_scan":
+            if well not in slots:
+                slots[well] = network_scan_slot(div_dir, stem)
+            well_tail = slots[well][0]
+        return div_dir / f"{stem}_{well_tail}.raw.h5"
+
+    # A network scan joining others of its DIV: number what is there before anything lands, so the
+    # new file's name and the renames it caused are settled together (and journaled together).
+    renamed: dict[int, dict[str, str]] = {}
+    for well in chosen:
+        destination(well)
+        for old, new in slots.get(well, ("", []))[1]:
+            if new.exists():
+                raise FileExistsError(f"Refusing to overwrite {new}.")
+            on_progress(f"Numbering the DIV's earlier network scan: {old.name} -> {new.name}")
+            old.rename(new)
+            renamed.setdefault(well, {})[str(old)] = str(new)
 
     if len(present) == 1 and chosen == present:
         # One well: a straight file copy (or move) is faster and bit-exact; nothing to split.
@@ -1210,6 +1295,9 @@ def ingest_recording(
     from mxtreme import transactions
 
     for well, dest in written.items():
+        data = {"source": str(h5_path), "path": str(dest), "moved": bool(move), "kind": kind}
+        if well in renamed:
+            data["renamed"] = renamed[well]
         transactions.record(
             config,
             "recording.ingested",
@@ -1221,7 +1309,7 @@ def ingest_recording(
             div=div,
             actor=actor,
             note=note,
-            data={"source": str(h5_path), "path": str(dest), "moved": bool(move), "kind": kind},
+            data=data,
         )
 
     return written
