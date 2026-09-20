@@ -16,6 +16,7 @@ later stage reads back from there. The structure is as follows:
 │               └── DIV_<d>/
 │                   ├── plating_…_chip_<chip>_well_<N>_DIV_<d>_activity_scan.raw.h5
 │                   ├── plating_…_chip_<chip>_well_<N>_DIV_<d>_network_scan.raw.h5
+│                   ├── plating_…_chip_<chip>_well_<N>_DIV_<d>_network_scan_<i>.raw.h5   (several on one DIV: numbered from 0)
 │                   └── plating_…_chip_<chip>_well_<N>_DIV_<d>_<exp_id>.raw.h5
 ├── preprocessed/                  cleaned .npz, one per well per recording
 │   └── <exp_id>/<chip>/well<N>/DIV<d>_<plate_date>_<chip>_<exp_id>_well<N>_exp_data.npz

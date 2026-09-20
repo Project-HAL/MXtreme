@@ -317,6 +317,64 @@ def test_ingest_refuses_to_overwrite(tmp_path):
         store.ingest_recording(src, config, **kwargs, on_progress=lambda _: None)
 
 
+def test_network_scan_slot_numbers_a_divs_scans_in_arrival_order(tmp_path):
+    stem = "plating_260810_fall2026_batch1_DRG_M1_chip_M07460_well_0_DIV_21"
+    div_dir = tmp_path / "DIV_21"
+    assert store.network_scan_slot(div_dir, stem) == ("network_scan", [])  # no directory yet
+    div_dir.mkdir()
+    plain = div_dir / f"{stem}_network_scan.raw.h5"
+    plain.touch()
+    tail, renames = store.network_scan_slot(div_dir, stem)
+    assert tail == "network_scan_1" and renames == [(plain, div_dir / f"{stem}_network_scan_0.raw.h5")]
+    # Already numbered: the next free index, nothing to rename.
+    plain.rename(renames[0][1])
+    (div_dir / f"{stem}_network_scan_1.raw.h5").touch()
+    assert store.network_scan_slot(div_dir, stem) == ("network_scan_2", [])
+    # MaxLab's own collision rename (plain beside _1): the plain one takes the gap at 0.
+    (div_dir / f"{stem}_network_scan_0.raw.h5").unlink()
+    plain.touch()
+    tail, renames = store.network_scan_slot(div_dir, stem)
+    assert tail == "network_scan_2" and renames == [(plain, div_dir / f"{stem}_network_scan_0.raw.h5")]
+    # Another well's files on the same DIV are not this well's.
+    assert store.network_scan_slot(div_dir, stem.replace("well_0", "well_1")) == ("network_scan", [])
+    assert [store.network_scan_index(n) for n in (f"{stem}_network_scan.raw.h5", f"{stem}_network_scan_3.raw.h5", f"{stem}_trial.raw.h5")] == [0, 3, None]
+
+
+def test_ingest_numbers_several_network_scans_of_one_div(tmp_path):
+    """A second network scan on the same well and DIV is not a collision: the pair is numbered
+    from zero in arrival order, both read back as network scans, the registry keeps one row, and
+    the rename is journaled with the file that caused it."""
+    config = Config(data_root=tmp_path / "ms")
+    kwargs = {"batch": BATCH, "plate_date": 260810, "chip": "M07460", "div": 21, "kind": "network_scan", "on_progress": lambda _: None}
+    first = store.ingest_recording(_single_well_h5(tmp_path / "a.raw.h5"), config, **kwargs)[0]
+    assert first.name.endswith("_DIV_21_network_scan.raw.h5")
+
+    second = store.ingest_recording(_single_well_h5(tmp_path / "b.raw.h5"), config, **kwargs)[0]
+    third = store.ingest_recording(_single_well_h5(tmp_path / "c.raw.h5"), config, **kwargs)[0]
+    names = sorted(p.name for p in first.parent.glob("*.h5"))
+    assert [n.rsplit("_DIV_21_", 1)[1] for n in names] == ["network_scan_0.raw.h5", "network_scan_1.raw.h5", "network_scan_2.raw.h5"]
+    assert not first.exists() and second.name.endswith("_network_scan_1.raw.h5") and third.name.endswith("_network_scan_2.raw.h5")
+    for p in first.parent.glob("*.h5"):
+        assert store.recording_kind(p) == "network_scan"
+        location = store.parse_recording_path(p, config.recordings_dir)
+        assert location.kind == "network_scan" and location.exp_id == ""
+    assert [store.network_scan_index(n) for n in names] == [0, 1, 2]
+
+    df = pd.read_csv(config.registry_path, keep_default_na=False)
+    assert len(df) == 1 and df.iloc[0]["kind"] == "network_scan" and df.iloc[0]["exp_id"] == ""
+
+    log = [t for t in transactions.read(config) if t.op == "recording.ingested"]
+    assert len(log) == 3 and all(t.data["kind"] == "network_scan" for t in log)
+    assert "renamed" not in log[0].data and "renamed" not in log[2].data
+    assert log[1].data["renamed"] == {str(first): str(first.parent / first.name.replace("_network_scan.raw", "_network_scan_0.raw"))}
+
+    # An activity scan still refuses to collide: numbering is a network-scan convention.
+    src = _single_well_h5(tmp_path / "as.raw.h5")
+    store.ingest_recording(src, config, **{**kwargs, "kind": "activity_scan"})
+    with pytest.raises(FileExistsError):
+        store.ingest_recording(src, config, **{**kwargs, "kind": "activity_scan"})
+
+
 @pytest.mark.parametrize("bad", ["", "has space", "a/b", "activity_scan", "network_scan_2"])
 def test_ingest_rejects_unusable_exp_ids(tmp_path, bad):
     config = Config(data_root=tmp_path / "ms")
