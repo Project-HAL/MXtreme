@@ -599,6 +599,24 @@ def test_rename_batch_refuses_bad_targets(tmp_path, new, error):
     assert sorted(str(p) for p in tmp_path.rglob("*")) == before
 
 
+def test_rename_batch_can_take_the_old_system_suffix_off(tmp_path):
+    """The 2026-09-21 migration: ``..._E18_M1`` -> ``..._E18``. The new id stands as a whole token
+    inside every old name, which must read as the rename, not as the target already existing."""
+    config = Config(data_root=tmp_path)
+    _seed_batch(config, "fall2026_batch1_E18_M1")
+    _seed_batch(config, "fall2026_batch2_E18_M1", chip="P2")  # a sibling, left alone
+
+    result = store.rename_batch(config, "fall2026_batch1_E18_M1", "fall2026_batch1_E18")
+
+    assert result.registry_rows == 2 and len(result.paths) == 12
+    assert not _mentions(tmp_path, "fall2026_batch1_E18_M1")
+    assert {p.batch.id for p in store.list_platings(config)} == {"fall2026_batch1_E18", "fall2026_batch2_E18_M1"}
+    [plating] = [p for p in store.list_platings(config) if p.batch.id == "fall2026_batch1_E18"]
+    assert plating.systems() == {"P1": "M1"}  # the chip directory still says which system
+    with pytest.raises(FileExistsError):  # and a real collision is still one
+        store.rename_batch(config, "fall2026_batch2_E18_M1", "fall2026_batch1_E18")
+
+
 def test_rename_batch_refuses_a_batch_it_cannot_find(tmp_path):
     config = Config(data_root=tmp_path)
     with pytest.raises(FileNotFoundError):

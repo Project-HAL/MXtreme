@@ -1524,8 +1524,14 @@ def rename_batch(
     if not paths and not registry_rows:
         raise FileNotFoundError(f"Nothing in {config.data_root} is named by batch {old.id!r}.")
 
-    taken = [p for root in roots for p in _named(root, new_token)]
-    if taken or new_token.search(registry_text):
+    # Names carrying the *old* id are masked before looking for the new one: taking a suffix off
+    # an id (``fall2026_batch1_E18_M1`` -> ``fall2026_batch1_E18``) leaves the new id standing as
+    # a whole token inside every old name, which is the rename itself, not a collision.
+    def _has_new(text: str) -> bool:
+        return bool(new_token.search(old_token.sub("", text)))
+
+    taken = [p for root in roots for p in _named(root, new_token) if _has_new(p.name)]
+    if taken or _has_new(registry_text):
         where = taken[0] if taken else config.registry_path
         raise FileExistsError(f"Batch {new.id!r} is already present in the store: {where}")
 
