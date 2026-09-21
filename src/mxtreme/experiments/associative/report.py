@@ -374,7 +374,8 @@ def _gate(data, record) -> list:
 
     # Only detections large enough to be spikes count towards "not silent": the detector fires on
     # noise crossings of a few uV on every channel, and on the artifact everywhere a pulse reaches.
-    real = frames[np.abs(spikes["amplitude"]) >= checks.MIN_SPIKE_UV]
+    # A recording's amplitudes are in ADC counts (clean.py and the scans scale them by lsb too).
+    real = frames[np.abs(spikes["amplitude"]) * data["lsb"] * 1e6 >= checks.MIN_SPIKE_UV]
     silent = checks.silent_recording(checks.outside_artifacts(real, [f for _, f in pulses], fps), fps)
     if silent is not None:
         return [silent]
@@ -800,7 +801,7 @@ def _read_one(h5_path: str, protocol_path: str | None, threshold_uv: float) -> d
             from mxtreme.experiments.associative import checks
 
             print("\n=== baseline gate: each region probed alone, from the baseline block ===")
-            real = frames_all[np.abs(spikes["amplitude"]) >= checks.MIN_SPIKE_UV]
+            real = frames_all[np.abs(spikes["amplitude"]) * data["lsb"] * 1e6 >= checks.MIN_SPIKE_UV]
             silent = checks.silent_recording(
                 checks.outside_artifacts(real, [f for _, f in by_role], fps), fps
             )

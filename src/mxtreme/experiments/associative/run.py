@@ -198,6 +198,8 @@ def run(
     work: str | Path | None = None,
     on_progress: ProgressFn = print,
     should_stop: StopFn | None = None,
+    clock=None,
+    sleep=None,
 ) -> RunResult:
     """Run the protocol on the rig and record it: one recording, or one per phase.
 
@@ -214,6 +216,10 @@ def run(
         Optional; the recordings carry everything :mod:`.report` needs without it.
     :param should_stop: Polled while waiting; return ``True`` to end the run early. The recording
         being made is closed properly and no later phase starts.
+    :param clock: What the schedule is walked against; ``time.monotonic`` unless given, or unless
+        the ``maxlab`` module in use carries its own ``clock`` (a simulated rig keeps simulated
+        time; MaxLab's API has no such attribute, so on hardware this is always the wall clock).
+    :param sleep: Its partner, the same way; ``time.sleep`` on hardware.
     :returns: The last phase's result; every phase's is in its ``phases`` list.
     :raises ModuleNotFoundError: If ``maxlab`` is not installed (this is not the rig).
     :raises RuntimeError: If a protocol cannot be written into its recording and there is no
@@ -224,6 +230,8 @@ def run(
     from mxtreme.stimulation import sequences
 
     mx = _require_maxlab()
+    clock = clock or getattr(mx, "clock", time.monotonic)
+    sleep = sleep or getattr(mx, "sleep", time.sleep)
     names = expand_phases(params, phases)
     per_phase = [replace(params, phase=name) for name in names]
     for p in per_phase:
@@ -268,7 +276,7 @@ def run(
     mx.initialize()
     if mx.send(mx.Core().enable_stimulation_power(True)) != "Ok":
         raise RuntimeError("the system did not enable stimulation power")
-    time.sleep(mx.Timing.waitInit)
+    sleep(mx.Timing.waitInit)
     mx.clear_events()
 
     groups = {}
@@ -330,13 +338,16 @@ def run(
 
     mx.activate([well])
     mx.offset()
-    time.sleep(mx.Timing.waitInMX2Offset)
+    sleep(mx.Timing.waitInMX2Offset)
 
     def fire(token):
         registered[token].send()
 
     def mark(label):
-        sequences.mark(well, f"{label} {well}")
+        # `<block>_start <well>`, the key report looks for (and the scans' convention:
+        # pre_recording_start, closed_loop_start); end_experiment is already its own key.
+        tag = label if label == "end_experiment" else f"{label}_start"
+        sequences.mark(well, f"{tag} {well}")
 
     # --- one recording per phase ---
     results: list[RunResult] = []
@@ -360,6 +371,8 @@ def run(
                 work,
                 on_progress,
                 should_stop,
+                clock,
+                sleep,
             )
             results.append(result)
             if result.stopped_early:
@@ -416,6 +429,8 @@ def _record_phase(
     work,
     on_progress,
     should_stop,
+    clock=time.monotonic,
+    sleep=time.sleep,
 ) -> RunResult:
     """Open one recording, write its metadata and protocol into it, run its schedule, close it."""
     from mxtreme import io
@@ -458,11 +473,11 @@ def _record_phase(
     on_progress(f"recording to {params.h5_path}")
     try:
         fired, stopped = execute_schedule(
-            blocks, fire, mark, should_stop=should_stop, on_progress=on_progress
+            blocks, fire, mark, clock=clock, sleep=sleep, should_stop=should_stop, on_progress=on_progress
         )
     finally:
         s.stop_recording()
-        time.sleep(mx.Timing.waitAfterRecording)
+        sleep(mx.Timing.waitAfterRecording)
         s.stop_file()
         s.group_delete_all()
 
