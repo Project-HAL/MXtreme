@@ -617,6 +617,25 @@ def test_rename_batch_can_take_the_old_system_suffix_off(tmp_path):
         store.rename_batch(config, "fall2026_batch2_E18_M1", "fall2026_batch1_E18")
 
 
+def test_rename_batch_can_leave_the_blobs_alone(tmp_path):
+    """An archive copy on a share that refuses read-write HDF5 opens: paths, registry, CSVs and
+    npz follow the rename; the raw files keep their blob until the originals are synced over."""
+    import h5py
+
+    from mxtreme import io
+
+    config = Config(data_root=tmp_path)
+    _seed_batch(config, OLD)
+
+    result = store.rename_batch(config, OLD, NEW, h5_blobs=False)
+
+    assert result.h5_files == [] and result.npz_files and result.csv_files and result.registry_rows == 2
+    assert not _mentions(tmp_path, OLD)  # every name and every CSV cell moved on
+    h5_path = next(config.recordings_dir.rglob("*.h5"))
+    assert io._embedded_metadata(h5_path)["Batch ID"] == OLD  # the blob is the one thing left
+    assert store.parse_recording_path(h5_path, config.recordings_dir).batch.id == NEW
+
+
 def test_rename_batch_refuses_a_batch_it_cannot_find(tmp_path):
     config = Config(data_root=tmp_path)
     with pytest.raises(FileNotFoundError):

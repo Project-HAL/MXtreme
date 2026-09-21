@@ -1443,6 +1443,7 @@ def rename_batch(
     dry_run: bool = False,
     reason: str = "",
     actor: str | None = None,
+    h5_blobs: bool = True,
     on_progress: Callable[[str], None] = lambda _: None,
 ) -> BatchRename:
     """Give a plating batch a new id everywhere the store names it.
@@ -1482,6 +1483,12 @@ def rename_batch(
     :param dry_run: Collect and report what would change without changing it.
     :param reason: Why, in the caller's words; goes into the journal record's ``note``.
     :param actor: Who is renaming, for the journal. ``None`` records the OS user.
+    :param h5_blobs: Rewrite the ``/assay/metadata`` blob inside each raw ``.h5``. Set it to
+        ``False`` for a copy of the store that cannot be opened read-write in place -- an archive
+        on a network share, say -- so its paths, registry, CSVs and ``.npz`` files follow the
+        rename now, and the rewritten originals replace its raw files when they are next synced.
+        Until then the blobs there still carry the old id; nothing in the tree reads identity from
+        them (:func:`parse_recording_path` reads the path).
     :param on_progress: Called with a line of progress text as each group of files is done.
     :raises ValueError: If the new id is malformed, equals the old one, or is a substring of
         another batch's id in the store (which the rename could not tell apart).
@@ -1543,7 +1550,7 @@ def rename_batch(
     # --- contents first: the identity each file carries inside it -----------------------------
     old_bytes = re.compile(old_token.pattern.encode())
     h5_files = []
-    for h5_path in (p for p in paths if p.suffix == ".h5" and p.is_file()):
+    for h5_path in (p for p in paths if h5_blobs and p.suffix == ".h5" and p.is_file()):
         with h5py.File(str(h5_path), "r") as f:
             raw = bytes(f["/assay/metadata"][:][0]) if "/assay/metadata" in f else b""
         if not old_bytes.search(raw):
@@ -1560,7 +1567,7 @@ def rename_batch(
                 )
 
         _keep_mtime(h5_path, _rewrite_blob)
-    on_progress(f"Metadata blobs: {len(h5_files)} raw recording(s)")
+    on_progress(f"Metadata blobs: {len(h5_files)} raw recording(s)" + ("" if h5_blobs else " (left as they were)"))
 
     npz_files = []
     for npz_path in (p for p in paths if p.suffix == ".npz" and p.is_file()):
