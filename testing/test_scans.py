@@ -132,14 +132,14 @@ def test_dist_thresh_relaxation_restarts_for_each_well(capsys):
 
 # --- where a scan is written --------------------------------------------------------------------
 
-BATCH = "fall2026_batch1_DRG_M1"
+BATCH = "fall2026_batch1_DRG"
 STEM = f"plating_250512_{BATCH}_chip_C0001_well_0_DIV_14"
 
 
 def _params(**overrides):
     from mxtreme.scans.activity_scan import ActivityScanParams
 
-    defaults = {"batch": BATCH, "chip": "C0001", "plate_date": 250512, "div": 14, "wells": [0]}
+    defaults = {"batch": BATCH, "chip": "C0001", "system": "M1", "plate_date": 250512, "div": 14, "wells": [0]}
     return ActivityScanParams(**{**defaults, **overrides})
 
 
@@ -179,6 +179,29 @@ def test_scan_into_the_store_requires_a_batch(tmp_path):
         _params(batch=None).validate()
     with pytest.raises(ValueError, match="batch id"):
         _params(batch="not-a-batch-id").validate()
+
+
+def test_scan_into_the_store_requires_the_system(tmp_path):
+    """The chip directory is chip_<M1|M2>_<chip>, so a store scan cannot resolve without it."""
+    from mxtreme.config import Config
+
+    with pytest.raises(ValueError, match="system"):
+        _params(system=None).resolved(Config(data_root=tmp_path))
+    resolved = _params(system="M2").resolved(Config(data_root=tmp_path))
+    assert resolved.h5_path.parent.parent.parent.name == "chip_M2_C0001"
+
+
+def test_connected_system_fills_or_checks_the_params():
+    """On the rig, the device the server reports names the chip directory -- and must agree with
+    what the params say when they say anything."""
+    from mxtreme.scans.activity_scan import _with_connected_system
+
+    assert _with_connected_system(_params(system=None), "MaxTwo").system == "M2"
+    assert _with_connected_system(_params(system="M1"), "MaxOne").system == "M1"
+    with pytest.raises(RuntimeError, match="M1 chip, but the rig has a MaxTwo"):
+        _with_connected_system(_params(system="M1"), "MaxTwo")
+    with pytest.raises(RuntimeError, match="No MaxWell device"):
+        _with_connected_system(_params(), "unrecognised system type 7")
 
 
 def test_resolved_returns_a_copy_and_leaves_the_caller_s_params_alone(tmp_path):

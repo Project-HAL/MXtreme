@@ -42,7 +42,9 @@ from pathlib import Path
 #: Semesters a batch id may name, in calendar order.
 SEMESTERS = ("spring", "summer", "fall", "winter")
 
-#: MaxWell systems a batch may be plated on: MaxOne or MaxTwo.
+#: MaxWell systems a chip's recordings come off: MaxOne (``M1``) or MaxTwo (``M2``). Named at the
+#: chip level of the tree (``chip_<system>_<chip>``), never in the batch id: one plating can put
+#: cultures on both.
 SYSTEMS = ("M1", "M2")
 
 #: What a file in the recordings tree can be. ``"experiment"`` is an ingested exogenous recording;
@@ -50,14 +52,15 @@ SYSTEMS = ("M1", "M2")
 #: ingested as scans (see :func:`ingest_recording`).
 RECORDING_KINDS = ("activity_scan", "network_scan", "experiment")
 
-#: The batch-id convention, e.g. ``fall2026_batch1_DRG_M1``. The cell type is the one free-form
-#: field; it may itself contain underscores, which parses unambiguously because everything around it
-#: is fixed-format.
+#: The batch-id convention, e.g. ``fall2026_batch1_DRG``. The cell type is the one free-form
+#: field, and the last; it may itself contain underscores, which parses unambiguously because
+#: everything before it is fixed-format. (Ids written before 2026-09-21 ended in ``_M1``/``_M2``;
+#: such an id still parses, with the suffix read as part of the cell type -- see :func:`rename_batch`
+#: for taking it off.)
 _BATCH_ID = re.compile(
     r"^(?P<semester>spring|summer|fall|winter)(?P<year>\d{4})"
     r"_batch(?P<number>\d+)"
-    r"_(?P<cell_type>.+)"
-    r"_(?P<system>M[12])$"
+    r"_(?P<cell_type>.+)$"
 )
 
 #: Matches the scan-kind tail of a store file name (``..._activity_scan.raw.h5``,
@@ -77,7 +80,7 @@ _PLATE_DATE = re.compile(r"^\d{6}$")
 
 #: The directory names the layout functions below produce, for reading the tree back.
 _PLATING_DIR = re.compile(r"^plating_(?P<plate_date>\d{6})_(?P<batch_id>.+)$")
-_CHIP_DIR = re.compile(r"^chip_M[12]_(?P<chip>.+)$")
+_CHIP_DIR = re.compile(r"^chip_(?P<system>M[12])_(?P<chip>.+)$")
 
 
 @dataclass(frozen=True)
@@ -87,24 +90,26 @@ class Batch:
     Created manually at the start of a batch -- this constructor *is* the generator, validating each
     field so a malformed id never reaches a directory name::
 
-        batch = Batch(semester="fall", year=2026, number=1, cell_type="DRG", system="M1")
-        batch.id  # "fall2026_batch1_DRG_M1"
+        batch = Batch(semester="fall", year=2026, number=1, cell_type="DRG")
+        batch.id  # "fall2026_batch1_DRG"
 
     An id someone already has as a string round-trips through :meth:`parse`.
+
+    The system a culture is recorded on (MaxOne or MaxTwo) is deliberately not part of the id: a
+    plating can put cultures on both, and the tree records it one level down, in the chip
+    directory (see :func:`chip_dirname`).
 
     :param semester: One of :data:`SEMESTERS`.
     :param year: Four-digit calendar year.
     :param number: Batch number within the semester, starting at 1.
     :param cell_type: Free-form cell type label, e.g. ``"DRG"``. Underscores are allowed; path
         separators and whitespace are not.
-    :param system: ``"M1"`` (MaxOne) or ``"M2"`` (MaxTwo) -- see :data:`SYSTEMS`.
     """
 
     semester: str
     year: int
     number: int
     cell_type: str
-    system: str
 
     def __post_init__(self) -> None:
         if self.semester not in SEMESTERS:
@@ -118,13 +123,11 @@ class Batch:
                 f"cell_type must be a non-empty label of letters, digits, '-' or '_', "
                 f"got {self.cell_type!r}."
             )
-        if self.system not in SYSTEMS:
-            raise ValueError(f"system must be one of {SYSTEMS}, got {self.system!r}.")
 
     @property
     def id(self) -> str:
-        """The batch id string, e.g. ``fall2026_batch1_DRG_M1``."""
-        return f"{self.semester}{self.year}_batch{self.number}_{self.cell_type}_{self.system}"
+        """The batch id string, e.g. ``fall2026_batch1_DRG``."""
+        return f"{self.semester}{self.year}_batch{self.number}_{self.cell_type}"
 
     def __str__(self) -> str:
         return self.id
@@ -135,7 +138,7 @@ class Batch:
 
         A :class:`Batch` passes through unchanged, so call sites can accept either form.
 
-        :param batch_id: e.g. ``"fall2026_batch1_DRG_M1"``.
+        :param batch_id: e.g. ``"fall2026_batch1_DRG"``.
         :raises ValueError: If the string does not follow the batch-id convention.
         """
         if isinstance(batch_id, Batch):
@@ -144,14 +147,13 @@ class Batch:
         if match is None:
             raise ValueError(
                 f"Not a valid batch id: {batch_id!r}. Expected "
-                "<semester><year>_batch<n>_<cell_type>_<M1|M2>, e.g. 'fall2026_batch1_DRG_M1'."
+                "<semester><year>_batch<n>_<cell_type>, e.g. 'fall2026_batch1_DRG'."
             )
         return cls(
             semester=match["semester"],
             year=int(match["year"]),
             number=int(match["number"]),
             cell_type=match["cell_type"],
-            system=match["system"],
         )
 
 
@@ -170,19 +172,52 @@ def plating_dirname(batch: Batch | str, plate_date) -> str:
     return f"plating_{_validate_plate_date(plate_date)}_{Batch.parse(batch).id}"
 
 
-def chip_dirname(batch: Batch | str, chip: str) -> str:
-    """One chip's directory within a plating: ``chip_<M1|M2>_<chip>``."""
-    return f"chip_{Batch.parse(batch).system}_{chip}"
+def chip_dirname(system: str, chip: str) -> str:
+    """One chip's directory within a plating: ``chip_<M1|M2>_<chip>``.
+
+    The system is the chip's, not the batch's: it is what the rig reported when the chip was
+    recorded from (:func:`mxtreme.scans.activity_scan.run_activity_scan`), or what an ingested
+    file says about its plate (:func:`describe_recording`).
+
+    :raises ValueError: If ``system`` is not one of :data:`SYSTEMS`.
+    """
+    if system not in SYSTEMS:
+        raise ValueError(f"system must be one of {SYSTEMS}, got {system!r}.")
+    return f"chip_{system}_{chip}"
 
 
-def chip_dir(config, batch: Batch | str, plate_date, chip: str) -> Path:
-    """Directory holding one chip's wells: ``<recordings_dir>/plating_.../chip_...``."""
-    return config.recordings_dir / plating_dirname(batch, plate_date) / chip_dirname(batch, chip)
+def chip_dir(config, batch: Batch | str, plate_date, chip: str, *, system: str) -> Path:
+    """Directory holding one chip's wells: ``<recordings_dir>/plating_.../chip_...``.
+
+    For *writing*: the caller says which system the chip is on. To find the directory a chip
+    already has, whichever system it is on, use :func:`find_chip_dir`.
+    """
+    return config.recordings_dir / plating_dirname(batch, plate_date) / chip_dirname(system, chip)
 
 
-def recording_dir(config, batch: Batch | str, plate_date, chip: str, well: int, div: int) -> Path:
+def find_chip_dir(config, batch: Batch | str, plate_date, chip: str) -> Path | None:
+    """The directory a chip already has in a plating, or ``None`` if it has none yet.
+
+    A chip lives on one system, so at most one ``chip_M?_<chip>`` exists; this is how a reader
+    that knows the chip but not the system (a registry row, a journal record) gets to its files.
+    """
+    plating_dir = config.recordings_dir / plating_dirname(batch, plate_date)
+    return _find_chip_dir_in(plating_dir, chip)
+
+
+def _find_chip_dir_in(plating_dir: Path, chip: str) -> Path | None:
+    for system in SYSTEMS:
+        candidate = plating_dir / chip_dirname(system, chip)
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
+def recording_dir(
+    config, batch: Batch | str, plate_date, chip: str, well: int, div: int, *, system: str
+) -> Path:
     """Directory one culture's recordings for one DIV land in: ``.../well_<well>/DIV_<div>``."""
-    return chip_dir(config, batch, plate_date, chip) / f"well_{int(well)}" / f"DIV_{int(div)}"
+    return chip_dir(config, batch, plate_date, chip, system=system) / f"well_{int(well)}" / f"DIV_{int(div)}"
 
 
 def recording_stem(batch: Batch | str, plate_date, chip: str, well, div: int) -> str:
@@ -266,10 +301,22 @@ class Plating:
 
     def chips(self) -> list[str]:
         """Chip serials this plating has recordings for, from its ``chip_*`` directories."""
+        return sorted(self.systems())
+
+    def systems(self) -> dict[str, str]:
+        """``{chip: system}`` for every chip directory: which of :data:`SYSTEMS` each chip is on."""
         if not self.path.is_dir():
-            return []
+            return {}
         found = (_CHIP_DIR.match(entry.name) for entry in self.path.iterdir() if entry.is_dir())
-        return sorted(match["chip"] for match in found if match)
+        return {match["chip"]: match["system"] for match in found if match}
+
+    def system_of(self, chip: str) -> str | None:
+        """The system one chip is on, or ``None`` if the plating has no directory for it."""
+        return self.systems().get(chip)
+
+    def chip_dir(self, chip: str) -> Path | None:
+        """One chip's directory in this plating, whichever system it is on; ``None`` if absent."""
+        return _find_chip_dir_in(self.path, chip)
 
 
 def list_platings(config) -> list[Plating]:
@@ -317,6 +364,7 @@ class RecordingLocation:
     :param batch: The plating batch, parsed from the plating directory.
     :param plate_date: Plating date (``YYMMDD``), from the plating directory.
     :param chip: Chip serial, from the chip directory.
+    :param system: ``M1`` or ``M2``, from the chip directory.
     :param well: Well number, from the well directory.
     :param div: Days *in vitro*, from the DIV directory.
     :param kind: See :data:`RECORDING_KINDS`.
@@ -326,6 +374,7 @@ class RecordingLocation:
     batch: Batch
     plate_date: int
     chip: str
+    system: str
     well: int
     div: int
     kind: str
@@ -371,6 +420,7 @@ def parse_recording_path(h5_path: Path, recordings_dir: Path) -> RecordingLocati
         batch=batch,
         plate_date=int(plating_match["plate_date"]),
         chip=chip_match["chip"],
+        system=chip_match["system"],
         well=int(well_match.group(1)),
         div=int(div_match.group(1)),
         kind=kind,
@@ -1104,6 +1154,7 @@ def ingest_recording(
     exp_id: str | None = None,
     wells: Iterable[int] | None = None,
     conditions: dict[int, object] | None = None,
+    system: str | None = None,
     move: bool = False,
     actor: str | None = None,
     note: str = "",
@@ -1139,12 +1190,12 @@ def ingest_recording(
         config = Config.from_toml("mxtreme.toml")
         ingest_recording(
             "/data/exports/stim_session.raw.h5", config,
-            batch="fall2026_batch1_DRG_M1", plate_date=260810,
+            batch="fall2026_batch1_DRG", plate_date=260810,
             chip="M07460", div=21, exp_id="burstTrainer_trial3",
         )
         ingest_recording(                      # a Scope activity scan
             "/data/scope/M07460_260831.h5", config,
-            batch="fall2026_batch1_DRG_M1", plate_date=260810,
+            batch="fall2026_batch1_DRG", plate_date=260810,
             chip="M07460", div=21, kind="activity_scan",
         )
 
@@ -1161,6 +1212,9 @@ def ingest_recording(
         experiment; not accepted for a scan (a scan's identity is its batch).
     :param wells: Which of the file's wells to ingest; ``None`` means all of them.
     :param conditions: Optional per-well condition labels, keyed by well number.
+    :param system: Which system the chip is on, ``"M1"`` or ``"M2"`` -- it names the chip
+        directory. ``None`` takes what the file says about its plate
+        (:attr:`RecordingDescription.system`); a file that does not say needs it given.
     :param move: Move the file instead of copying it. A multi-well source is removed after a
         successful split either way when this is set; on any failure the original is kept.
     :param actor: Who, for the journal; the OS user when ``None``.
@@ -1171,7 +1225,7 @@ def ingest_recording(
     :raises FileExistsError: If a destination file already exists -- nothing is overwritten. A
         network scan never collides (it takes the next index instead).
     :raises ValueError: On a malformed batch id, plate date, kind or exp id, a file with no wells,
-        or ``wells`` naming one the file lacks.
+        ``wells`` naming one the file lacks, or no way to tell which system the chip is on.
     """
     import shutil
 
@@ -1206,11 +1260,24 @@ def ingest_recording(
         if not chosen:
             raise ValueError("wells is empty: nothing to ingest.")
 
+    # The chip directory names the system. The file usually says (Scope and the MaxLab server
+    # both write /wellplate/version); a caller that knows better, or has a file that does not
+    # say, passes it.
+    if system is None:
+        system = describe_recording(h5_path).system
+        if system is None:
+            raise ValueError(
+                f"{h5_path.name} does not say whether it was recorded on a MaxOne or a MaxTwo; "
+                "pass system='M1' or 'M2' to name the chip directory."
+            )
+    if system not in SYSTEMS:
+        raise ValueError(f"system must be one of {SYSTEMS}, got {system!r}.")
+
     slots: dict[int, tuple[str, list[tuple[Path, Path]]]] = {}
 
     def destination(well: int) -> Path:
         stem = recording_stem(batch, plate_date, chip, well, div)
-        div_dir = recording_dir(config, batch, plate_date, chip, well, div)
+        div_dir = recording_dir(config, batch, plate_date, chip, well, div, system=system)
         well_tail = tail
         if kind == "network_scan":
             if well not in slots:
@@ -1295,7 +1362,7 @@ def ingest_recording(
     from mxtreme import transactions
 
     for well, dest in written.items():
-        data = {"source": str(h5_path), "path": str(dest), "moved": bool(move), "kind": kind}
+        data = {"source": str(h5_path), "path": str(dest), "moved": bool(move), "kind": kind, "system": system}
         if well in renamed:
             data["renamed"] = renamed[well]
         transactions.record(
@@ -1347,9 +1414,9 @@ def _id_token(batch_id: str) -> re.Pattern[str]:
     """Match ``batch_id`` where it stands as a whole token in a name or a CSV cell.
 
     Every place the store writes a batch id butts it against ``_``, ``,``, a quote or an end, never
-    against a letter or digit -- so this is what separates ``fall2026_batch1_E18_M1`` from
-    ``fall2026_batch12_E18_M1``. It cannot separate an id from one whose cell type *contains* it
-    (``fall2026_batch1_E18_M1_E18_M1``); :func:`rename_batch` checks the store for that case first.
+    against a letter or digit -- so this is what separates ``fall2026_batch1_E18`` from
+    ``fall2026_batch12_E18``. It cannot separate an id from one whose cell type *contains* it
+    (``fall2026_batch1_E18_E18``); :func:`rename_batch` checks the store for that case first.
     """
     return re.compile(rf"(?<![A-Za-z0-9]){re.escape(batch_id)}(?![A-Za-z0-9])")
 
@@ -1391,8 +1458,9 @@ def rename_batch(
     they are produced again.
 
     The plate date is not part of the batch id and is left alone -- the batch keeps its place in the
-    calendar, only its label changes. The system (``M1``/``M2``) is refused: it names the hardware
-    the recordings came off, and the chip directories and well counts assume it.
+    calendar, only its label changes. Nor is the system: the chip directories name it, and they are
+    not touched. (Taking a pre-2026-09-21 ``_M1``/``_M2`` suffix off an id is an ordinary rename:
+    ``rename_batch(config, "fall2026_batch1_E18_M1", "fall2026_batch1_E18")``.)
 
     Contents (blobs, ``.npz`` fields, CSV rows, the registry) are rewritten before any path moves,
     and paths are renamed deepest-first with the top-level directories last, so the failures most
@@ -1415,8 +1483,8 @@ def rename_batch(
     :param reason: Why, in the caller's words; goes into the journal record's ``note``.
     :param actor: Who is renaming, for the journal. ``None`` records the OS user.
     :param on_progress: Called with a line of progress text as each group of files is done.
-    :raises ValueError: If the new id is malformed, equals the old one, changes the system, or is a
-        substring of another batch's id in the store (which the rename could not tell apart).
+    :raises ValueError: If the new id is malformed, equals the old one, or is a substring of
+        another batch's id in the store (which the rename could not tell apart).
     :raises FileNotFoundError: If nothing in the store is named by ``old``.
     :raises FileExistsError: If something in the store is already named by ``new``.
     :returns: A :class:`BatchRename` listing everything changed (or, with ``dry_run``, to change).
@@ -1429,11 +1497,6 @@ def rename_batch(
     old, new = Batch.parse(old), Batch.parse(new)
     if old.id == new.id:
         raise ValueError(f"Batch is already named {old.id!r}.")
-    if old.system != new.system:
-        raise ValueError(
-            f"Cannot move batch {old.id!r} from {old.system} to {new.system}: the system names the "
-            "hardware the recordings came off, and the store's layout assumes it."
-        )
 
     old_token, new_token = _id_token(old.id), _id_token(new.id)
     on_disk = _batch_ids_on_disk(config)

@@ -58,7 +58,7 @@ from mxtreme.scans import activity_scan
 
 config = Config.from_toml("mxtreme.toml")
 params = activity_scan.ActivityScanParams(
-    batch="fall2026_batch1_DRG_M1", chip="M07459", plate_date=250512, div=14, wells=[0, 1]
+    batch="fall2026_batch1_DRG", chip="M07459", plate_date=250512, div=14, wells=[0, 1]
 )
 result = activity_scan.run_activity_scan(params, config)   # -> result.h5_path
 ```

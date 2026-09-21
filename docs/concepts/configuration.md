@@ -45,13 +45,19 @@ the same tree through {func}`mxtreme.store.ingest_recording`, which files and re
 A *batch id* names one plating event, following a fixed convention:
 
 ```
-<semester><year>_batch<n>_<cell_type>_<M1|M2>      e.g.  fall2026_batch1_DRG_M1
+<semester><year>_batch<n>_<cell_type>      e.g.  fall2026_batch1_DRG
 ```
 
 {class}`mxtreme.store.Batch` generates and validates them — construct one at the start of a batch
-(`Batch(semester="fall", year=2026, number=1, cell_type="DRG", system="M1")`), or pass the id string
+(`Batch(semester="fall", year=2026, number=1, cell_type="DRG")`), or pass the id string
 anywhere a `batch` is accepted and it is parsed and validated on the way in. Every new activity or
 network scan headed for the store requires one, as does every ingest.
+
+The system a culture is recorded on -- MaxOne (`M1`) or MaxTwo (`M2`) -- is not part of the id: a
+plating can put cultures on both. It is recorded one level down, in the chip directory
+(`chip_<M1|M2>_<chip>`), from what the rig reports when a scan is run or what an ingested file
+says about its plate. Ids written before September 2026 ended in `_M1`/`_M2`; those were renamed
+with {func}`mxtreme.store.rename_batch`.
 
 ## `mxtreme.toml`
 

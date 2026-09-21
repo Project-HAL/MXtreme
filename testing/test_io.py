@@ -187,7 +187,7 @@ def test_rebuild_registry_preserves_rows_without_npz(make_well, tmp_path):
 # --- activity scans -------------------------------------------------------------------------------
 
 
-BATCH = "fall2026_batch1_DRG_M1"
+BATCH = "fall2026_batch1_DRG"
 
 
 class _FakeScanParams:
@@ -269,9 +269,8 @@ def _store_with_scan(tmp_path, wells=(0, 1), metadata=True, kind="activity_scan"
     paths = []
     for well in params.wells:
         stem = store.recording_stem(BATCH, params.plate_date, params.chip, well, params.div)
-        h5_path = store.recording_dir(
-            config, BATCH, params.plate_date, params.chip, well, params.div
-        ) / f"{stem}_{kind}.raw.h5"
+        h5_path = store.recording_dir(config, BATCH, params.plate_date, params.chip, well, params.div
+        , system="M1") / f"{stem}_{kind}.raw.h5"
         h5_path.parent.mkdir(parents=True, exist_ok=True)
 
         with h5py.File(h5_path, "w") as f:
@@ -335,7 +334,7 @@ def test_rebuild_registry_recovers_an_ingested_experiment(tmp_path):
 
     config = Config(data_root=tmp_path)
     stem = store.recording_stem(BATCH, 250512, "C1", 0, 3)
-    h5_path = store.recording_dir(config, BATCH, 250512, "C1", 0, 3) / f"{stem}_burst_game_v2.raw.h5"
+    h5_path = store.recording_dir(config, BATCH, 250512, "C1", 0, 3, system="M1") / f"{stem}_burst_game_v2.raw.h5"
     h5_path.parent.mkdir(parents=True)
     with h5py.File(h5_path, "w"):
         pass
