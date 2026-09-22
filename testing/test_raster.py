@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from mxtreme.raster import SpikeRaster, load_spike_raster
+from mxtreme.raster import load_spike_raster
 
 MAPPING = np.dtype([("channel", "<i4"), ("electrode", "<i4"), ("x", "<f8"), ("y", "<f8")])
 SPIKES = np.dtype([("frameno", "<i8"), ("channel", "<i4"), ("amplitude", "<f4")])
@@ -125,19 +125,6 @@ def test_an_empty_recording_still_has_its_segment(tmp_path):
 
     assert r.n_spikes == 0 and r.duration_sec == 30.0
     assert r.binned(n_time_bins=30).counts.sum() == 0
-
-
-def test_save_and_load_round_trip(tmp_path):
-    r = load_spike_raster(_scan(tmp_path / "scan.raw.h5"), 0)
-
-    back = SpikeRaster.load(r.save(tmp_path / "raster.cache"))
-
-    assert back.well == 0 and back.path == r.path and back.samp_rate == r.samp_rate
-    assert [(s.name, s.duration_sec, s.n_spikes, s.n_unrouted) for s in back.segments] == [
-        (s.name, s.duration_sec, s.n_spikes, s.n_unrouted) for s in r.segments
-    ]
-    assert back.segments[0].electrodes.tolist() == [10, 20, 30]
-    np.testing.assert_array_equal(back.binned(60).counts, r.binned(60).counts)
 
 
 def test_a_missing_well_or_a_file_that_is_not_a_recording_says_so(tmp_path):

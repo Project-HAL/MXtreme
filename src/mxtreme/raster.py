@@ -6,7 +6,9 @@ right after a recording ends -- *did it record what it was meant to?* -- because
 is never preprocessed at all, and a network scan or experiment only later. This module answers it
 from the raw ``.h5`` alone: :func:`load_spike_raster` reads one well's spike table as MaxLab wrote
 it, recording by recording, and :meth:`SpikeRaster.binned` reduces it to a count matrix a front end
-can paint.
+can paint. Reading a spike table is cheap enough (tens of milliseconds for a million spikes) that
+a caller wanting a second window of the same recording should keep the :class:`SpikeRaster` and
+bin it again, rather than cache anything derived from it.
 
 Nothing is filtered. No amplitude or firing-rate threshold, no sign filter, no artifact removal:
 the point is to see what the rig measured, so the only spikes left out are those on a channel the
@@ -153,60 +155,6 @@ class SpikeRaster:
             np.clip(col, 0, n_time_bins - 1, out=col)
             np.add.at(counts, (self.row[inside] // rows_per_bin, col), 1)
         return BinnedRaster(counts=counts, t0=t0, t1=t1, rows_per_bin=rows_per_bin)
-
-    def save(self, path: str | Path) -> Path:
-        """Write the raster to a compressed ``.npz``, for a front end that re-bins it per zoom and
-        should not reopen the recording each time. Read it back with :meth:`load`."""
-        import json
-
-        path = Path(path)
-        meta = {
-            "path": str(self.path),
-            "well": self.well,
-            "samp_rate": self.samp_rate,
-            "segments": [
-                {"name": s.name, "started_at_ms": s.started_at_ms, "duration_sec": s.duration_sec, "n_spikes": s.n_spikes,
-                 "n_unrouted": s.n_unrouted}
-                for s in self.segments
-            ],
-        }
-        arrays = {"segment": self.segment, "time_sec": self.time_sec.astype(np.float32), "row": self.row}
-        for i, s in enumerate(self.segments):
-            arrays[f"electrodes_{i}"] = s.electrodes
-            arrays[f"channels_{i}"] = s.channels
-        with path.open("wb") as fh:  # an open handle, so numpy does not append ".npz" to the name
-            np.savez_compressed(fh, meta=np.array(json.dumps(meta)), **arrays)
-        return path
-
-    @classmethod
-    def load(cls, path: str | Path) -> SpikeRaster:
-        """Read back what :meth:`save` wrote. Spike times come back at float32 precision -- a
-        quarter of a millisecond an hour into a recording, below anything a raster resolves."""
-        import json
-
-        with np.load(Path(path), allow_pickle=False) as z:
-            meta = json.loads(str(z["meta"]))
-            segments = tuple(
-                RasterSegment(
-                    name=s["name"],
-                    started_at_ms=s["started_at_ms"],
-                    duration_sec=float(s["duration_sec"]),
-                    n_spikes=int(s["n_spikes"]),
-                    electrodes=z[f"electrodes_{i}"],
-                    channels=z[f"channels_{i}"],
-                    n_unrouted=int(s.get("n_unrouted", 0)),
-                )
-                for i, s in enumerate(meta["segments"])
-            )
-            return cls(
-                path=Path(meta["path"]),
-                well=int(meta["well"]),
-                samp_rate=float(meta["samp_rate"]),
-                segments=segments,
-                segment=z["segment"],
-                time_sec=z["time_sec"].astype(np.float64),
-                row=z["row"],
-            )
 
 
 def _first(dataset, cast=float):
