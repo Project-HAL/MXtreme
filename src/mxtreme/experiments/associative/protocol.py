@@ -139,6 +139,12 @@ def stim_site(center_um, site: dict) -> tuple[list[int], list[int]]:
     ``grid`` (``{"shape": "grid", "size": 3, "gap": 2}``): a size x size grid, all driven with the
     same pulse; no return.
 
+    ``hex`` (``{"shape": "hex", "gap": 5}``, the default): seven electrodes, one at the centre and
+    six around it at ``gap + 1`` electrodes' distance, laid out 2-3-2 as nearly hexagonally as the
+    square lattice allows; all driven, no return. Seven electrodes spread over a disc rather than
+    four at the corners of a square: more of the region's neurons have a driven electrode within
+    reach, which matters because an electrode not over a neuron or an axon stimulates nothing.
+
     ``focal`` (``{"shape": "focal", "inner": 2, "inner_gap": 4, "return_radius": 6,
     "return_points": "corners"}``): an inner x inner block of driven electrodes (``inner_gap``
     empty electrodes between them), ringed by return electrodes that get the same pulse inverted.
@@ -162,8 +168,10 @@ def stim_site(center_um, site: dict) -> tuple[list[int], list[int]]:
     shape = site.get("shape", "grid")
     if shape == "grid":
         return stim_grid(center_um, int(site.get("size", 3)), int(site.get("gap", 2))), []
+    if shape == "hex":
+        return stim_hex(center_um, int(site.get("gap", 5))), []
     if shape != "focal":
-        raise ValueError(f"stim_site shape must be 'grid' or 'focal', not {shape!r}")
+        raise ValueError(f"stim_site shape must be 'grid', 'hex' or 'focal', not {shape!r}")
 
     inner = int(site.get("inner", 2))
     step = int(site.get("inner_gap", 0)) + 1
@@ -198,6 +206,30 @@ def stim_site(center_um, site: dict) -> tuple[list[int], list[int]]:
             raise ValueError(f"return ring at {center_um} um runs off the array")
         ring.append(electrode)
     return drive, ring
+
+
+def stim_hex(center_um, gap: int) -> list[int]:
+    """Seven electrodes: the one nearest ``center_um`` and six around it at ``gap + 1``
+    electrodes' distance, in rows of 2, 3 and 2 -- a hexagon as the square lattice draws it. The
+    two outer rows sit ``round(d * sqrt(3) / 2)`` rows away and ``round(d / 2)`` columns either side
+    of the centre, so the six are within a quarter of an electrode of a true hexagon.
+
+    :raises ValueError: If any electrode falls off the array.
+    """
+    import math
+
+    d = gap + 1
+    centre = nearest_electrode(*center_um)
+    col0, row0 = centre % COLS, centre // COLS
+    half, tall = round(d / 2), round(d * math.sqrt(3) / 2)
+    points = [(-half, -tall), (half, -tall), (-d, 0), (0, 0), (d, 0), (-half, tall), (half, tall)]
+    out = []
+    for dx, dy in points:
+        electrode = electrode_at(col0 + dx, row0 + dy)
+        if electrode is None:
+            raise ValueError(f"hex site at {center_um} um runs off the array")
+        out.append(electrode)
+    return out
 
 
 #: Stimulation units on the chip. Every stimulation electrode needs one, so this is what limits

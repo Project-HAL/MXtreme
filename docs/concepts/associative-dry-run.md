@@ -97,11 +97,11 @@ regions are that culture's, which is fine: the saline chip is only going to fire
 The two scans play different parts, and using both is not a mismatch. The **recording** set is
 the network scan's electrodes (the active set braintrix-cli chose, 100 µm apart) plus every
 electrode the activity scan found active inside the three regions, so the readout counts on as
-many electrodes as the culture has there. The **stimulation** electrodes — four driven per site
+many electrodes as the culture has there. The **stimulation** electrodes — seven driven per site, in a hexagon
 — are routed separately, on top of that set, and need not be in it; they are the
 ones the activity scan is used to place, because it is the only recording that covers every
-electrode and can say whether a particular one has a neuron under it. Expect "3 of 4" or "4 of 4
-driven electrodes active" per region.
+electrode and can say whether a particular one has a neuron under it. Expect "5 of 7" or better
+"driven electrodes active" per region.
 
 If it refuses (`only N patches qualify`), place them by hand instead:
 
@@ -265,14 +265,20 @@ python -m mxtreme.experiments.associative report $DRY/*_dry_cal_focal.raw.h5 -o 
 python -m mxtreme.experiments.associative compare $DRY/*_dry_cal.raw.h5 $DRY/*_dry_cal_focal.raw.h5
 ```
 
-`dry_cal_focal` is the other stimulation pattern the real day may try: the same 2x2 block with
+`dry_cal_focal` is the other stimulation pattern the real day may try: a 2x2 block with
 two return electrodes carrying the inverted pulse (six stimulation units per site, two DACs).
 It is **allowed to fail**: the chip hands stimulation units out per area of the array, about
 seven each on the MaxOne tried so far, and a six-electrode site was already refused there. If it
 connects, its report's artifact section should show the return electrodes as the mirror image of
 the driven ones, and `compare` on two silent recordings should say there is nothing to compare,
 which is that path working; if it does not, the message names the electrodes and that is the
-answer for this chip. Either way the default (four per site) is what the day runs.
+answer for this chip. Either way the default (the seven-electrode hex) is what the day runs.
+
+## Optional: the field around one electrode
+
+While the saline chip is in, two minutes measure how far a pulse reaches through the medium,
+against distance, amplitude and direction: [the field map](associative-fieldmap.md). It is what
+the regions' radius and separation are sized against.
 
 ## What a dry run cannot tell you
 
@@ -284,7 +290,7 @@ stimulation code any run makes.
 ## Checklist
 
 - [ ] `select` chose three regions from the live scan (or took `--centers`), placed the driven blocks on active electrodes, and wrote `$P` with the saline identity
-- [ ] `preview` says `$DRY`, not registered, raw traces on the regions, the three 2x2 blocks drawn
+- [ ] `preview` says `$DRY`, not registered, raw traces on the regions, the three hex sites drawn
 - [ ] calibration printed the right device and ran without a routing error
 - [ ] conditioning ran, and its report printed the baseline gate
 - [ ] `--phase session` wrote four `dry_split_*` recordings from one command; the baseline one reported while the rest ran; one `report` over all four read them as one session, in order

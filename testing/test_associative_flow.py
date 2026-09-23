@@ -739,7 +739,7 @@ def test_regions_for_drives_the_electrodes_written_back_for_the_same_site():
     params = _params(regions={"US": list(CENTRES[0]), "CS": list(CENTRES[1]), "NS": list(CENTRES[2])})
     planned = {r: list(s.drive_electrodes) for r, s in protocol.regions_for(params).items()}
     swapped = dict(planned)
-    swapped["US"] = planned["US"][:3] + [planned["US"][3] + 1]  # a neighbour, as a unit clash would give
+    swapped["US"] = planned["US"][:-1] + [planned["US"][-1] + 1]  # a neighbour, as a unit clash would give
     honoured = protocol.regions_for(
         _params(regions=params.regions, stim_electrodes=swapped, stim_electrodes_site=dict(params.stim_site))
     )

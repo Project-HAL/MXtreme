@@ -66,8 +66,9 @@ class AssociativeParams:
         conditioning run refuses to start on it.
     :param min_region_separation_um: :mod:`.select` refuses closer centres.
     :param region_radius_um: Recording electrodes within this of a centre belong to the region.
-    :param stim_site: ``{"shape": "grid", "size", "gap"}`` or ``{"shape": "focal", "inner",
-        "inner_gap", "return_radius", "return_points"}``; see :func:`.protocol.stim_site`.
+    :param stim_site: ``{"shape": "hex", "gap"}`` (seven electrodes, the default),
+        ``{"shape": "grid", "size", "gap"}`` or ``{"shape": "focal", "inner", "inner_gap",
+        "return_radius", "return_points"}``; see :func:`.protocol.stim_site`.
     :param region_dacs: Grid sites: which DAC drives each role.
     :param drive_dac: Focal sites: the DAC every site's driven electrodes share.
     :param return_dac: Focal sites: the DAC every site's return ring shares.
@@ -160,7 +161,7 @@ class AssociativeParams:
     amplitudes_source: str = "default"
     min_region_separation_um: float = 1000.0
     region_radius_um: float = 150.0
-    stim_site: dict = field(default_factory=lambda: {"shape": "grid", "size": 2, "gap": 6})
+    stim_site: dict = field(default_factory=lambda: {"shape": "hex", "gap": 5})
     region_dacs: dict[str, int] = field(default_factory=lambda: {"US": 0, "CS": 1, "NS": 2})
     drive_dac: int = 0
     return_dac: int = 1
@@ -356,9 +357,9 @@ class AssociativeParams:
         if needed > STIM_UNITS:
             raise ValueError(
                 f"this stim_site needs {footprint['units']} stimulation units per region, "
-                f"{needed} for {len(ROLES)} regions, and the chip has {STIM_UNITS}. A focal site "
-                f"costs inner^2 + the return points; widen it with inner_gap rather than with "
-                f"inner, or use a grid site, which spends nothing on a return ring."
+                f"{needed} for {len(ROLES)} regions, and the chip has {STIM_UNITS}. A hex site "
+                f"costs 7, a grid size^2, a focal site inner^2 + the return points; widen a site "
+                f"with gap (or inner_gap) rather than with more electrodes."
             )
         if self.t_probe <= 0 or self.t_stim <= 0 or self.pulse_hz <= 0:
             raise ValueError("t_probe, t_stim and pulse_hz must be positive")

@@ -29,11 +29,10 @@
   "amplitudes_source": "saline",
   "min_region_separation_um": 1000.0,
   "region_radius_um": 150.0,
-  "_stim_site": "What stimulates a region. grid: a size x size block of driven electrodes, gap empty electrodes between them, on the role's DAC from region_dacs, no return electrodes. The default is a 2x2 block 122.5 um on a side: four stimulation units per site, twelve of the chip's 32. focal: {shape, inner, inner_gap, return_radius, return_points} adds return electrodes carrying the inverted pulse to confine the field (Ronchi et al. 2019) -- 'diagonal' two at opposite corners, 'corners' four -- at the cost of more stimulation units, which the chip hands out per area of the array (about seven per area, measured on a MaxOne), so a site of eight would not connect and one of six was marginal. Add returns after the first culture if the connectivity check shows the sites driving each other; until then the bath is the return.",
+  "_stim_site": "What stimulates a region. hex (the default): seven driven electrodes, one at the centre and six around it gap+1 electrodes away in rows of 2-3-2, 210 um across at gap 5; seven per site, 21 of the chip's 32 stimulation units. Seven spread over a disc rather than four at a square's corners, because an electrode that is not over a neuron or an axon stimulates nothing. grid: a size x size block, gap empty electrodes between them. focal: {shape, inner, inner_gap, return_radius, return_points} adds return electrodes carrying the inverted pulse to confine the field (Ronchi et al. 2019) at the cost of more units. The chip hands units out per area of the array (about seven per area, measured on a MaxOne), so a dense site may not connect; run swaps clashing electrodes for routed neighbours and says so, and a wider gap spreads the site over more of the chip. Widen a site with gap, never with more electrodes.",
   "stim_site": {
-    "shape": "grid",
-    "size": 2,
-    "gap": 6
+    "shape": "hex",
+    "gap": 5
   },
   "region_dacs": {
     "US": 0,

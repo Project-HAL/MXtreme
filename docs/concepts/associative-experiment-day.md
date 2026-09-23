@@ -98,7 +98,7 @@ carry it. What to look at, and what would stop you:
 | after | look at | go on if | stop and do instead |
 |---|---|---|---|
 | scans | `ls $CULTURE`; braintrix-cli's electrode-selection figure | hundreds of active electrodes, spread over the array | a quiet or one-sided array: another culture |
-| `select` | its terminal output and `*_regions.png`, `*_coupling.png` | three regions ≥ 1000 µm apart, coupling < 0.3, 3-4 of 4 driven electrodes active each | `--centers`, or `--separation 800` |
+| `select` | its terminal output and `*_regions.png`, `*_coupling.png` | three regions ≥ 1000 µm apart, coupling < 0.3, most of the 7 driven electrodes active in each | `--centers`, or `--separation 800` |
 | calibration `report` | the table and the verdicts | an `ok` per region with an amplitude | `STOP`: back to `select` for that region |
 | `compare` (optional) | the verdicts | a pattern named per region | ties: keep the default |
 | `preview` | the timeline and the size line | 180 min, spikes only, < 0.5 GB, regions drawn | anything surprising: fix `$P` first |
@@ -176,27 +176,29 @@ What it does, from the baseline: ranks 150 µm patches by active electrodes, kee
 at least 1000 µm apart, measures their coupling (correlation with network bursts left out, and
 burst-onset order), and picks the least-coupled, near-equilateral triple, with US at the vertex
 equidistant from the other two and CS versus NS set by the seed. Then, per region, it moves the
-driven block by up to 70 µm so that its four electrodes sit on electrodes the activity scan
-recorded spikes from, and prints what it found:
+driven site (seven electrodes in a hexagon, 210 µm across) by up to 70 µm so that its electrodes
+sit on electrodes the activity scan recorded spikes from, and prints what it found:
 
 ```
 stimulation sites: each driven block moved by up to 70 um so its electrodes sit on ones the activity scan recorded spikes from:
-  US   4 of 4 driven electrodes active (moved 25 um): e6736 4.7 Hz 60 uV, e6741 1.2 Hz 35 uV, ...
-  CS   3 of 4 driven electrodes active (moved 0 um): ...
-  NS   2 of 4 driven electrodes active (moved 52 um): e23402 0.4 Hz 24 uV, e23407 silent, ...
+  US   6 of 7 driven electrodes active (moved 25 um): e6736 4.7 Hz 60 uV, e6741 1.2 Hz 35 uV, ...
+  CS   5 of 7 driven electrodes active (moved 0 um): ...
+  NS   3 of 7 driven electrodes active (moved 52 um): e23402 0.4 Hz 24 uV, e23407 silent, ...
 ```
 
-A region being dense does not make its four particular electrodes live, and a driven electrode
-over glass stimulates nothing. **Three or four of four is what you want; two is workable; zero
-gets a warning and means calibration will most likely find nothing there** — give that region
-another centre with `--centers` rather than spend 17 minutes confirming it. The activity scan is
-the right source because it covers every electrode; the baseline covers only its thousand.
+A region being dense does not make its particular electrodes live, and a driven electrode over
+glass stimulates nothing: an electrode has to be over a neuron or an axon to fire it, which is
+why the site is seven electrodes spread over a 210 µm disc rather than four at a square's
+corners. **Five or more of seven is what you want; three is workable; zero gets a warning and
+means calibration will most likely find nothing there**: give that region another centre with
+`--centers` rather than spend 17 minutes confirming it. The activity scan is the right source
+because it covers every electrode; the baseline covers only its thousand.
 
 It then routes every electrode the baseline recorded, plus every electrode the activity scan found
 active inside the three chosen regions: standard electrode selection keeps electrodes 100 µm
 apart, which leaves only a handful in a region, and the readout is counted on these. The chip
 reads 1024 channels at once, so if the baseline's set plus the regions' additions exceed the
-budget the surplus is thinned evenly over the array, never cut from one end. The four driven
+budget the surplus is thinned evenly over the array, never cut from one end. The seven driven
 electrodes per region go into `$P` as `stim_electrodes`.
 
 If a scan was repeated that day the globs match two files; name the one you mean instead.
@@ -234,7 +236,7 @@ guide printed across its top:
 | correlograms, one per pair | correlation at every lag from -250 to +250 ms, grey with bursts, black without | the black line flat | a black peak off zero: one patch leads the other by that many ms |
 | which patch enters each burst first | one dot per burst per patch: ms after the first to join | the tally spread across patches | one patch at zero on most bursts |
 | coupling against distance | every candidate pair | a falling trend means separation is doing most of the work, which is fine | coupling *rising* with distance is worth a look: something other than proximity links those patches |
-| driven electrodes (terminal) | activity under the four stimulation electrodes | 3-4 of 4 active per region | 0 of 4 anywhere |
+| driven electrodes (terminal) | activity under the seven stimulation electrodes | 5-7 of 7 active per region | 0 of 7 anywhere |
 
 If it refuses (`only N patches qualify`), it writes a rejection figure saying why. Lower
 `--separation`, or place the regions by hand with `--centers "x,y;x,y;x,y"`.
@@ -252,7 +254,7 @@ you calibrate again, which is right, because the sites moved. Everything is on t
 | change the region's radius (what counts as its readout) | `--set region_radius_um=200` |
 | require more active electrodes per patch | `--min-active 8` (default: a quarter of the recorded, at least five) |
 | place the three regions yourself | `--centers "x,y;x,y;x,y"` in µm, US first |
-| widen the driven block | `--set 'stim_site={"shape":"grid","size":2,"gap":8}'` |
+| widen the driven site, or change its shape | `--set 'stim_site={"shape":"hex","gap":7}'`; `{"shape":"grid","size":3,"gap":4}` for a 3x3 |
 
 ## 4. Calibration
 
@@ -341,8 +343,8 @@ refuses to start. If the regions disagree on polarity the report says so and tak
 
 ### 4b. Which pattern to drive through: the block alone, or with return electrodes
 
-The default drives a 2x2 block with the bath as the return. Ronchi's design adds return
-electrodes carrying the inverted pulse, which confines the field — at the cost of more
+The default drives a seven-electrode hex with the bath as the return. Ronchi's design adds
+return electrodes carrying the inverted pulse, which confines the field — at the cost of more
 stimulation units, which the chip hands out per area of the array (about seven per area on the
 MaxOne tried so far, where a six-electrode site was refused). Whether confinement is *needed* is
 what calibration's `spread` column measures (and the baseline gate confirms), so the question is
@@ -366,8 +368,8 @@ answer, and the default stands.
 
 **Copy the winning pattern's `stim_site`, its `amplitudes_mv` and its `amplitudes_source` into
 `$P`.** The sites' centres
-were placed for the 2x2's electrodes (step 3), so a 3x3 at the same centre has five electrodes
-that were not checked for activity; `compare` measures what they evoke regardless.
+were placed for the hex's electrodes (step 3), so another pattern at the same centre has
+electrodes that were not checked for activity; `compare` measures what they evoke regardless.
 
 From here the regions, pattern and amplitudes are frozen for this culture.
 
@@ -588,26 +590,29 @@ third day measures how much of any decay is the probing.
 counted:
 
 ```
-site: 4 driven electrodes spanning 122 um; response measured over 150 um; 12 of 32 stimulation units
+site: 7 driven electrodes spanning 210 um; response measured over 150 um; 21 of 32 stimulation units
 ```
 
-The driven block spans 122 µm inside the 150 µm counting radius, so a region's count is its
-driven block's response; the bath is the return. The binding constraint is stimulation units: 32
-on the chip, one per stimulation electrode — and, measured on a MaxOne, each *area* of the chip
-exposes only about seven of them. A 2x2 with a four-corner return ring (eight per site) could not
-be connected on the rig and one with two returns (six) failed too, so the default has none. If the
+The driven hex spans 210 µm, its outer electrodes 105 µm from the centre inside the 150 µm
+counting radius, so a region's count is its driven site's response; the bath is the return. The
+binding constraint is stimulation units: 32 on the chip, one per stimulation electrode — and,
+measured on a MaxOne, each *area* of the chip exposes only about seven of them. A 2x2 with a
+four-corner return ring (eight per site) could not be connected on the rig and one with two
+returns (six) failed too, so the default has none. Seven per site is at that limit: `run` swaps
+any clashing electrode for a routed neighbour and prints the swap, and the wide gap spreads the
+site over more of the chip; if a hex will not connect, widen `gap` first. If the
 baseline gate shows the sites driving each other, return electrodes are the next thing to
 try (`stim_site` focal, `return_points` `"diagonal"`).
 
 | site | units total | per site | driven span | connects? |
 |---|---|---|---|---|
-| grid 2x2, `gap` 6 (default) | 12 | 4 | 122.5 µm | yes |
-| grid 2x2, `gap` 7 | 12 | 4 | 140 µm | yes |
+| hex, `gap` 5 (default) | 21 | 7 | 210 µm | to be confirmed on the dry run |
+| grid 3x3, `gap` 4 | 27 | 9 | 175 µm | to be confirmed; 9 per area is over the ~7 seen |
+| grid 2x2, `gap` 6 | 12 | 4 | 122.5 µm | yes |
 | focal 2x2, `inner_gap` 6, two returns | 18 | 6 | 122.5 µm | failed on a MaxOne: an area has ~7 units, and the returns compete for them |
 | focal 2x2, four returns | 24 | 8 | — | no, on that chip |
-| grid 3x3, gap 2 | 27 | 9 | 105 µm | 9 per area is over the ~7 available |
 
-Widen a site with `gap` (or `inner_gap`), never `size` (or `inner`).
+Widen a site with `gap` (or `inner_gap`), never with more electrodes.
 
 ## Safety notes
 

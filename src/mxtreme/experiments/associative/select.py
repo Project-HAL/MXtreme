@@ -19,7 +19,7 @@ exactly what a network scan is (``braintrix-cli``'s *Network scan*, or
    (:func:`mxtreme.scans.region_selection.assign_roles`);
 4. the stimulation sites: each driven block is moved by up to 70 um so that its electrodes sit on
    electrodes the activity scan (or, failing that, the baseline) recorded spikes from
-   (:func:`place_site`). A region is dense, but the four driven electrodes are particular
+   (:func:`place_site`). A region is dense, but the seven driven electrodes are particular
    electrodes, and one over glass stimulates nothing;
 5. the experiment's routing: every electrode the baseline recorded, with the three chosen regions
    first. Standard electrode selection keeps electrodes at least 100 um apart, which leaves only a

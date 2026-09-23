@@ -412,13 +412,12 @@ def test_site_footprint_and_the_unit_budget():
 
     default = AssociativeParams.from_json(os.path.join(PACKAGE, "params_default.json"))
     f = site_footprint(default.stim_site)
-    # A plain 2x2 block, no return electrodes: four units per site. The chip hands units out per
-    # area of the array (about seven each, measured on a MaxOne), and sites of eight and six
-    # electrodes both failed to connect on the rig.
-    assert f["units"] == 4 and f["return"] == 0 and f["units"] * 3 <= STIM_UNITS
-    # The stimulation site fills the region whose response is measured, rather than being a point
-    # inside it.
-    assert f["driven_span_um"] == pytest.approx(122.5)
+    # A hex of seven driven electrodes, no return: seven units per site, 21 of 32. Seven spread
+    # over a disc so that more of the region's neurons have a driven electrode within reach.
+    assert f["units"] == 7 and f["return"] == 0 and f["units"] * 3 <= STIM_UNITS
+    # The stimulation site fills the region whose response is measured (150 um radius), rather
+    # than being a point inside it: 210 um across at gap 5.
+    assert f["driven_span_um"] == pytest.approx(210.0)
 
     # A 3x3 focal site needs 13 units per region, 39 for three, and cannot route.
     with pytest.raises(ValueError, match="stimulation units"):
@@ -840,3 +839,20 @@ def test_a_stimulation_unit_clash_is_solved_by_a_neighbouring_electrode(monkeypa
     finally:
         for name in set(sys.modules) - before:
             sys.modules.pop(name, None)
+
+
+def test_hex_site_is_seven_electrodes_in_rows_of_two_three_two():
+    drive, ring = protocol.stim_site((1000.0, 1000.0), {"shape": "hex", "gap": 5})
+    assert ring == [] and len(drive) == len(set(drive)) == 7
+    centre = protocol.nearest_electrode(1000.0, 1000.0)
+    cols = [e % protocol.COLS - centre % protocol.COLS for e in drive]
+    rows = [e // protocol.COLS - centre // protocol.COLS for e in drive]
+    assert centre in drive
+    assert sorted(rows) == [-5, -5, 0, 0, 0, 5, 5]  # round(6 * sqrt(3) / 2) = 5
+    assert sorted(cols) == [-6, -3, -3, 0, 3, 3, 6]
+    # Every outer electrode is within a quarter of an electrode of a true hexagon of radius 6.
+    for c, r in zip(cols, rows):
+        if (c, r) != (0, 0):
+            assert abs((c * c + r * r) ** 0.5 - 6) < 0.25
+    with pytest.raises(ValueError, match="off the array"):
+        protocol.stim_site((10.0, 10.0), {"shape": "hex", "gap": 5})
