@@ -32,7 +32,7 @@ Typical use::
 
     config = Config.from_toml("mxtreme.toml")
     params = activity_scan.ActivityScanParams(
-        batch="fall2026_batch1_DRG_M1", chip="M07460", plate_date=260810, div=1, wells=[0]
+        batch="fall2026_batch1_DRG", chip="M07460", plate_date=260810, div=1, wells=[0]
     )
     result = activity_scan.run_activity_scan(params, config)
     # -> result.h5_path feeds electrode_selection.select_electrodes()
@@ -62,6 +62,9 @@ MAX_WELLS = 6
 #: What the MaxLab server's ``wellplate_query_version`` reply means.
 SYSTEM_TYPES = {0: "MaxOne", 1: "MaxTwo"}
 
+#: The device names as the store's chip directories spell them (:data:`mxtreme.store.SYSTEMS`).
+SYSTEM_CODES = {"MaxOne": "M1", "MaxTwo": "M2"}
+
 #: Shared opening for every "there is nothing to scan with" failure.
 _NO_DEVICE = (
     "No MaxWell device detected. Check that the chip is plugged in and MaxLab Live is running"
@@ -88,9 +91,13 @@ class ActivityScanParams:
     keyed by plating batch.
 
     :param batch: The plating batch the culture belongs to -- a :class:`mxtreme.store.Batch` or its
-        id string (e.g. ``"fall2026_batch1_DRG_M1"``). Required for any scan saved into the managed
+        id string (e.g. ``"fall2026_batch1_DRG"``). Required for any scan saved into the managed
         store; validated by :meth:`validate`.
     :param chip: Chip serial, e.g. ``"M07460"``. Written to the file's metadata and used in its name.
+    :param system: Which system the chip is on, ``"M1"`` (MaxOne) or ``"M2"`` (MaxTwo): it names
+        the chip's directory in the store. ``None`` lets :func:`run_activity_scan` fill it in from
+        the connected device; set it to resolve the destination beforehand (a front end previewing
+        the scan asks the rig the same question), and the run then checks the rig agrees.
     :param plate_date: Plating date as ``YYMMDD``; validated by :func:`mxtreme.scans.mx_setup.write_metadata`.
     :param div: Days *in vitro* at the time of the scan.
     :param wells: Wells to scan, each in ``0..5``. All are scanned simultaneously (into one file,
@@ -114,6 +121,7 @@ class ActivityScanParams:
     # Metadata
     batch: store.Batch | str | None = None
     chip: str = "M07460"
+    system: str | None = None
     plate_date: int = 260810
     div: int = 1
     wells: list[int] = field(default_factory=lambda: [0])
@@ -148,7 +156,7 @@ class ActivityScanParams:
         if self.batch is None:
             raise ValueError(
                 "batch is unset, so this scan cannot be named. Every scan needs the plating batch "
-                "it records, e.g. batch='fall2026_batch1_DRG_M1'."
+                "it records, e.g. batch='fall2026_batch1_DRG'."
             )
         well_token = "-".join(str(w) for w in self.wells)
         return (
@@ -184,7 +192,8 @@ class ActivityScanParams:
         :param config: The :class:`~mxtreme.config.Config` describing the managed store. Only needed
             when ``save_path`` is unset.
         :raises ValueError: If there is neither a ``save_path`` nor a ``config`` to derive one from,
-            or if the scan is headed for the store without a ``batch`` to file it under.
+            or if the scan is headed for the store without a ``batch`` to file it under or a
+            ``system`` to name its chip directory.
         :returns: This object, or a copy with ``save_path`` set.
         :rtype: ActivityScanParams
         """
@@ -199,14 +208,21 @@ class ActivityScanParams:
         if self.batch is None:
             raise ValueError(
                 "A scan saved into the managed store needs the plating batch it records: the "
-                "recordings tree is keyed by batch. Set batch (e.g. 'fall2026_batch1_DRG_M1')."
+                "recordings tree is keyed by batch. Set batch (e.g. 'fall2026_batch1_DRG')."
+            )
+        if self.system is None:
+            raise ValueError(
+                "A scan saved into the managed store needs to know which system its chip is on: "
+                "the chip directory is chip_<M1|M2>_<chip>. Set system='M1' or 'M2' (on the rig, "
+                "run_activity_scan fills it in from the connected device)."
             )
         if len(self.wells) == 1:
             directory = store.recording_dir(
-                config, self.batch, self.plate_date, self.chip, self.wells[0], self.div
+                config, self.batch, self.plate_date, self.chip, self.wells[0], self.div,
+                system=self.system,
             )
         else:
-            directory = store.chip_dir(config, self.batch, self.plate_date, self.chip)
+            directory = store.chip_dir(config, self.batch, self.plate_date, self.chip, system=self.system)
         return replace(self, save_path=str(directory))
 
     @property
@@ -382,7 +398,7 @@ def describe(params: ActivityScanParams) -> str:
     else:
         destination = f"the managed store, as {params.file_name}.raw.h5"
     lines = [
-        f"Chip           : {params.chip}",
+        f"Chip           : {params.chip} on {params.system or '(system not known yet)'}",
         f"Plate date     : {params.plate_date} | DIV: {params.div}",
         f"Batch          : {params.batch_id or '(unset)'}",
         f"Wells          : {params.wells}",
@@ -556,6 +572,29 @@ def _connected_device(mx) -> str:
     return SYSTEM_TYPES.get(system_type, f"unrecognised system type {system_type}")
 
 
+def _with_connected_system(params, device: str):
+    """Fill in (or check) the params' ``system`` against the device the rig reports.
+
+    :param params: Scan params of either kind (activity or network).
+    :param device: What :func:`_connected_device` returned.
+    :raises RuntimeError: If the device is not one the store has a system code for, or the params
+        say one system and the rig another -- a scan filed under the wrong chip directory is not
+        something a registry rebuild could put right.
+    :returns: The params, or a copy with ``system`` set.
+    """
+    code = SYSTEM_CODES.get(device)
+    if code is None:
+        raise RuntimeError(f"{_NO_DEVICE} (the server reports {device!r})")
+    if params.system is None:
+        return replace(params, system=code)
+    if params.system != code:
+        raise RuntimeError(
+            f"The scan is set up for a {params.system} chip, but the rig has a {device} ({code}). "
+            "Fix the system on the scan, or the chip on the rig."
+        )
+    return params
+
+
 def run_activity_scan(
     params: ActivityScanParams,
     config=None,
@@ -619,15 +658,18 @@ def run_activity_scan(
     # what erases the distinction between a derived save_path and a given one.
     registry_path = config.registry_path if config is not None and params.save_path is None else None
 
-    # Resolve before anything is created, so a scan with nowhere to go fails now rather than after
-    # eight minutes of recording.
+    # The device first: it names the chip directory the scan is filed in, and a missing one is the
+    # cheapest failure there is. Then resolve before anything is created, so a scan with nowhere
+    # to go fails now rather than after eight minutes of recording.
+    device = _connected_device(mx)
+    params = _with_connected_system(params, device)
     params = params.resolved(config)
     plan = plan_scan_electrodes(params, seed=seed)  # validates params
 
     on_progress("=== Activity scan ===")
     on_progress(describe(params))
 
-    on_progress(f"Device: {_connected_device(mx)}")
+    on_progress(f"Device: {device}")
 
     Path(params.save_path).mkdir(parents=True, exist_ok=True)
 
@@ -764,7 +806,8 @@ def _split_into_store(
     def destination(well: int) -> Path:
         stem = store.recording_stem(params.batch, params.plate_date, params.chip, well, params.div)
         return store.recording_dir(
-            config, params.batch, params.plate_date, params.chip, well, params.div
+            config, params.batch, params.plate_date, params.chip, well, params.div,
+            system=params.system,
         ) / f"{stem}_{kind}.raw.h5"
 
     try:

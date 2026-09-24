@@ -63,7 +63,7 @@ OPS: dict[str, str] = {
     # -- what MXtreme did to the store, journaled by the function that did it ---------------------
     "activity_scan.registered": "recording",  # data: {"path"}; one per well
     "network_scan.registered": "recording",  # data: {"path"}; one per well
-    "recording.ingested": "recording",  # data: {"source", "path", "moved", "kind"}; one per well
+    "recording.ingested": "recording",  # data: {"source", "path", "moved", "kind", "system"}; one per well
     "preprocessed.saved": "recording",  # data: {"path", "source"}
     "preprocessed.repaired": "recording",  # data: {"path"}; spike order fixed in place
     "bursts.saved": "recording",  # data: {"path", "n_bursts"}
@@ -507,7 +507,7 @@ def backfill(config, *, on_progress=print) -> int:
     """
     import pandas as pd
 
-    from mxtreme.store import chip_dir
+    from mxtreme.store import find_chip_dir
 
     def _when(value) -> str:
         """A registry or burst-log timestamp as ISO 8601; a stamp that does not parse is 'now'."""
@@ -550,10 +550,11 @@ def backfill(config, *, on_progress=print) -> int:
                         "activity_scan.registered": "_activity_scan",
                         "network_scan.registered": "_network_scan",
                     }.get(op, f"_{exp_id}")
-                    div_dir = chip_dir(config, batch_id, plate_date, chip) / f"well_{well}" / f"DIV_{div}"
+                    chip_path = find_chip_dir(config, batch_id, plate_date, chip)
+                    div_dir = chip_path / f"well_{well}" / f"DIV_{div}" if chip_path else None
                     matches = (
                         sorted(div_dir.glob(f"*{tail}*.h5"), key=lambda p: p.stat().st_mtime)
-                        if div_dir.is_dir()
+                        if div_dir is not None and div_dir.is_dir()
                         else []
                     )
                     path = str(matches[-1]) if matches else ""
@@ -762,6 +763,10 @@ def _applied_stamp(value: str) -> float:
         return float("-inf")
 
 
-def default_device(batch: Batch | str) -> str:
-    """The device a batch's id implies for its chips: ``M1`` -> MaxOne, ``M2`` -> MaxTwo."""
-    return "MaxTwo" if Batch.parse(batch).system == "M2" else "MaxOne"
+def default_device(system: str | None) -> str:
+    """The device a chip's system implies: ``M2`` -> MaxTwo, anything else -> MaxOne.
+
+    The system is the chip directory's (:meth:`mxtreme.store.Plating.system_of`); a
+    ``chip.set_device`` record (MaxOne+, say) overrides it.
+    """
+    return "MaxTwo" if system == "M2" else "MaxOne"

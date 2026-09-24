@@ -36,7 +36,7 @@ Typical use::
     rec_elecs = electrode_selection.select_electrodes(str(scan.h5_path), str(scan.h5_path.parent))
     params = network_scan.NetworkScanParams(
         recording_electrodes=rec_elecs,
-        batch="fall2026_batch1_DRG_M1", chip="M07460", plate_date=260810, div=25,
+        batch="fall2026_batch1_DRG", chip="M07460", plate_date=260810, div=25,
         rec_length_sec=300,
     )
     result = network_scan.run_network_scan(params, config)
@@ -59,6 +59,7 @@ from mxtreme.scans.activity_scan import (
     StopFn,
     _connected_device,
     _require_maxlab,
+    _with_connected_system,
     _saved_file,
     _split_into_store,
 )
@@ -89,9 +90,12 @@ class NetworkScanParams:
         :data:`~mxtreme.scans.activity_scan.MAX_ROUTED_ELECTRODES` here, so after construction this
         holds exactly what the scan will record.
     :param batch: The plating batch the culture belongs to -- a :class:`mxtreme.store.Batch` or its
-        id string (e.g. ``"fall2026_batch1_DRG_M1"``). Required for any scan saved into the managed
+        id string (e.g. ``"fall2026_batch1_DRG"``). Required for any scan saved into the managed
         store; validated by :meth:`validate`.
     :param chip: Chip serial, e.g. ``"M07460"``. Written to the file's metadata and used in its name.
+    :param system: Which system the chip is on, ``"M1"`` or ``"M2"``; names the chip directory.
+        ``None`` lets :func:`run_network_scan` fill it in from the connected device, as
+        :class:`~mxtreme.scans.activity_scan.ActivityScanParams` does.
     :param plate_date: Plating date as ``YYMMDD``; validated by :func:`mxtreme.scans.mx_setup.write_metadata`.
     :param div: Days *in vitro* at the time of the scan.
     :param conditions: Optional per-well condition labels, in :attr:`wells` order; must be empty or
@@ -112,6 +116,7 @@ class NetworkScanParams:
     # Metadata
     batch: store.Batch | str | None = None
     chip: str = "M07460"
+    system: str | None = None
     plate_date: int = 260810
     div: int = 1
     conditions: list[str] = field(default_factory=list)
@@ -176,7 +181,7 @@ class NetworkScanParams:
         if self.batch is None:
             raise ValueError(
                 "batch is unset, so this scan cannot be named. Every scan needs the plating batch "
-                "it records, e.g. batch='fall2026_batch1_DRG_M1'."
+                "it records, e.g. batch='fall2026_batch1_DRG'."
             )
         well_token = "-".join(str(w) for w in self.wells)
         return (
@@ -224,14 +229,21 @@ class NetworkScanParams:
         if self.batch is None:
             raise ValueError(
                 "A scan saved into the managed store needs the plating batch it records: the "
-                "recordings tree is keyed by batch. Set batch (e.g. 'fall2026_batch1_DRG_M1')."
+                "recordings tree is keyed by batch. Set batch (e.g. 'fall2026_batch1_DRG')."
+            )
+        if self.system is None:
+            raise ValueError(
+                "A scan saved into the managed store needs to know which system its chip is on: "
+                "the chip directory is chip_<M1|M2>_<chip>. Set system='M1' or 'M2' (on the rig, "
+                "run_network_scan fills it in from the connected device)."
             )
         if len(self.wells) == 1:
             directory = store.recording_dir(
-                config, self.batch, self.plate_date, self.chip, self.wells[0], self.div
+                config, self.batch, self.plate_date, self.chip, self.wells[0], self.div,
+                system=self.system,
             )
         else:
-            directory = store.chip_dir(config, self.batch, self.plate_date, self.chip)
+            directory = store.chip_dir(config, self.batch, self.plate_date, self.chip, system=self.system)
         return replace(self, save_path=str(directory))
 
     @property
@@ -370,7 +382,7 @@ def describe(params: NetworkScanParams) -> str:
         f"well {well}: {len(params.recording_electrodes[well])}" for well in params.wells
     )
     lines = [
-        f"Chip           : {params.chip}",
+        f"Chip           : {params.chip} on {params.system or '(system not known yet)'}",
         f"Plate date     : {params.plate_date} | DIV: {params.div}",
         f"Batch          : {params.batch_id or '(unset)'}",
         f"Wells          : {params.wells}",
@@ -442,15 +454,17 @@ def run_network_scan(
     # what erases the distinction between a derived save_path and a given one.
     registry_path = config.registry_path if config is not None and params.save_path is None else None
 
-    # Resolve and validate before anything is created, so a scan that cannot run fails now rather
-    # than after the chip has been reconfigured.
+    # The device first (it names the chip directory), then resolve and validate before anything is
+    # created, so a scan that cannot run fails now rather than after the chip has been reconfigured.
+    device = _connected_device(mx)
+    params = _with_connected_system(params, device)
     params = params.resolved(config)
     params.validate()
 
     on_progress("=== Network scan ===")
     on_progress(describe(params))
 
-    on_progress(f"Device: {_connected_device(mx)}")
+    on_progress(f"Device: {device}")
 
     Path(params.save_path).mkdir(parents=True, exist_ok=True)
 

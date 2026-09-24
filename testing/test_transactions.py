@@ -13,7 +13,7 @@ def config(tmp_path):
     return Config(data_root=tmp_path / "store")
 
 
-BATCH = "fall2026_batch1_DRG_M1"
+BATCH = "fall2026_batch1_DRG"
 
 
 def test_record_appends_one_json_line_per_call(config):
@@ -188,14 +188,15 @@ def test_treatments_follow_a_rename(config):
         well=0,
         data={"applied_at": "2026-09-05T10:00", "name": "ATP"},
     )
-    new = "fall2026_batch2_DRG_M1"
+    new = "fall2026_batch2_DRG"
     tx.record(config, "batch.renamed", batch_id=new, plate_date=260813, data={"old": BATCH, "new": new})
     assert list(tx.treatments(config)) == [(new, 260813, "P1", 0)]
 
 
 def test_chip_devices(config):
-    assert tx.default_device(BATCH) == "MaxOne"
-    assert tx.default_device("fall2026_batch2_DRG_M2") == "MaxTwo"
+    assert tx.default_device("M1") == "MaxOne"
+    assert tx.default_device(None) == "MaxOne"
+    assert tx.default_device("M2") == "MaxTwo"
     tx.record(
         config, "chip.set_device", batch_id=BATCH, plate_date=260813, chip="P1", data={"device": "MaxOne+"}
     )
@@ -279,12 +280,15 @@ def test_ingest_journals_each_well(config, tmp_path):
         chip="P1",
         div=9,
         exp_id="stim1",
+        system="M1",
         on_progress=lambda _: None,
     )
     log = tx.read(config)
     assert [t.op for t in log] == ["recording.ingested"]
     assert log[0].exp_id == "stim1" and log[0].batch_id == BATCH and log[0].div == 9
-    assert log[0].data == {"source": str(src), "path": str(written[0]), "moved": False, "kind": "experiment"}
+    assert log[0].data == {
+        "source": str(src), "path": str(written[0]), "moved": False, "kind": "experiment", "system": "M1",
+    }
 
 
 def test_rebuild_registry_journals_once(config, make_well):
@@ -304,7 +308,7 @@ def test_for_culture_matches_by_batch_or_exp_id_and_includes_batch_level(config)
     tx.record(
         config,
         "activity_scan.registered",
-        batch_id="fall2026_batch2_DRG_M1",
+        batch_id="fall2026_batch2_DRG",
         plate_date=260901,
         chip="P1",
         well=0,
@@ -317,7 +321,7 @@ def test_for_culture_matches_by_batch_or_exp_id_and_includes_batch_level(config)
 
 
 def test_reading_follows_a_batch_rename(config):
-    old, new = "summer2026_batch1_DRG_M1", BATCH
+    old, new = "summer2026_batch1_DRG", BATCH
     tx.record(config, "activity_scan.registered", batch_id=old, plate_date=260813, chip="P1", well=0, div=7)
     tx.record(config, "preprocessed.saved", exp_id=old, chip="P1", well=0, div=7)  # older flow: exp id only
     tx.record(config, "culture.mark_dead", batch_id=old, plate_date=260813, chip="P1", well=0)
@@ -349,7 +353,7 @@ def test_reading_follows_a_batch_rename(config):
 
 
 def test_renames_chain(config):
-    a, b, c = "summer2026_batch1_DRG_M1", "fall2026_batch1_DRG_M1", "fall2026_batch9_DRG_M1"
+    a, b, c = "summer2026_batch1_DRG", "fall2026_batch1_DRG", "fall2026_batch9_DRG"
     tx.record(config, "batch.mark_dead", batch_id=a, plate_date=260813)
     tx.record(config, "batch.renamed", batch_id=b, plate_date=260813, data={"old": a, "new": b})
     tx.record(config, "note", batch_id=b, plate_date=260813, note="under the middle name")

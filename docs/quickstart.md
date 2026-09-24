@@ -18,7 +18,7 @@ from mxtreme.scans import activity_scan
 config = Config.from_toml("mxtreme.toml")
 
 params = activity_scan.ActivityScanParams(
-    batch="fall2026_batch1_DRG_M1",  # the plating batch -- see Configuration: batches
+    batch="fall2026_batch1_DRG",  # the plating batch -- see Configuration: batches
     chip="M07460",
     plate_date=260810,   # YYMMDD
     div=1,
@@ -93,7 +93,7 @@ rec_elecs = electrode_selection.select_electrodes(str(result.h5_path), save_path
 
 params = network_scan.NetworkScanParams(
     recording_electrodes=rec_elecs,   # {well: [electrode, ...]}; the wells come from its keys
-    batch="fall2026_batch1_DRG_M1",
+    batch="fall2026_batch1_DRG",
     chip="M07460",
     plate_date=260810,
     div=25,
@@ -152,7 +152,7 @@ from mxtreme.store import ingest_recording
 
 ingest_recording(
     "/path/to/export.raw.h5", config,
-    batch="fall2026_batch1_DRG_M1", plate_date=260810,
+    batch="fall2026_batch1_DRG", plate_date=260810,
     chip="M07460", div=21, exp_id="stim_trial_3",
 )
 ```
@@ -176,7 +176,7 @@ from mxtreme.store import describe_recording
 
 d = describe_recording("/path/to/M07460_260831.h5")
 if d.ok:
-    ingest_recording(d.path, config, batch="fall2026_batch1_DRG_M1", plate_date=260810,
+    ingest_recording(d.path, config, batch="fall2026_batch1_DRG", plate_date=260810,
                      chip=d.chip, div=21, kind=d.kind_guess, wells=[w.well for w in d.wells])
 else:
     print(d.problems)

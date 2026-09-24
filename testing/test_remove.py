@@ -10,7 +10,7 @@ from mxtreme import io, store
 from mxtreme import transactions as tx
 from mxtreme.config import Config
 
-BATCH = "fall2026_batch1_E18_M1"
+BATCH = "fall2026_batch1_E18"
 PLATE = 260813
 CHIP = "P1"
 
@@ -37,7 +37,7 @@ def populated(tmp_path):
     """A store with one culture on DIV 26: activity scan + selection outputs, network scan +
     preprocessed npz + burst CSV + burst-log row, all registered and journaled."""
     config = Config(data_root=tmp_path / "store")
-    div_dir = store.recording_dir(config, BATCH, PLATE, CHIP, 0, 26)
+    div_dir = store.recording_dir(config, BATCH, PLATE, CHIP, 0, 26, system="M1")
     div_dir.mkdir(parents=True)
     stem = store.recording_stem(BATCH, PLATE, CHIP, 0, 26)
     activity = div_dir / f"{stem}_activity_scan.raw.h5"

@@ -8,14 +8,14 @@ from mxtreme import store, transactions
 from mxtreme.config import Config
 from mxtreme.store import Batch
 
-BATCH = "fall2026_batch1_DRG_M1"
+BATCH = "fall2026_batch1_DRG"
 
 
 # --- batch ids ------------------------------------------------------------------------------------
 
 
 def test_batch_id_round_trips():
-    batch = Batch(semester="fall", year=2026, number=1, cell_type="DRG", system="M1")
+    batch = Batch(semester="fall", year=2026, number=1, cell_type="DRG")
     assert batch.id == BATCH
     assert Batch.parse(BATCH) == batch
     assert Batch.parse(batch) is batch  # a Batch passes through unchanged
@@ -23,19 +23,28 @@ def test_batch_id_round_trips():
 
 def test_batch_cell_type_may_contain_underscores():
     """Only the cell type is free-form, so its underscores must parse unambiguously."""
-    batch = Batch.parse("spring2027_batch12_rat_cortical_M2")
+    batch = Batch.parse("spring2027_batch12_rat_cortical")
     assert batch.cell_type == "rat_cortical"
     assert batch.number == 12
-    assert batch.system == "M2"
+
+
+def test_batch_id_carries_no_system():
+    """The system is the chip directory's, not the batch's: one plating can span MaxOne and MaxTwo.
+
+    An id written before the suffix was dropped still parses, the suffix landing in the cell type,
+    so ``rename_batch`` can take it off.
+    """
+    legacy = Batch.parse("fall2026_batch1_E18_M1")
+    assert legacy.cell_type == "E18_M1"
+    assert legacy.id == "fall2026_batch1_E18_M1"
 
 
 @pytest.mark.parametrize("bad", [
-    "autumn2026_batch1_DRG_M1",   # not a semester
-    "fall26_batch1_DRG_M1",       # two-digit year
-    "fall2026_batch0_DRG_M1",     # batches start at 1
-    "fall2026_batch1_DRG_M3",     # no such system
-    "fall2026_batch1_DRG",        # system missing
-    "fall2026_1_DRG_M1",          # 'batch' marker missing
+    "autumn2026_batch1_DRG",   # not a semester
+    "fall26_batch1_DRG",       # two-digit year
+    "fall2026_batch0_DRG",     # batches start at 1
+    "fall2026_batch1",         # cell type missing
+    "fall2026_1_DRG",          # 'batch' marker missing
 ])
 def test_malformed_batch_ids_are_rejected(bad):
     with pytest.raises(ValueError, match="batch"):
@@ -44,9 +53,9 @@ def test_malformed_batch_ids_are_rejected(bad):
 
 def test_batch_constructor_validates_fields():
     with pytest.raises(ValueError, match="semester"):
-        Batch(semester="autumn", year=2026, number=1, cell_type="DRG", system="M1")
+        Batch(semester="autumn", year=2026, number=1, cell_type="DRG")
     with pytest.raises(ValueError, match="cell_type"):
-        Batch(semester="fall", year=2026, number=1, cell_type="D/RG", system="M1")
+        Batch(semester="fall", year=2026, number=1, cell_type="D/RG")
 
 
 # --- layout ---------------------------------------------------------------------------------------
@@ -56,7 +65,7 @@ def test_layout_and_parse_are_inverses(tmp_path):
     """What recording_dir/recording_stem write down, parse_recording_path must read back."""
     config = Config(data_root=tmp_path)
     stem = store.recording_stem(BATCH, 260810, "M07460", 4, 21)
-    directory = store.recording_dir(config, BATCH, 260810, "M07460", 4, 21)
+    directory = store.recording_dir(config, BATCH, 260810, "M07460", 4, 21, system="M1")
 
     for tail, kind, exp_id in [
         ("activity_scan", "activity_scan", ""),
@@ -89,12 +98,12 @@ def test_plate_date_is_validated():
 
 def test_list_platings_reads_the_tree_back_newest_first(tmp_path):
     config = Config(data_root=tmp_path)
-    for plate_date, batch in [(260810, BATCH), (270115, "spring2027_batch2_iPSC_M2")]:
+    for plate_date, batch in [(260810, BATCH), (270115, "spring2027_batch2_iPSC")]:
         (config.recordings_dir / store.plating_dirname(batch, plate_date)).mkdir(parents=True)
 
     platings = store.list_platings(config)
     assert [(p.batch.id, p.plate_date) for p in platings] == [
-        ("spring2027_batch2_iPSC_M2", 270115),
+        ("spring2027_batch2_iPSC", 270115),
         (BATCH, 260810),
     ]
     assert all(p.path.is_dir() for p in platings)
@@ -138,6 +147,7 @@ def _multiwell_h5(path, wells=(0, 3), conditions=("ctrl", "drug")):
         "Well IDs": list(wells), "Conditions": list(conditions),
     })
     with h5py.File(path, "w") as f:
+        f.create_dataset("wellplate/version", data=np.array([b"MaxTwo 6 multi-well MEA"]))
         f.attrs["version"] = "20190530"
         f.create_dataset("/assay/metadata", data=np.array([blob.encode("utf-8")]))
         f.create_dataset("/assay/inputs/record_time", data=np.array([60]))
@@ -199,12 +209,39 @@ def test_split_by_well_removes_the_original_only_on_success(tmp_path):
 # --- ingest ---------------------------------------------------------------------------------------
 
 
-def _single_well_h5(path, well=0):
+def _single_well_h5(path, well=0, plate="MaxOne"):
+    """A minimal wells-format file. ``plate`` is what ``/wellplate/version`` says (``None`` for a
+    file that says nothing), which is where ingest reads the chip's system from."""
     import h5py
 
     with h5py.File(path, "w") as f:
         f.create_dataset(f"/wells/well{well:03d}/rec0000/spikes", data=np.arange(5))
+        if plate is not None:
+            f.create_dataset("wellplate/version", data=np.array([plate.encode()]))
     return path
+
+
+def test_ingest_files_the_chip_by_the_system_the_file_says(tmp_path):
+    """The chip directory's M1/M2 comes from the file's plate description, or from ``system=``;
+    a file that says nothing and is given nothing is refused before anything is copied."""
+    config = Config(data_root=tmp_path / "ms")
+    kwargs = dict(batch=BATCH, plate_date=260810, chip="M07460", div=21, exp_id="t", on_progress=lambda _: None)
+
+    [dest] = store.ingest_recording(_single_well_h5(tmp_path / "two.raw.h5", plate="MaxTwo 6 multi-well MEA"), config, **kwargs).values()
+    assert dest.parent.parent.parent.name == "chip_M2_M07460"
+    assert store.parse_recording_path(dest, config.recordings_dir).system == "M2"
+    assert store.find_chip_dir(config, BATCH, 260810, "M07460") == dest.parent.parent.parent
+    [plating] = store.list_platings(config)
+    assert plating.system_of("M07460") == "M2" and plating.chip_dir("M07460") == dest.parent.parent.parent
+
+    mute = _single_well_h5(tmp_path / "mute.raw.h5", plate=None)
+    with pytest.raises(ValueError, match="MaxOne or a MaxTwo"):
+        store.ingest_recording(mute, config, **{**kwargs, "exp_id": "u"})
+    assert not list((config.recordings_dir).rglob("*_u.raw.h5"))
+    [given] = store.ingest_recording(mute, config, **{**kwargs, "exp_id": "u"}, system="M1").values()
+    assert "chip_M1_M07460" in str(given)  # the same chip serial cannot be on both, but the store does not police that
+    with pytest.raises(ValueError, match="system"):
+        store.ingest_recording(mute, config, **{**kwargs, "exp_id": "v"}, system="M3")
 
 
 def test_ingest_places_names_and_registers_a_single_well_file(tmp_path):
@@ -218,7 +255,7 @@ def test_ingest_places_names_and_registers_a_single_well_file(tmp_path):
 
     dest = written[0]
     stem = store.recording_stem(BATCH, 260810, "M07460", 0, 21)
-    assert dest == store.recording_dir(config, BATCH, 260810, "M07460", 0, 21) / f"{stem}_stim_trial_3.raw.h5"
+    assert dest == store.recording_dir(config, BATCH, 260810, "M07460", 0, 21, system="M1") / f"{stem}_stim_trial_3.raw.h5"
     assert dest.exists() and src.exists()  # copied, not moved, by default
 
     row = pd.read_csv(config.registry_path).iloc[0]
@@ -254,7 +291,7 @@ def test_ingest_splits_a_multiwell_file(tmp_path):
 
     assert sorted(written) == [0, 3]
     for well, path in written.items():
-        assert path.parent == store.recording_dir(config, BATCH, 250512, "C1", well, 7)
+        assert path.parent == store.recording_dir(config, BATCH, 250512, "C1", well, 7, system="M2")
     df = pd.read_csv(config.registry_path).sort_values("well")
     assert list(df["well"]) == [0, 3]
     assert set(df["kind"]) == {"experiment"}
@@ -318,7 +355,7 @@ def test_ingest_refuses_to_overwrite(tmp_path):
 
 
 def test_network_scan_slot_numbers_a_divs_scans_in_arrival_order(tmp_path):
-    stem = "plating_260810_fall2026_batch1_DRG_M1_chip_M07460_well_0_DIV_21"
+    stem = "plating_260810_fall2026_batch1_DRG_chip_M07460_well_0_DIV_21"
     div_dir = tmp_path / "DIV_21"
     assert store.network_scan_slot(div_dir, stem) == ("network_scan", [])  # no directory yet
     div_dir.mkdir()
@@ -404,8 +441,8 @@ def test_ingest_requires_a_wells_format_file(tmp_path):
 
 # --- renaming a batch -----------------------------------------------------------------------------
 
-OLD = "summer2026_batch1_E18_M1"
-NEW = "fall2026_batch1_E18_M1"
+OLD = "summer2026_batch1_E18"
+NEW = "fall2026_batch1_E18"
 PLATE_DATE = 260813
 
 
@@ -416,7 +453,7 @@ def _seed_batch(config, batch, chip="P1", div=19):
     from mxtreme import io
 
     stem = store.recording_stem(batch, PLATE_DATE, chip, 0, div)
-    rec_dir = store.recording_dir(config, batch, PLATE_DATE, chip, 0, div)
+    rec_dir = store.recording_dir(config, batch, PLATE_DATE, chip, 0, div, system="M1")
     (rec_dir / "electrode_selection").mkdir(parents=True)
     h5_path = rec_dir / f"{stem}_activity_scan.raw.h5"
     blob = str({"Exp ID": batch, "Batch ID": batch, "Chip ID": chip, "Plate date": PLATE_DATE,
@@ -479,9 +516,9 @@ def test_rename_batch_renames_everything_the_store_names(tmp_path):
 
     config = Config(data_root=tmp_path)
     _seed_batch(config, OLD)
-    _seed_batch(config, "fall2026_batch12_E18_M1", chip="P2")  # a sibling whose id contains no token of OLD
-    npz_before = next(config.preprocessed_dir.rglob("*.npz")).stat().st_mtime
-    sibling_before = sorted(_mentions(tmp_path, "fall2026_batch12_E18_M1"))
+    _seed_batch(config, "fall2026_batch12_E18", chip="P2")  # a sibling whose id contains no token of OLD
+    npz_before = next(p for p in config.preprocessed_dir.rglob("*.npz") if OLD in p.name).stat().st_mtime
+    sibling_before = sorted(_mentions(tmp_path, "fall2026_batch12_E18"))
     transactions.record(config, "culture.mark_dead", batch_id=OLD, plate_date=PLATE_DATE, chip="P1", well=0)
 
     lines = []
@@ -489,7 +526,7 @@ def test_rename_batch_renames_everything_the_store_names(tmp_path):
 
     assert _mentions(tmp_path, OLD) == []
     assert OLD not in config.registry_path.read_text()
-    assert {p.batch.id for p in store.list_platings(config)} == {NEW, "fall2026_batch12_E18_M1"}
+    assert {p.batch.id for p in store.list_platings(config)} == {NEW, "fall2026_batch12_E18"}
     assert (result.old.id, result.new.id) == (OLD, NEW)
     assert (len(result.h5_files), len(result.npz_files), len(result.csv_files)) == (1, 1, 2)
     assert result.registry_rows == 2
@@ -521,7 +558,7 @@ def test_rename_batch_renames_everything_the_store_names(tmp_path):
     assert npz_path.stat().st_mtime == npz_before  # a rebuilt registry keeps its timestamps
 
     # The sibling batch was not touched.
-    assert sorted(_mentions(tmp_path, "fall2026_batch12_E18_M1")) == sibling_before
+    assert sorted(_mentions(tmp_path, "fall2026_batch12_E18")) == sibling_before
 
     # And a registry rebuilt from disk agrees with the one rewritten in place.
     rebuilt = tmp_path / "rebuilt.csv"
@@ -548,19 +585,55 @@ def test_rename_batch_dry_run_reports_the_plan_and_touches_nothing(tmp_path):
 
 @pytest.mark.parametrize("new, error", [
     (OLD, ValueError),                          # nothing to do
-    ("summer2026_batch1_E18_M2", ValueError),   # the system is not a label
     ("batch-one", ValueError),                  # not a batch id
-    ("fall2026_batch2_E18_M1", FileExistsError),  # already in the store
+    ("fall2026_batch2_E18", FileExistsError),  # already in the store
 ])
 def test_rename_batch_refuses_bad_targets(tmp_path, new, error):
     config = Config(data_root=tmp_path)
     _seed_batch(config, OLD)
-    _seed_batch(config, "fall2026_batch2_E18_M1", chip="P2")
+    _seed_batch(config, "fall2026_batch2_E18", chip="P2")
     before = sorted(str(p) for p in tmp_path.rglob("*"))
 
     with pytest.raises(error):
         store.rename_batch(config, OLD, new)
     assert sorted(str(p) for p in tmp_path.rglob("*")) == before
+
+
+def test_rename_batch_can_take_the_old_system_suffix_off(tmp_path):
+    """The 2026-09-21 migration: ``..._E18_M1`` -> ``..._E18``. The new id stands as a whole token
+    inside every old name, which must read as the rename, not as the target already existing."""
+    config = Config(data_root=tmp_path)
+    _seed_batch(config, "fall2026_batch1_E18_M1")
+    _seed_batch(config, "fall2026_batch2_E18_M1", chip="P2")  # a sibling, left alone
+
+    result = store.rename_batch(config, "fall2026_batch1_E18_M1", "fall2026_batch1_E18")
+
+    assert result.registry_rows == 2 and len(result.paths) == 12
+    assert not _mentions(tmp_path, "fall2026_batch1_E18_M1")
+    assert {p.batch.id for p in store.list_platings(config)} == {"fall2026_batch1_E18", "fall2026_batch2_E18_M1"}
+    [plating] = [p for p in store.list_platings(config) if p.batch.id == "fall2026_batch1_E18"]
+    assert plating.systems() == {"P1": "M1"}  # the chip directory still says which system
+    with pytest.raises(FileExistsError):  # and a real collision is still one
+        store.rename_batch(config, "fall2026_batch2_E18_M1", "fall2026_batch1_E18")
+
+
+def test_rename_batch_can_leave_the_blobs_alone(tmp_path):
+    """An archive copy on a share that refuses read-write HDF5 opens: paths, registry, CSVs and
+    npz follow the rename; the raw files keep their blob until the originals are synced over."""
+    import h5py
+
+    from mxtreme import io
+
+    config = Config(data_root=tmp_path)
+    _seed_batch(config, OLD)
+
+    result = store.rename_batch(config, OLD, NEW, h5_blobs=False)
+
+    assert result.h5_files == [] and result.npz_files and result.csv_files and result.registry_rows == 2
+    assert not _mentions(tmp_path, OLD)  # every name and every CSV cell moved on
+    h5_path = next(config.recordings_dir.rglob("*.h5"))
+    assert io._embedded_metadata(h5_path)["Batch ID"] == OLD  # the blob is the one thing left
+    assert store.parse_recording_path(h5_path, config.recordings_dir).batch.id == NEW
 
 
 def test_rename_batch_refuses_a_batch_it_cannot_find(tmp_path):
@@ -572,7 +645,7 @@ def test_rename_batch_refuses_a_batch_it_cannot_find(tmp_path):
 def test_rename_batch_refuses_an_id_nested_inside_another(tmp_path):
     config = Config(data_root=tmp_path)
     _seed_batch(config, OLD)
-    _seed_batch(config, f"{OLD}_E18_M1", chip="P2")  # cell type "E18_M1_E18": contains OLD whole
+    _seed_batch(config, f"{OLD}_E18", chip="P2")  # cell type "E18_E18": contains OLD whole
 
     with pytest.raises(ValueError, match="inside other batch ids"):
         store.rename_batch(config, OLD, NEW)
@@ -686,7 +759,7 @@ def test_ingest_files_a_scope_activity_scan_as_an_activity_scan(tmp_path):
     src = _scope_activity_scan_h5(tmp_path / "M07474_240419.h5")
 
     written = store.ingest_recording(
-        src, config, batch="spring2024_batch1_DRG_M2", plate_date=240328, chip="M07474", div=22,
+        src, config, batch="spring2024_batch1_DRG", plate_date=240328, chip="M07474", div=22,
         kind="activity_scan", wells=[1], actor="kam", note="from the Scope archive",
         on_progress=lambda _: None,
     )
@@ -706,13 +779,13 @@ def test_ingest_files_a_scope_activity_scan_as_an_activity_scan(tmp_path):
     with h5py.File(dest, "r") as f:
         blob = eval(f["assay/metadata"][:][0].decode())
         assert list(f["wells"]) == ["well001"]
-    assert blob["Exp ID"] == "spring2024_batch1_DRG_M2" and blob["Well IDs"] == [1]
+    assert blob["Exp ID"] == "spring2024_batch1_DRG" and blob["Well IDs"] == [1]
     assert sorted(load_activity_scan(str(dest))) == [1]  # the selection pipeline reads it
 
     log = transactions.read(config)
     assert [t.op for t in log] == ["recording.ingested"]
     assert (log[0].actor, log[0].note, log[0].data["kind"]) == ("kam", "from the Scope archive", "activity_scan")
-    assert log[0].exp_id == "spring2024_batch1_DRG_M2"
+    assert log[0].exp_id == "spring2024_batch1_DRG"
     assert src.exists()  # copied; only the chosen well was split out
 
 
