@@ -25,8 +25,12 @@
     "CS": 80.0,
     "NS": 80.0
   },
+  "_amplitude_thresholds_mv": "Per region, the lowest amplitude calibration found usable: the lowest at which the whole site evoked a countable response over the region's 150 um disc. Written by `report --apply` alongside amplitudes_mv. `preview` prints the chosen amplitude as a multiple of it, which is the headroom. It is an amplitude measured on a site against a population count, not the field at which a neuron fires, so nothing here converts it into a radius.",
+  "amplitude_thresholds_mv": {},
   "_amplitudes_source": "Where amplitudes_mv came from: the calibration recording's name once `report --apply` has written it. 'default' means nobody calibrated, and a conditioning run refuses to start. 'saline' is the dry run's stand-in.",
   "amplitudes_source": "saline",
+  "_field_model": "Path to the JSON written by `fieldmap report --save-model`: how the potential falls off through the medium, measured on a saline chip (an exponent and uV per mV at one electrode pitch). Optional. With it, `preview` shades the array with the potential the pulses put on it and prints what each site puts at the other two. A saline map says nothing about what field fires a neuron; run the same map on a culture to see how tissue changes the falloff.",
+  "field_model": null,
   "min_region_separation_um": 1000.0,
   "region_radius_um": 150.0,
   "_stim_site": "What stimulates a region. hex (the default): seven driven electrodes, one at the centre and six around it gap+1 electrodes away in rows of 2-3-2, 210 um across at gap 5; seven per site, 21 of the chip's 32 stimulation units. Seven spread over a disc rather than four at a square's corners, because an electrode that is not over a neuron or an axon stimulates nothing. grid: a size x size block, gap empty electrodes between them. focal: {shape, inner, inner_gap, return_radius, return_points} adds return electrodes carrying the inverted pulse to confine the field (Ronchi et al. 2019) at the cost of more units. The chip hands units out per area of the array (about seven per area, measured on a MaxOne), so a dense site may not connect; run swaps clashing electrodes for routed neighbours and says so, and a wider gap spreads the site over more of the chip. Widen a site with gap, never with more electrodes.",

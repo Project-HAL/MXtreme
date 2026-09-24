@@ -3,6 +3,8 @@ sites, the run as a timeline, and the pulse waveform. Needs no rig."""
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from mxtreme.experiments.associative import display, protocol
 from mxtreme.experiments.associative.params import AssociativeParams
 
@@ -18,6 +20,103 @@ SPIKE_HZ_PER_CHANNEL = (0.5, 2.0)
 #: Bytes per channel-second of compressed raw, by sample rate. Measured on a MaxTwo (10 kHz);
 #: MaxOne samples twice as fast for twice the size.
 RAW_BYTES_PER_CHANNEL_SEC = {10000: 3800.0, 20000: 7600.0}
+
+
+def field_overlay(params, regions, samples: int = 260):
+    """The potential over the whole array from all three sites firing at their own amplitudes,
+    for the preview's map; ``None`` unless a field model is set.
+
+    All three never fire at once, so this is not a moment of the experiment: it is the three
+    sites' fields drawn together so their extents can be compared at a glance.
+
+    :returns: ``(values_uv, extent)`` for ``imshow``, or ``None``.
+    """
+    if not params.field_model or not regions:
+        return None
+    import numpy as np
+
+    from mxtreme.experiments import fieldmap
+
+    model = fieldmap.load_model(params.field_model)
+    width, height = protocol.COLS * protocol.PITCH_UM, protocol.ROWS * protocol.PITCH_UM
+    xs = np.linspace(0, width, samples)
+    ys = np.linspace(0, height, max(2, round(samples * height / width)))
+    gx, gy = np.meshgrid(xs, ys)
+    points = np.column_stack([gx.ravel(), gy.ravel()])
+    total = np.zeros(len(points))
+    for spec in regions.values():
+        total = np.maximum(
+            total, fieldmap.site_field_uv(model, spec.drive_electrodes, spec.amplitude_mv, points)
+        )
+    return total.reshape(gx.shape), (0.0, width, height, 0.0)
+
+
+def field_text(params, regions) -> list[str]:
+    """What the field model says about these regions at these amplitudes, as lines for the
+    printed preview: the field each site puts at the other two, and what does and does not
+    follow from it."""
+    if not regions:
+        return []
+    if not params.field_model:
+        return [
+            (
+                "  field of a pulse: unknown, since no field model is set. Measure it on a saline chip "
+                "(python -m mxtreme.experiments.fieldmap run ..., then report --save-model) and point "
+                "field_model at the JSON."
+            )
+        ]
+    from mxtreme.experiments import fieldmap
+
+    model = fieldmap.load_model(params.field_model)
+    lines = [
+        (
+            f"  field of a pulse, from {Path(params.field_model).name}: "
+            f"V(r) = {model['uv_per_mv_at_one_pitch']:.1f} uV/mV x A x (r / {model['pitch_um']:.1f} um)^"
+            f"-{model['exponent']:.2f}, where A is the amplitude in mV and r the distance from a driven "
+            f"electrode in um, summed over a site's electrodes; measured in saline out to "
+            f"{model.get('measured_to_um', 0):.0f} um"
+        )
+    ]
+    for role, spec in regions.items():
+        own = fieldmap.field_at_um(
+            model,
+            spec.drive_electrodes,
+            spec.amplitude_mv,
+            (spec.center_um[0], spec.center_um[1] + params.region_radius_um),
+        )
+        others = []
+        for other, o_spec in regions.items():
+            if other == role:
+                continue
+            at = fieldmap.field_at_um(model, spec.drive_electrodes, spec.amplitude_mv, o_spec.center_um)
+            distance = protocol.separation_um(spec.center_um, o_spec.center_um)
+            others.append(f"{at:.0f} uV at {other} ({distance:.0f} um, {at / own:.0%} of its own)")
+        headroom = params.amplitude_thresholds_mv.get(role)
+        lines.append(
+            f"    {role:<4} {spec.amplitude_mv:.0f} mV"
+            + (f" ({spec.amplitude_mv / headroom:.1f}x its {headroom:.0f} mV threshold)" if headroom else "")
+            + f": {own:.0f} uV at its own {params.region_radius_um:.0f} um edge; "
+            + ", ".join(others)
+        )
+    lines += [
+        (
+            f"    The potential falls slowly (r^-{model['exponent']:.2f}), so the *artifact* reaches the "
+            f"whole array. What drives a long straight axon is its second derivative (Rattay 1986), which "
+            f"falls as r^-{model['exponent'] + 2:.2f}; at axon terminals and bends it is the first "
+            f"derivative instead (Rattay 1999), r^-{model['exponent'] + 1:.2f}. Either way the excitation "
+            f"is far more local than the artifact. Whatever the threshold is, a quantity falling as r^-p "
+            f"puts the excited radius at A^(1/p), so doubling the amplitude grows it by "
+            f"{2 ** (1 / (model['exponent'] + 2)):.2f}x to {2 ** (1 / (model['exponent'] + 1)):.2f}x, not 2x."
+        ),
+        (
+            "    No radius is drawn here on purpose. Converting a field in uV into 'this is how far the "
+            "stimulus reaches' needs the field at which tissue fires, which a saline map does not "
+            "measure and calibration does not either: calibration finds the lowest amplitude at which a "
+            "whole site evokes a countable response over a 150 um disc. Calibration's spread column and "
+            "the baseline gate are the measurements of independence."
+        ),
+    ]
+    return lines
 
 
 def storage_estimate(params: AssociativeParams, minutes: float, channels: int) -> dict:
@@ -123,6 +222,7 @@ def preview(
             + (f"  return dac {spec.return_dac} {spec.return_electrodes}" if spec.return_electrodes else "")
             + f"  {len(spec.rec_electrodes)} recording electrodes  {spec.amplitude_mv} mV"
         )
+    text += field_text(params, regions)
     text.append(protocol.summary(blocks, stimuli, params.stim_phase_us))
 
     channels = len(rec or []) or 1024
@@ -156,13 +256,16 @@ def preview(
     ax_time = fig.add_subplot(grid[1, :])
     ax_train = fig.add_subplot(grid[2, 0])
     ax_pulse = fig.add_subplot(grid[2, 1])
+    overlay = field_overlay(params, regions)
     if regions:
         display.draw_map(
             ax_map,
             {r: s.as_dict() for r, s in regions.items()},
             routed,
             params.region_radius_um,
-            title=f"well {params.well}: {params.stim_site.get('shape')} sites {params.stim_site}, recording radius {params.region_radius_um} um",
+            title=f"well {params.well}: {params.stim_site.get('shape')} sites {params.stim_site}, recording radius {params.region_radius_um} um"
+            + (", shading = the pulse's potential (log uV)" if overlay else ""),
+            field=overlay,
         )
         display.draw_triangle(ax_map, {r: s.as_dict() for r, s in regions.items()})
     else:

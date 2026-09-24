@@ -16,6 +16,7 @@ from mxtreme.stimulation.timeline import (
     STIM_CLOCK_HZ,
     PulseGeometry,
     RegionUnits,
+    amplitude_bits,
     region_timeline,
 )
 
@@ -38,12 +39,25 @@ def next_event_id() -> int:
 
 
 def dac_lsb_mv() -> float:
-    """The DAC's least significant bit in mV, from the system; 1.0 if it does not answer."""
+    """The DAC's least significant bit in mV, from the system.
+
+    Every amplitude is sent as a whole number of these, so an amplitude means nothing without it.
+    A silent fallback here would be a silent dose error -- if the system's step is 2.9 mV and we
+    assumed 1.0, an 80 mV pulse would leave the chip at 232 -- so a system that does not answer
+    is an error rather than a guess.
+
+    :raises RuntimeError: If the system does not report a usable step.
+    """
     mx = _require_maxlab()
+    reply = None
     try:
-        return float(mx.query_DAC_lsb_mV())
-    except (TypeError, ValueError):
-        return 1.0
+        reply = mx.query_DAC_lsb_mV()
+        return float(reply)
+    except (TypeError, ValueError) as e:
+        raise RuntimeError(
+            f"the system did not report the DAC's step in mV (it said {reply!r}), so an amplitude "
+            f"in mV cannot be turned into DAC steps. Is the MaxLab server running?"
+        ) from e
 
 
 class MaxlabEmitter:
@@ -112,10 +126,15 @@ def build_region_sequence(
                 emitter.connect(unit, dac)
 
     # Read back from the h5 as key-value pairs, so: an even list of words, no spaces in a value.
+    lsb = dac_lsb_mv()
     description = " ".join(
         f"{r.role} drive_dac{r.drive_dac}"
         + (f":return_dac{r.return_dac}" if r.return_units else "")
         + f":amp_mV{amplitude_mv if amplitude_mv is not None else r.amplitude_mv}"
+        # What the chip was actually asked for: the amplitude in mV is a request, these are the
+        # steps it became, so a recording says what it delivered rather than what was intended.
+        + f":dac_steps{amplitude_bits(amplitude_mv if amplitude_mv is not None else r.amplitude_mv, lsb)}"
+        + f":dac_lsb_mV{lsb:g}"
         + f":delay_s{delays_sec.get(r.role, 0.0)}"
         for r in regions
     )

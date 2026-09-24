@@ -32,6 +32,7 @@ def draw_map(
     radius_um: float = 150.0,
     fill: dict[str, float] | None = None,
     title: str = "",
+    field: tuple | None = None,
 ):
     """The 220 x 120 array with the three regions on it: driven electrodes filled, return
     electrodes hollow, recording electrodes faint, a circle per region.
@@ -39,6 +40,9 @@ def draw_map(
     :param regions: ``{role: RegionSpec.as_dict()}``.
     :param routed_xy: (N, 2) positions of every routed electrode, or None.
     :param fill: ``{role: 0..1}`` to shade each region's circle.
+    :param field: ``(values_uv, extent)`` from :func:`mxtreme.experiments.associative.preview.field_overlay`,
+        shaded behind everything on a log scale. It is the potential the pulses put on the array,
+        not a claim about how far they excite: no contour here is a threshold.
     """
     from matplotlib.patches import Circle
 
@@ -51,6 +55,17 @@ def draw_map(
     if title:
         ax.set_title(title, loc="left", fontsize=10)
 
+    if field is not None:
+        values, extent = field
+        ax.imshow(
+            np.log10(np.maximum(values, 1.0)),
+            extent=extent,
+            origin="upper",
+            cmap="magma",
+            alpha=0.55,
+            zorder=0,
+            interpolation="bilinear",
+        )
     gx, gy = np.meshgrid(
         np.arange(protocol.COLS) * protocol.PITCH_UM, np.arange(protocol.ROWS) * protocol.PITCH_UM
     )

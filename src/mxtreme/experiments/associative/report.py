@@ -413,6 +413,9 @@ def _gate(data, record) -> list:
             )
         record["_calibration_pick"] = {
             "amplitudes_mv": picked,
+            "amplitude_thresholds_mv": {
+                role: (row["threshold_mv"] if row else None) for role, row in chosen.items()
+            },
             "amplitudes_source": data.get("name", "this calibration"),
             "pulse_polarity": majority,
         }
@@ -430,7 +433,12 @@ def apply_calibration(params_path: str, pick: dict) -> None:
     from mxtreme.experiments.associative.params import AssociativeParams
 
     AssociativeParams.update_file(
-        params_path, {key: pick[key] for key in ("amplitudes_mv", "amplitudes_source", "pulse_polarity")}
+        params_path,
+        {
+            key: pick[key]
+            for key in ("amplitudes_mv", "amplitude_thresholds_mv", "amplitudes_source", "pulse_polarity")
+            if key in pick
+        },
     )
     print(
         f"\nwrote amplitudes_mv {pick['amplitudes_mv']}, amplitudes_source {pick['amplitudes_source']!r} "

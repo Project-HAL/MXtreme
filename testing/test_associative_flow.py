@@ -2,6 +2,7 @@
 select choosing from a baseline, and report reading a run back from the recording alone."""
 
 import json
+from dataclasses import replace
 
 import h5py
 import numpy as np
@@ -791,3 +792,55 @@ def test_artifact_panels_show_one_case_each():
         "probe_us_0",
         "stim_cs_us_0",
     }
+
+
+def test_preview_reports_the_field_between_regions_without_claiming_a_radius(tmp_path, capsys):
+    from mxtreme.experiments.associative.preview import field_overlay, preview
+
+    model = tmp_path / "field_model.json"
+    model.write_text(
+        json.dumps(
+            {
+                "exponent": 0.78,
+                "uv_per_mv_at_one_pitch": 11.5,
+                "pitch_um": 17.5,
+                "measured_to_um": 1050.0,
+            }
+        )
+    )
+    base = _params(
+        regions={"US": list(CENTRES[0]), "CS": list(CENTRES[1]), "NS": list(CENTRES[2])},
+        rec_electrodes=list(range(0, protocol.NUM_ELECTRODES, 11)),
+        amplitudes_mv={"US": 60.0, "CS": 60.0, "NS": 30.0},
+        amplitudes_source="test",
+    )
+    preview(base, str(tmp_path / "a.png"), show=False)
+    assert "no field model is set" in capsys.readouterr().out
+    assert field_overlay(base, protocol.regions_for(base)) is None
+
+    with_model = replace(base, field_model=str(model))
+    preview(with_model, str(tmp_path / "b.png"), show=False)
+    text = capsys.readouterr().out
+    assert "field of a pulse" in text
+    # The concrete, checkable numbers: what each site puts at the others.
+    assert "uV at CS" in text and "uV at NS" in text
+    # And the two things that do not follow from them.
+    assert "No radius is drawn here on purpose" in text
+    assert "second derivative" in text
+    # The threshold is printed as headroom when calibration has measured it, not as a radius.
+    assert "its 20 mV threshold" not in text
+    with_threshold = replace(with_model, amplitude_thresholds_mv={"US": 20.0, "CS": 30.0, "NS": 20.0})
+    preview(with_threshold, str(tmp_path / "c.png"), show=False)
+    assert "3.0x its 20 mV threshold" in capsys.readouterr().out
+
+    values, extent = field_overlay(with_model, protocol.regions_for(with_model))
+    assert values.shape[0] > 10 and extent[1] > extent[0]
+    # The field peaks on a site. It is only a few times the array's median, not orders of
+    # magnitude above it: r^-0.78 is shallow enough that the whole array is bathed in the pulse.
+    peak = np.unravel_index(np.argmax(values), values.shape)
+    x = extent[0] + (extent[1] - extent[0]) * peak[1] / (values.shape[1] - 1)
+    # extent is (left, right, bottom, top) with top first, as origin="upper" needs.
+    y = extent[3] + (extent[2] - extent[3]) * peak[0] / (values.shape[0] - 1)
+    assert min(protocol.separation_um((x, y), c) for c in CENTRES) < 120
+    assert 3 < values.max() / float(np.median(values)) < 30
+    assert (tmp_path / "b.png").exists()

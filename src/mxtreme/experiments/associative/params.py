@@ -61,6 +61,15 @@ class AssociativeParams:
     :param amplitudes_mv: Per role, **mV per phase**, from a calibration run. Peak to peak is
         twice this, which is the number stimulation papers usually quote: 80 here is 160 mV
         peak to peak.
+    :param amplitude_thresholds_mv: Per region, the lowest amplitude calibration found usable --
+        the lowest at which the whole site evoked a countable response over the region's disc.
+        Written by ``report --apply``. ``preview`` prints the chosen amplitude as a multiple of
+        it, which is the headroom the region is driven with. It is *not* the field at which a
+        neuron fires: it is an amplitude, measured on a site, against a population count.
+    :param field_model: Path to the JSON ``fieldmap report --save-model`` wrote: how the
+        potential falls off through the medium, measured on a saline chip. Optional; with it
+        ``preview`` shades the array with the potential the pulses put on it and prints what each
+        site puts at the other two.
     :param amplitudes_source: Where ``amplitudes_mv`` came from -- the calibration recording's
         name, as its report prints it. ``"default"`` means nobody calibrated, and a
         conditioning run refuses to start on it.
@@ -158,7 +167,9 @@ class AssociativeParams:
     stim_electrodes_site: dict = field(default_factory=dict)
     routing_cfg: str | None = None
     amplitudes_mv: dict[str, float] = field(default_factory=lambda: {r: 80.0 for r in ROLES})
+    amplitude_thresholds_mv: dict[str, float] = field(default_factory=dict)
     amplitudes_source: str = "default"
+    field_model: str | None = None
     min_region_separation_um: float = 1000.0
     region_radius_um: float = 150.0
     stim_site: dict = field(default_factory=lambda: {"shape": "hex", "gap": 5})

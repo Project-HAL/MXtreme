@@ -509,6 +509,9 @@ def calibration_verdicts(
                 (r for r in usable if r["polarity"] == polarity),
                 key=lambda r: (r["amplitude_mv"], r["local"]),
             )
+            # The threshold travels with the choice: it is the amplitude at which this site only
+            # just responds, which is what turns a field in uV into "enough to fire a neuron".
+            best = dict(best, threshold_mv=float(thresholds[polarity]))
             chosen[role] = best
             others = {pol: t for pol, t in thresholds.items() if pol != polarity}
             why = (
