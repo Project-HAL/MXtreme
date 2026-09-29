@@ -79,7 +79,7 @@ picks up.
 
 {func}`mxtreme.extract.extract` opens one raw Maxwell `.h5` and returns a plain
 `dict[int, dict]`: well number → that well's spike table plus the metadata and settings needed to
-clean, bin, and later analyse it.
+clean, bin, and later analyse it. Every key is listed in the [Data dictionary](data-dictionary.md).
 
 Newer Maxwell files carry an embedded `/assay/metadata` blob that is read automatically. Older files
 lack it, so the caller supplies a `metadata` dict. A supplied dict is merged **over** the embedded
@@ -157,12 +157,26 @@ all deliberately live elsewhere, which is what keeps `Recording` stable while th
 A *phase* is a named interval of a recording — `"pre"` / `"train"` / `"post"` in a closed-loop
 training experiment, say. MXtreme never assumes phase names, or that phases exist at all.
 
-Phases are anchored to maxlab event tags already present in the recording's event data. You choose
-which tags mark boundaries and what to call each interval. There are three ways to supply that, in
-increasing order of convenience:
+Phases are anchored to maxlab event tags already present in the recording's event data, or to
+minutes from the first frame. A phase spec maps each phase name to a `start` and an optional `end`:
+
+```python
+{
+    "pre":   {"start": "pre_recording_start", "end": "pre_recording_end"},  # event key present
+    "train": {"start": {"closed_loop_start": None, "side": "left"},       # every pair must match
+              "end":   {"closed_loop_end": None, "side": "left"}},        # None = any value
+    "post":  "post_recording_start",                                      # start only
+    "base":  {"start": 0, "end": 20},                                     # minutes
+}
+```
+
+A phase with no end, or whose end event never follows its start, runs to the next phase's start and
+otherwise to the end of the recording. A phase whose start event occurs more than once gets one
+interval per occurrence, named `train_1`, `train_2`, and so on. There are three ways to supply a
+spec, in increasing order of convenience:
 
 1. **Nothing.** The recording is a single `"full"` phase spanning its whole duration.
-2. **At `Recording` construction** — pass `phase_tags=` and `end_tag=`.
+2. **At `Recording` construction** — pass a phase spec as `phase_tags=`.
 3. **At extraction time** — pass a `Phases` key in `metadata`. The spec is written into every `.npz`
    as `phase_spec`, and every later `Recording` resolves it with no arguments at all.
 

@@ -32,8 +32,8 @@ def test_extract_reads_embedded_metadata():
 
 def test_extract_propagates_phases_metadata():
     spec = {
-        "starts": {"pre": "pre_recording_start", "train": "closed_loop_start"},
-        "end": "end_experiment",
+        "pre": "pre_recording_start",
+        "train": {"start": "closed_loop_start", "end": "end_experiment"},
     }
     data = extract.extract(str(_P004722), metadata={"Phases": spec})
     assert data[0]["phase_spec"] == spec

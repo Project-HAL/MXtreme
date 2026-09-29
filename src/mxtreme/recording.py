@@ -1,18 +1,10 @@
-"""A single recording: a thin, experiment-agnostic view over one preprocessed ``.npz``.
+"""A ``Recording`` object is a view over a single preprocessed ``.npz``.
 
-``Recording`` holds the arrays and identity of one well's cleaned recording and exposes a few cheap
-derived views (``asdr``, ``event_df``). It makes **no** experiment-specific assumptions: phases are an
-injected input (see :mod:`mxtreme.phases`), defaulting to a single ``"full"`` phase spanning the
-recording, and experimental conditions are carried through opaquely.
+It holds the arrays and identity of one well's cleaned recording and exposes a few
+derived views such as the array-wide spike detection rate array (``asdr``) and the event data (``event_df``). 
 
-Burst detection, feature extraction, saving, and plotting deliberately live elsewhere:
-
-    from mxtreme.bursting import BurstDetector      # detection + features
-    from mxtreme import io                          # save/load burst CSVs
-    from mxtreme import visualizations as viz       # ax-aware plots
-
-This keeps ``Recording`` a stable data-access object that those modules (and ``mxtreme.analysis``)
-consume.
+Reocording phases are a user input (see :mod:`mxtreme.phases`), defaulting to a single ``"full"`` phase spanning the
+entire recording.
 """
 
 from __future__ import annotations
@@ -22,7 +14,7 @@ from typing import Mapping, Optional
 import numpy as np
 import pandas as pd
 
-from mxtreme.phases import Phases, TagSpec, phases_from_event_tags, phases_from_spec
+from mxtreme.phases import Phases, PhaseSpec, phases_from_spec
 
 
 def _item(value):
@@ -39,15 +31,14 @@ def _scalar_float(value) -> float:
 class Recording:
     """Data-access wrapper around one preprocessed recording (one well).
 
-    :param id: Caller-assigned recording id (kept for convenience; not interpreted).
+    :param id: User-assigned recording id.
     :param exp_data: Preprocessed data dict, as returned by :func:`mxtreme.io.load_preprocessed`.
     :param phases: Optional pre-built :class:`~mxtreme.phases.Phases` labelling parts of the recording.
-    :param phase_tags: Optional event-tag spec (an ordered ``name -> tag`` mapping or ``(name, tag)``
-        sequence). When given, phases are resolved here from this recording's own ``event_df`` via
-        :func:`~mxtreme.phases.phases_from_event_tags`, so callers no longer need to build a
-        provisional ``Recording`` just to read its event tags. Mutually exclusive with ``phases``.
-    :param end_tag: Optional event tag marking the end of the final phase (used only with
-        ``phase_tags``); the last phase runs to this tag's frame if present, else to the last frame.
+    :param phase_tags: Optional phase spec (an ordered ``name -> definition`` mapping; each phase has a
+        ``start`` and optional ``end`` boundary given as minutes, an event key, or a key/value
+        matcher -- see :func:`~mxtreme.phases.phases_from_spec`). When given, phases are resolved here
+        from this recording's own ``event_df``, so callers no longer need to build a provisional
+        ``Recording`` just to read its event tags. Mutually exclusive with ``phases``.
 
     When neither ``phases`` nor ``phase_tags`` is supplied, phases default to a spec embedded in
     ``exp_data`` under ``"phase_spec"`` (written at preprocessing time from the ``Phases`` metadata key
@@ -62,8 +53,7 @@ class Recording:
         exp_data: dict,
         phases: Optional[Phases] = None,
         *,
-        phase_tags: Optional[TagSpec] = None,
-        end_tag: Optional[str] = None,
+        phase_tags: Optional[PhaseSpec] = None,
     ) -> None:
         self.id = id
 
@@ -110,15 +100,12 @@ class Recording:
         if phases is not None and phase_tags is not None:
             raise ValueError("Pass either `phases` or `phase_tags`, not both.")
 
+        spec = phase_tags if phase_tags is not None else embedded_spec
         if phases is not None:
             self.phases = phases
-        elif phase_tags is not None:
-            self.phases = phases_from_event_tags(
-                self.event_df, phase_tags, end_frame=end_frame, end_tag=end_tag
-            )
-        elif isinstance(embedded_spec, Mapping) and embedded_spec.get("starts"):
+        elif isinstance(spec, Mapping) and spec:
             self.phases = phases_from_spec(
-                embedded_spec, self.event_df,
+                spec, self.event_df,
                 start_frame=start_frame, end_frame=end_frame, samp_rate=self.samp_rate,
             )
         else:

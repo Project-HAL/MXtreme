@@ -75,14 +75,14 @@ def stim_summary(cpath, analysis_dir: Path, use_existing=True, show_plot=True, s
 
             for phase in rec.phases:
                 in_phase = stim_df['eventtime'].between(
-                    phase.start_frame, phase.end_frame, inclusive='left'
+                    phase.start_frame, phase.end_frame, inclusive='both'
                 )
                 rows.append({
                     'div':            div,
                     'phase':          phase.name,
                     # phase_us (µs) -> ms
                     'total_stim_ms':  stim_df.loc[in_phase, 'stim_phase'].sum() / 1000,
-                    'phase_dur_min':  (phase.end_frame - phase.start_frame) / rec.samp_rate / 60,
+                    'phase_dur_min':  phase.n_frames / rec.samp_rate / 60,
                     'culture_id':     str(cid),
                 })
 

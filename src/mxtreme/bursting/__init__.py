@@ -11,7 +11,7 @@ Typical use::
     from mxtreme.bursting import BurstDetector
     from mxtreme.params import BurstDetectParams, BurstFeatureParams
 
-    rec = Recording(0, exp_data)                       # or Recording(..., phase_tags=..., end_tag=...)
+    rec = Recording(0, exp_data)                       # or Recording(..., phase_tags=...)
     # Pass burst_data_dir= to refresh the per-experiment burst log automatically (detection and
     # feature extraction stamp their own timestamps independently); omit it for pure in-memory use.
     bursts = BurstDetector(BurstDetectParams()).detect(rec, burst_data_dir=config.burst_data_dir)
