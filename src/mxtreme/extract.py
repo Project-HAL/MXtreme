@@ -38,8 +38,10 @@ def extract(filepath: str, metadata: dict | None = None, wells: list | int | Non
         An optional ``'Phases'`` key supplies an experiment-level phase spec that is embedded in every
         preprocessed ``.npz`` and reconstructed automatically by :class:`~mxtreme.recording.Recording`
         (see :func:`mxtreme.phases.phases_from_spec`). It is shaped as
-        ``{'starts': {name: tag_or_minutes, ...}, 'end': tag_or_minutes}`` where each boundary is
-        either a maxlab event tag (``str``) or a number of minutes from the recording's first frame.
+        ``{name: {'start': boundary, 'end': boundary}, ...}`` (``'end'`` optional; a bare boundary is
+        shorthand for a start only), where each boundary is a number of minutes from the recording's
+        first frame, a maxlab event key (``str``), or a ``{key: value}`` matcher on the event message
+        (``None`` = key present with any value).
     :type metadata: dict, optional
     :param wells: Well number(s) to extract. ``None`` extracts every well present in the file.
     :type wells: list or int, optional
@@ -91,7 +93,7 @@ def extract(filepath: str, metadata: dict | None = None, wells: list | int | Non
         conditions = h5_metadata.get("Conditions")
         
         # Optional phase spec (experiment-level: applies to every well). Same shape as accepted by
-        # ``mxtreme.phases.phases_from_spec`` -- {"starts": {name: tag|minutes}, "end": tag|minutes}.
+        # ``mxtreme.phases.phases_from_spec`` -- {name: {"start": boundary, "end": boundary}}.
         phase_spec = h5_metadata.get("Phases")
 
         h5_metadata["wells"] = []  # track which wells actually carry data in this file

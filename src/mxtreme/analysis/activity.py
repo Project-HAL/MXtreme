@@ -44,7 +44,7 @@ def burst_activity_summary(cpath, analysis_dir: Path, use_existing=True, show_pl
             # Phase windows come from the recording's injected phases (default: a single "full"
             # phase over the whole recording), not a hardcoded pre/train/post split.
             phase_time_dict = {
-                p.name: frame_to_sec(p.end_frame - p.start_frame, samp_rate) for p in rec.phases
+                p.name: frame_to_sec(p.n_frames, samp_rate) for p in rec.phases
             }
 
             burst_stats = cpath.recordings[div].burst_stats
@@ -165,7 +165,7 @@ def channel_activity_summary(cpath, analysis_dir: Path, use_existing=True, show_
                 start = p.start_frame
                 stop = p.end_frame
 
-                phase_spike_data = rec.spike_data[(rec.spike_data["frameno"]>start)&(rec.spike_data["frameno"]<stop)]
+                phase_spike_data = rec.spike_data[(rec.spike_data["frameno"]>=start)&(rec.spike_data["frameno"]<=stop)]
 
                 # --- Per-channel metrics: {channel: value} dicts ---------- #
                 channel_firing_rates = firing_rate_chan(phase_spike_data, rec.samp_rate)
@@ -337,7 +337,7 @@ DISTRIBUTION_KEYS = ('fr_hz', 'isi_ms', 'ibi_sec', 'size_pct')
 
 
 def _phase_window(rec, phase: str | None) -> tuple[str, int, int]:
-    """Resolve ``phase`` against ``rec``'s own phases, as ``(name, start_frame, end_frame)``.
+    """Resolve ``phase`` against ``rec``'s own phases, as inclusive ``(name, start_frame, end_frame)``.
 
     ``None`` selects the recording's first phase -- ``"full"`` for a recording with no user-supplied
     phases, the first of the sequence otherwise. A name the recording doesn't carry falls back to the
@@ -355,7 +355,7 @@ def _phase_window(rec, phase: str | None) -> tuple[str, int, int]:
 
     frames = rec.spike_data["frameno"]
     start = int(np.min(frames)) if len(frames) else 0
-    stop = int(np.max(frames)) + 1 if len(frames) else 0
+    stop = int(np.max(frames)) if len(frames) else 0
     print(f"  no {phase!r} phase (found: {', '.join(named)}); using the whole recording")
     return phase, start, stop
 
@@ -408,7 +408,7 @@ def culture_distributions(cpath, analysis_dir: Path, *, phase: str | None = None
         rec = _load_recording(cpath.recordings[div].npz)
         _name, start, stop = _phase_window(rec, phase)
 
-        spikes = rec.spike_data[(rec.spike_data["frameno"] > start) & (rec.spike_data["frameno"] < stop)]
+        spikes = rec.spike_data[(rec.spike_data["frameno"] >= start) & (rec.spike_data["frameno"] <= stop)]
 
         firing_rates = firing_rate_chan(spikes, rec.samp_rate)
         fr_vals = np.array([v for v in firing_rates.values() if v is not None], dtype=float)

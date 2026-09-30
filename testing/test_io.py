@@ -40,7 +40,7 @@ def test_step_log_roundtrips(make_well, tmp_path):
 
 
 def test_phase_spec_roundtrips(make_well, tmp_path):
-    spec = {"starts": {"pre": 0, "train": 20, "post": 40}, "end": 60}
+    spec = {"pre": 0, "train": {"start": {"closed_loop_start": None, "side": "left"}}, "post": {"start": 40, "end": 60}}
     well = _clean_well(make_well)
     well["phase_spec"] = spec
     path = io.save_preprocessed(tmp_path, well)
@@ -364,7 +364,7 @@ def _saved_store(make_well, tmp_path):
 
     config = Config(data_root=tmp_path)
     well = _clean_well(make_well)
-    well["phase_spec"] = {"starts": {"pre": 0, "post": 20}, "end": 40}
+    well["phase_spec"] = {"pre": 0, "post": {"start": 20, "end": 40}}
     well["step_log"] = [{"step": "bin_spikes", "n_before": 4, "n_after": 4, "removed": 0, "seconds": 0.0}]
     path = io.save_preprocessed(config.preprocessed_dir, well, registry_path=config.registry_path)
     return config, path

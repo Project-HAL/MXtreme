@@ -21,7 +21,8 @@ Each stage writes its output to a user-defined **managed data store** — see [C
 :caption: Getting started
 
 install
-quickstart
+quickstart-scans
+quickstart-analysis
 ```
 
 ```{toctree}
@@ -29,6 +30,7 @@ quickstart
 :caption: Concepts
 
 concepts/data-flow
+concepts/data-dictionary
 concepts/configuration
 ```
 

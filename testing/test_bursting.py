@@ -9,7 +9,7 @@ from mxtreme.recording import Recording
 from mxtreme.bursting import Burst, BurstDetector, BurstSet
 from mxtreme.bursting.burst import _COLUMNS
 from mxtreme.params import BurstDetectParams, BurstFeatureParams
-from mxtreme.phases import Phase, Phases, phases_from_event_tags, phases_from_spec
+from mxtreme.phases import Phase, Phases, phases_from_spec
 
 
 # Detection params tuned for the small synthetic fixture (N=300 needs millions of spikes).
@@ -33,39 +33,145 @@ def test_phases_full_default_labels_everything():
     phases = Phases.full(0, 1000)
     assert phases.names == ("full",)
     assert phases.label_for(0) == "full"
-    assert phases.label_for(999) == "full"
-    assert phases.label_for(1000) is None  # half-open interval
+    assert phases.label_for(1000) == "full"  # both bounds inclusive
+    assert phases.label_for(1001) is None
+    assert phases.phases[0].n_frames == 1001
 
 
-def test_phases_from_event_tags_orders_and_bounds():
-    event_df = pd.DataFrame({
-        "eventtime": [10, 100, 1000],
-        "eventmessage": [
-            {"pre_recording_start": "5"},
-            {"closed_loop_start": "5"},
-            {"post_recording_start": "5"},
-        ],
-    })
-    phases = phases_from_event_tags(
-        event_df,
-        [("pre", "pre_recording_start"), ("train", "closed_loop_start"), ("post", "post_recording_start")],
-        end_frame=2000,
+def test_phases_get_phase_by_name():
+    phases = Phases((Phase("pre", 0, 100), Phase("train_1", 100, 200), Phase("train_2", 300, 400)))
+    assert phases.get_phase("train_2") == Phase("train_2", 300, 400)
+    with pytest.raises(KeyError, match="train_1"):  # the error lists the available names
+        phases.get_phase("train")
+
+
+_EMPTY_EVENTS = pd.DataFrame({"eventtime": [], "eventmessage": []})
+
+
+def _events(*rows):
+    """Build an event_df from ``(frame, message)`` pairs."""
+    return pd.DataFrame({"eventtime": [f for f, _ in rows], "eventmessage": [m for _, m in rows]})
+
+
+def _bounds(phases):
+    return [(p.name, p.start_frame, p.end_frame) for p in phases]
+
+
+def test_phases_from_spec_tags_run_to_next_start():
+    events = _events(
+        (10, {"pre_recording_start": "5"}), (100, {"closed_loop_start": "5"}),
+        (1000, {"post_recording_start": "5"}),
     )
-    assert phases.names == ("pre", "train", "post")
-    assert phases.label_for(50) == "pre"
-    assert phases.label_for(500) == "train"
-    assert phases.label_for(1500) == "post"
+    spec = {"pre": "pre_recording_start", "train": "closed_loop_start", "post": "post_recording_start"}
+    phases = phases_from_spec(spec, events, start_frame=0, end_frame=2000, samp_rate=100.0)
+    assert _bounds(phases) == [("pre", 10, 99), ("train", 100, 999), ("post", 1000, 2000)]
     assert phases.label_for(5) is None  # before the first tag
 
 
-def test_phases_from_event_tags_missing_tags_fall_back_to_full():
-    event_df = pd.DataFrame({"eventtime": [], "eventmessage": []})
-    phases = phases_from_event_tags(event_df, [("pre", "pre_recording_start")], end_frame=500)
+def test_phases_from_spec_orders_by_start_frame():
+    events = _events((10, {"a": "1"}), (100, {"b": "1"}))
+    phases = phases_from_spec({"b": "b", "a": "a"}, events, start_frame=0, end_frame=500, samp_rate=100.0)
+    assert _bounds(phases) == [("a", 10, 99), ("b", 100, 500)]
+
+
+def test_phases_from_spec_minutes_anchored_to_first_frame():
+    # 20 min @ 100 Hz = 120000 frames.
+    spec = {"pre": 0, "train": 20, "post": {"start": 40, "end": 60}}
+    phases = phases_from_spec(spec, _EMPTY_EVENTS, start_frame=0, end_frame=999999, samp_rate=100.0)
+    assert [(p.start_frame, p.end_frame) for p in phases] == [
+        (0, 119999), (120000, 239999), (240000, 359999)
+    ]
+
+
+def test_phases_from_spec_minutes_offset_by_first_frame():
+    spec = {"pre": 0, "train": {"start": 10, "end": 20}}
+    phases = phases_from_spec(spec, _EMPTY_EVENTS, start_frame=3000, end_frame=999999, samp_rate=100.0)
+    # 10 min @ 100 Hz = 60000, anchored at first frame 3000.
+    assert [(p.start_frame, p.end_frame) for p in phases] == [(3000, 62999), (63000, 122999)]
+
+
+def test_phases_from_spec_mixed_boundaries():
+    events = _events((50000, {"closed_loop_start": "5"}))
+    spec = {"pre": 0, "train": {"start": "closed_loop_start", "end": 10}}
+    phases = phases_from_spec(spec, events, start_frame=0, end_frame=999999, samp_rate=100.0)
+    # pre at minute 0 -> frame 0; train at the tag frame 50000; end at 10 min -> last frame 59999.
+    assert _bounds(phases) == [("pre", 0, 49999), ("train", 50000, 59999)]
+
+
+def test_phases_from_spec_multi_key_matcher():
+    events = _events(
+        (10, {"closed_loop_start": "5", "side": "right"}),
+        (20, {"closed_loop_start": "5"}),
+        (30, {"closed_loop_start": "5", "side": "left", "stim_electrode": "1234"}),
+    )
+    spec = {"train": {"closed_loop_start": None, "side": "left", "stim_electrode": 1234}}
+    # A bare matcher mapping isn't a definition; it must sit under "start".
+    with pytest.raises(ValueError):
+        phases_from_spec(spec, events, start_frame=0, end_frame=100, samp_rate=100.0)
+    phases = phases_from_spec(
+        {"train": {"start": spec["train"]}}, events, start_frame=0, end_frame=100, samp_rate=100.0
+    )
+    # Only the event carrying every pair matches; None is a wildcard and 1234 matches '1234'.
+    assert _bounds(phases) == [("train", 30, 100)]
+
+
+def test_phases_from_spec_explicit_end_leaves_gap():
+    events = _events(
+        (10, {"pre_recording_start": "5"}), (50, {"pre_recording_end": "5"}),
+        (100, {"closed_loop_start": "5"}),
+    )
+    spec = {
+        "pre": {"start": "pre_recording_start", "end": {"pre_recording_end": None}},
+        "train": "closed_loop_start",
+    }
+    phases = phases_from_spec(spec, events, start_frame=0, end_frame=500, samp_rate=100.0)
+    assert _bounds(phases) == [("pre", 10, 50), ("train", 100, 500)]
+    assert phases.label_for(75) is None
+
+
+def test_phases_from_spec_replicates_are_suffixed():
+    events = _events(
+        (10, {"pre_recording_start": "5"}),
+        (100, {"closed_loop_start": "5"}), (200, {"closed_loop_end": "5"}),
+        (300, {"closed_loop_start": "5"}), (400, {"closed_loop_end": "5"}),
+    )
+    spec = {"pre": "pre_recording_start", "train": {"start": "closed_loop_start", "end": "closed_loop_end"}}
+    phases = phases_from_spec(spec, events, start_frame=0, end_frame=500, samp_rate=100.0)
+    assert _bounds(phases) == [("pre", 10, 99), ("train_1", 100, 200), ("train_2", 300, 400)]
+
+
+def test_phases_from_spec_missing_end_falls_back():
+    events = _events((10, {"a": "1"}), (100, {"b": "1"}))
+    spec = {"a": {"start": "a", "end": "never_seen"}, "b": {"start": "b", "end": "never_seen"}}
+    phases = phases_from_spec(spec, events, start_frame=0, end_frame=500, samp_rate=100.0)
+    # No end event -> the frame before the next phase start, else the end of the recording.
+    assert _bounds(phases) == [("a", 10, 99), ("b", 100, 500)]
+
+
+def test_phases_from_spec_empty_falls_back_to_full():
+    phases = phases_from_spec({}, _EMPTY_EVENTS, start_frame=0, end_frame=500, samp_rate=100.0)
     assert phases.names == ("full",)
+    # A tag-only spec whose tags are all absent also collapses to a single full phase.
+    phases2 = phases_from_spec(
+        {"pre": "never_seen"}, _EMPTY_EVENTS, start_frame=0, end_frame=500, samp_rate=100.0
+    )
+    assert phases2.names == ("full",)
+
+
+@pytest.mark.parametrize("spec", [
+    {"starts": {"pre": 0, "post": 20}, "end": 40},  # the old format
+    {"pre": {"start": 0, "stop": 20}},              # unknown definition key
+    {"pre": {"end": 20}},                           # no start
+    {"pre": None},
+    {"pre": {"start": {}}},
+])
+def test_phases_from_spec_rejects_malformed_spec(spec):
+    with pytest.raises(ValueError):
+        phases_from_spec(spec, _EMPTY_EVENTS, start_frame=0, end_frame=500, samp_rate=100.0)
 
 
 def test_recording_resolves_phases_from_tag_spec(make_recording_data):
-    # A tag spec passed straight to Recording is resolved internally against the recording's own
+    # A spec passed straight to Recording is resolved internally against the recording's own
     # events -- no provisional Recording needed to read event_df / end_frame first.
     data = make_recording_data(
         eventtime=np.array([10, 100], dtype="<i8"),
@@ -73,8 +179,11 @@ def test_recording_resolves_phases_from_tag_spec(make_recording_data):
     )
     rec = Recording(
         0, data,
-        phase_tags=[("pre", "pre_recording_start"), ("train", "closed_loop_start")],
-        end_tag="end_experiment",  # absent from events -> final phase runs to the last frame
+        phase_tags={
+            "pre": "pre_recording_start",
+            # end absent from events -> final phase runs to the last frame
+            "train": {"start": "closed_loop_start", "end": "end_experiment"},
+        },
     )
     assert rec.phases.names == ("pre", "train")
     assert rec.phases.label_for(50) == "pre"
@@ -84,77 +193,18 @@ def test_recording_resolves_phases_from_tag_spec(make_recording_data):
 def test_recording_phases_and_tags_are_mutually_exclusive(make_recording_data):
     with pytest.raises(ValueError):
         Recording(0, make_recording_data(), phases=Phases.full(0, 10),
-                   phase_tags=[("pre", "pre_recording_start")])
-
-
-# --- phases_from_spec (the npz-embedded, polymorphic spec) ----------------------------------------
-
-_EMPTY_EVENTS = pd.DataFrame({"eventtime": [], "eventmessage": []})
-
-
-def test_phases_from_spec_minutes_anchored_to_first_frame():
-    # boundary (minutes) -> start_frame + minutes*60*samp_rate. 20 min @ 100 Hz = 120000 frames.
-    spec = {"starts": {"pre": 0, "train": 20, "post": 40}, "end": 60}
-    phases = phases_from_spec(spec, _EMPTY_EVENTS, start_frame=0, end_frame=999999, samp_rate=100.0)
-    assert phases.names == ("pre", "train", "post")
-    assert [(p.start_frame, p.end_frame) for p in phases] == [
-        (0, 120000), (120000, 240000), (240000, 360000)
-    ]
-
-
-def test_phases_from_spec_minutes_offset_by_first_frame():
-    spec = {"starts": {"pre": 0, "train": 10}, "end": 20}
-    phases = phases_from_spec(spec, _EMPTY_EVENTS, start_frame=3000, end_frame=999999, samp_rate=100.0)
-    # 10 min @ 100 Hz = 60000, anchored at first frame 3000.
-    assert [(p.start_frame, p.end_frame) for p in phases] == [(3000, 63000), (63000, 123000)]
-
-
-def test_phases_from_spec_tags():
-    events = pd.DataFrame({
-        "eventtime": [10, 100, 1000],
-        "eventmessage": [
-            {"pre_recording_start": "5"}, {"closed_loop_start": "5"}, {"post_recording_start": "5"},
-        ],
-    })
-    spec = {
-        "starts": {"pre": "pre_recording_start", "train": "closed_loop_start", "post": "post_recording_start"},
-        "end": "end_experiment",  # absent -> last phase runs to end_frame
-    }
-    phases = phases_from_spec(spec, events, start_frame=0, end_frame=2000, samp_rate=100.0)
-    assert [(p.name, p.start_frame, p.end_frame) for p in phases] == [
-        ("pre", 10, 100), ("train", 100, 1000), ("post", 1000, 2000)
-    ]
-
-
-def test_phases_from_spec_mixed_boundaries():
-    events = pd.DataFrame({"eventtime": [50000], "eventmessage": [{"closed_loop_start": "5"}]})
-    spec = {"starts": {"pre": 0, "train": "closed_loop_start"}, "end": 10}
-    phases = phases_from_spec(spec, events, start_frame=0, end_frame=999999, samp_rate=100.0)
-    # pre at minute 0 -> frame 0; train at the tag frame 50000; end at 10 min -> 60000.
-    assert [(p.name, p.start_frame, p.end_frame) for p in phases] == [
-        ("pre", 0, 50000), ("train", 50000, 60000)
-    ]
-
-
-def test_phases_from_spec_empty_falls_back_to_full():
-    phases = phases_from_spec({"starts": {}}, _EMPTY_EVENTS, start_frame=0, end_frame=500, samp_rate=100.0)
-    assert phases.names == ("full",)
-    # A tag-only spec whose tags are all absent also collapses to a single full phase.
-    phases2 = phases_from_spec(
-        {"starts": {"pre": "never_seen"}}, _EMPTY_EVENTS, start_frame=0, end_frame=500, samp_rate=100.0
-    )
-    assert phases2.names == ("full",)
+                   phase_tags={"pre": "pre_recording_start"})
 
 
 def test_recording_resolves_phases_from_embedded_spec(make_recording_data):
     # samp_rate defaults to 10000 Hz in the fixture; recording spans ~[0, 500000). Minutes must be small.
-    spec = {"starts": {"pre": 0.0, "train": 0.1, "post": 0.2}, "end": 0.5}
+    spec = {"pre": 0.0, "train": 0.1, "post": {"start": 0.2, "end": 0.5}}
     rec = Recording(0, make_recording_data(phase_spec=np.asarray(spec, dtype=object)))
     assert rec.phases.names == ("pre", "train", "post")
 
 
 def test_explicit_phases_override_embedded_spec(make_recording_data):
-    spec = {"starts": {"pre": 0.0, "train": 0.1}, "end": 0.5}
+    spec = {"pre": 0.0, "train": {"start": 0.1, "end": 0.5}}
     data = make_recording_data(phase_spec=np.asarray(spec, dtype=object))
     rec = Recording(0, data, phases=Phases.full(0, 10))
     assert rec.phases.names == ("full",)

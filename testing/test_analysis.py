@@ -177,7 +177,7 @@ def test_summaries_honor_embedded_phase_spec(tmp_path, make_recording_data):
     # make_phases / phase_tags anywhere. The fixture has dense bursts near frames 100k and 300k
     # (10 kHz), so a split at ~0.333 min (200k frames) puts a burst in each phase.
     config = Config(data_root=tmp_path)
-    spec = {"starts": {"early": 0.0, "late": 0.333}, "end": 0.833}
+    spec = {"early": 0.0, "late": {"start": 0.333, "end": 0.833}}
     data = make_recording_data(
         seed=1, exp_id="expP", chip="C0009", well=0, DIV=7,
         phase_spec=np.asarray(spec, dtype=object),
@@ -377,7 +377,7 @@ def test_pooled_summaries_carry_culture_identity(store):
 def _phased_store(tmp_path, make_recording_data):
     """A one-culture store whose recording carries an early/late phase spec."""
     config = Config(data_root=tmp_path)
-    spec = {"starts": {"early": 0.0, "late": 0.333}, "end": 0.833}
+    spec = {"early": 0.0, "late": {"start": 0.333, "end": 0.833}}
     _add_recording(
         config,
         make_recording_data(seed=1, exp_id="expQ", chip="C0014", well=0, DIV=7,
@@ -444,7 +444,7 @@ def _stim_store(tmp_path, make_recording_data, *, chip, phase_spec=None, message
 def test_stim_summary_attributes_stim_to_the_phase_it_falls_in(tmp_path, make_recording_data):
     # The fixture's spikes start at ~frame 3000, so the phases run pre [3k, 103k), train [103k, 303k),
     # post [303k, ...). The five stim pulses sit at 50k..250k, i.e. two in pre and three in train.
-    spec = {"starts": {"pre": 0.0, "train": 1 / 6, "post": 0.5}, "end": 0.833}
+    spec = {"pre": 0.0, "train": 1 / 6, "post": {"start": 0.5, "end": 0.833}}
     config, cpath = _stim_store(tmp_path, make_recording_data, chip="C0010", phase_spec=spec)
 
     df = stimulation.stim_summary(cpath, config.analysis_dir, show_plot=False).set_index("phase")
@@ -463,7 +463,7 @@ def test_stim_summary_unphased_recording_is_a_single_full_row(tmp_path, make_rec
     # window (rather than a negative number left over from the old 20-min pre/post assumption).
     config, cpath = _stim_store(tmp_path, make_recording_data, chip="C0011")
     rec = Recording(0, io.load_preprocessed(cpath.recordings[7].npz))
-    span_min = (rec.phases.phases[0].end_frame - rec.phases.phases[0].start_frame) / rec.samp_rate / 60
+    span_min = rec.phases.phases[0].n_frames / rec.samp_rate / 60
 
     df = stimulation.stim_summary(cpath, config.analysis_dir, show_plot=False)
 
@@ -490,7 +490,7 @@ def test_stim_summary_tolerates_non_dict_event_messages(tmp_path, make_recording
 
 
 def test_generate_report_with_stimulation_section(tmp_path, make_recording_data):
-    spec = {"starts": {"pre": 0.0, "train": 1 / 6, "post": 0.5}, "end": 0.833}
+    spec = {"pre": 0.0, "train": 1 / 6, "post": {"start": 0.5, "end": 0.833}}
     config, _ = _stim_store(tmp_path, make_recording_data, chip="C0013", phase_spec=spec)
 
     out = generate_report(
@@ -500,7 +500,7 @@ def test_generate_report_with_stimulation_section(tmp_path, make_recording_data)
 
 
 def test_population_stim_plot_renders(tmp_path, make_recording_data):
-    spec = {"starts": {"pre": 0.0, "train": 1 / 6, "post": 0.5}, "end": 0.833}
+    spec = {"pre": 0.0, "train": 1 / 6, "post": {"start": 0.5, "end": 0.833}}
     config, cpath = _stim_store(tmp_path, make_recording_data, chip="C0015", phase_spec=spec)
     stimulation.stim_summary(cpath, config.analysis_dir, show_plot=False)
     sel_paths = resolve_paths(CultureSelector(cultures=[CultureID("expS", "C0015", "0")]), config)
