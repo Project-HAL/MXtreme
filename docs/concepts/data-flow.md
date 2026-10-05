@@ -29,7 +29,7 @@ each hop.
         │  mxtreme.io.load_preprocessed() → mxtreme.recording.Recording
         │  mxtreme.bursting.BurstDetector.detect() → .extract_features()
         ▼
-   burst_data/…/*_burst_data.csv  +  per-experiment burst log
+   burst_data/…/*_burst_data.csv  +  per-batch burst log
         │
         │  mxtreme.analysis.{activity,spatial,stimulation,performance}
         ▼
@@ -128,7 +128,7 @@ saved file carries a record of exactly how it was produced.
 {func}`mxtreme.io.save_preprocessed` writes one compressed `.npz` per well at:
 
 ```
-preprocessed/<exp_id>/<chip>/well<N>/DIV<d>_<plate_date>_<chip>_<exp_id>_well<N>_exp_data.npz
+preprocessed/<batch_id>/<chip>/well<N>/DIV<d>_<plate_date>_<chip>_<batch_id>_well<N>[_<experiment>]_exp_data.npz
 ```
 
 Alongside the arrays (`spike_data`, `spike_bin`, `channelmap`, `eventtime`, …) it stores identity
@@ -210,7 +210,7 @@ Feature extraction is a separate call, so you can detect once and re-extract fea
 {class}`~mxtreme.params.BurstFeatureParams` without re-detecting.
 
 Passing `burst_data_dir=` to either call writes the results out — per-recording CSVs at
-`burst_data/<exp_id>/<chip>/well<N>/DIV<d>_…_burst_data.csv`, plus a per-experiment burst log that
+`burst_data/<batch_id>/<chip>/well<N>/DIV<d>_…_burst_data.csv`, plus a per-batch burst log that
 records detection and feature-extraction timestamps independently. Omit it for pure in-memory work.
 
 ## Stage 6 — Analysis
@@ -218,7 +218,7 @@ records detection and feature-extraction timestamps independently. Omit it for p
 Each topic module in {mod}`mxtreme.analysis` follows the same two-level shape:
 
 - A **culture-level** function takes one `CulturePaths`, computes across all its DIVs, and writes a
-  tidy per-DIV CSV under `analysis/<category>/<exp_id>/<chip>/well<N>/`.
+  tidy per-DIV CSV under `analysis/<category>/<batch_id>/<chip>/well<N>/`.
 - A **population-level** function reads those CSVs back and pools them across cultures.
 
 | Module | Culture level | Population level |

@@ -19,7 +19,7 @@ def _summary_paths(cpath, analysis_dir: Path, category: str, name: str,
     as ``.npz`` -- while keeping every per-culture output under the same predictable layout.
     """
     cid = cpath.culture_id
-    save_dir = analysis_dir / category / cid.exp_id / cid.chip / f"well{cid.well}"
+    save_dir = analysis_dir / category / cid.batch_id / cid.chip / f"well{cid.well}"
     return save_dir, save_dir / f"{cid}_{name}{ext}"
 
 
@@ -42,10 +42,10 @@ def load_population_summaries(sel_paths, data_dir: Path, suffix: str) -> pd.Data
     """
 
     frames = []
-    for exp_id in sel_paths:
-        epath = sel_paths[exp_id]
-        for cid in epath.cultures:
-            csv = data_dir / exp_id / cid.chip / f"well{cid.well}" / f"{cid}_{suffix}.csv"
+    for batch_id in sel_paths:
+        bpath = sel_paths[batch_id]
+        for cid in bpath.cultures:
+            csv = data_dir / batch_id / cid.chip / f"well{cid.well}" / f"{cid}_{suffix}.csv"
             frames.append(stamp_identity(pd.read_csv(csv), cid))
 
     if not frames:

@@ -2,6 +2,8 @@
 
 from functools import partial
 
+import numpy as np
+
 from mxtreme import clean
 from mxtreme.pipeline import Pipeline
 
@@ -39,7 +41,7 @@ def test_run_skips_wells_left_empty(make_well, tmp_path):
     # Well 0 keeps only positive spikes, so remove_positive_deflections empties it (no exception) and
     # run() should skip it; well 1 is normal and saved.
     empty_well = make_well()
-    empty_well["data"] = empty_well["data"][empty_well["data"]["amplitude"] > 0]
+    empty_well["spike_data"] = empty_well["spike_data"][empty_well["spike_data"]["amplitude"] > 0]
 
     data = {0: empty_well, 1: make_well(well=1)}
     paths = Pipeline([clean.remove_positive_deflections]).run(data, datastore=tmp_path)
@@ -57,6 +59,19 @@ def test_transform_records_step_log_and_retains_wells(make_well):
     assert set(log[0]) == {"step", "n_before", "n_after", "removed", "seconds"}
     # spike_filter should have removed at least one spike in the synthetic well
     assert any(r["step"] == "spike_filter" and r["removed"] > 0 for r in log)
+
+
+def test_time_and_unit_transforms_apply_only_once(make_well):
+    """normalize_time and dac_to_voltage record that they ran, so a second pass leaves the data alone
+    (``lsb=2`` so a second dac_to_voltage would visibly rescale amplitudes)."""
+    once = _full_pipeline().transform({0: make_well(lsb=np.array([2.0]))})[0]
+    twice = _full_pipeline().transform({0: make_well(lsb=np.array([2.0]))})
+    _full_pipeline().transform(twice)
+
+    np.testing.assert_array_equal(twice[0]["spike_data"], once["spike_data"])
+    assert twice[0]["preprocessing_params"]["time_normalized"] is True
+    assert twice[0]["preprocessing_params"]["amplitude_units"] == "V"
+    assert len(twice[0]["step_log"]) == 2 * len(once["step_log"])   # both passes recorded
 
 
 def test_run_frees_data_by_default_and_retains_when_false(make_well, tmp_path):

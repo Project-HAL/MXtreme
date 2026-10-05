@@ -24,11 +24,11 @@ DETECT = BurstDetectParams(n=50, noise_thresh=0.02, burst_thresh=0.15, min_dist_
 
 def _add_recording(config: Config, data: dict, well_no: int) -> None:
     """Write one synthetic recording (npz + burst CSV) into the managed store and register it."""
-    exp_id, chip, div = str(data["exp_id"]), str(data["chip"]), int(data["DIV"])
+    batch_id, chip, div = str(data["batch_id"]), str(data["chip"]), int(data["DIV"])
 
-    out_dir = config.preprocessed_dir / exp_id / chip / f"well{well_no}"
+    out_dir = config.preprocessed_dir / batch_id / chip / f"well{well_no}"
     out_dir.mkdir(parents=True, exist_ok=True)
-    npz = out_dir / f"DIV{div}_250101_{chip}_{exp_id}_well{well_no}_exp_data.npz"
+    npz = out_dir / f"DIV{div}_250101_{chip}_{batch_id}_well{well_no}_exp_data.npz"
     np.savez_compressed(npz, **data)
 
     rec = Recording(0, io.load_preprocessed(npz))
@@ -37,7 +37,7 @@ def _add_recording(config: Config, data: dict, well_no: int) -> None:
     io.save_burst_data(bursts, config.burst_data_dir, rec)
 
     io.register(
-        {well_no: {"exp_id": exp_id, "chip": chip, "well": well_no, "DIV": div}},
+        {well_no: {"batch_id": batch_id, "chip": chip, "well": well_no, "DIV": div}},
         config.registry_path,
     )
 
@@ -54,14 +54,14 @@ def store(tmp_path, make_recording_data):
     for seed, div in ((1, 7), (2, 8)):
         _add_recording(
             config,
-            make_recording_data(seed=seed, exp_id="expA", chip="C0001", well=0, DIV=div,
+            make_recording_data(seed=seed, batch_id="expA", chip="C0001", well=0, DIV=div,
                                 exp_condition=np.array([2, 0])),
             well_no=0,
         )
     # Culture B: a different experiment/chip (cross-experiment group case).
     _add_recording(
         config,
-        make_recording_data(seed=3, exp_id="expB", chip="C0002", well=0, DIV=7),
+        make_recording_data(seed=3, batch_id="expB", chip="C0002", well=0, DIV=7),
         well_no=0,
     )
 
@@ -79,6 +79,27 @@ def test_resolve_single_culture_all_divs(store):
     assert cpath.recordings[7].burst_stats.exists()
 
 
+def test_resolve_without_burst_data(store):
+    """A store of freshly preprocessed recordings has no burst CSVs yet: resolution still succeeds,
+    with ``burst_stats=None``, and analyses that need bursts say so clearly."""
+    import shutil
+
+    config, cid_a, _ = store
+    shutil.rmtree(config.burst_data_dir)
+
+    # Built the way a user would, straight from a registry row (numpy-typed well).
+    row = pd.read_csv(config.registry_path).iloc[0]
+    culture = CultureID(row["batch_id"], row["chip"], row["well"])
+    assert culture == cid_a
+
+    cpath = resolve_paths(culture, config)
+    assert sorted(cpath.recordings) == [7, 8]
+    assert all(r.npz.exists() for r in cpath.recordings.values())
+    assert all(r.burst_stats is None for r in cpath.recordings.values())
+    with pytest.raises(FileNotFoundError, match="run burst detection"):
+        cpath.recordings[7].require_burst_stats()
+
+
 def test_resolve_ignores_activity_scan_rows(store):
     """The registry also indexes scans -- raw .h5 files with no .npz behind them.
 
@@ -88,14 +109,14 @@ def test_resolve_ignores_activity_scan_rows(store):
     config, cid_a, _ = store
 
     class _ScanParams:
-        exp_id, chip, div = "expA", "C0001", 21  # a DIV culture A has no recording for
+        batch_id, chip, div = "expA", "C0001", 21  # a DIV culture A has no recording for
         wells, conditions = [0], []
 
     io.register_scan(_ScanParams(), config.registry_path)
     assert len(pd.read_csv(config.registry_path)) == 4  # the scan row really is there
 
     assert sorted(resolve_paths(cid_a, config).recordings) == [7, 8]
-    assert len(resolve_recordings(CultureSelector(exp_ids=["expA"]), config)) == 2
+    assert len(resolve_recordings(CultureSelector(batch_ids=["expA"]), config)) == 2
 
 
 def test_resolve_reads_a_registry_written_before_scans_were_indexed(store):
@@ -107,14 +128,34 @@ def test_resolve_reads_a_registry_written_before_scans_were_indexed(store):
     assert sorted(resolve_paths(cid_a, config).recordings) == [7, 8]
 
 
+def test_resolve_keeps_an_experiment_apart_from_the_scans_of_its_div(store, make_recording_data):
+    """An ingested experiment on DIV 7 is the same culture, but resolves only when asked for."""
+    config, cid_a, _ = store
+    out_dir = config.preprocessed_dir / "expA" / "C0001" / "well0"
+    npz = out_dir / "DIV7_250101_C0001_expA_well0_stim1_exp_data.npz"
+    np.savez_compressed(npz, **make_recording_data(seed=4, batch_id="expA", experiment="stim1"))
+    io.register(
+        {0: {"batch_id": "expA", "experiment": "stim1", "chip": "C0001", "DIV": 7}},
+        config.registry_path,
+    )
+
+    scans = resolve_paths(cid_a, config)
+    assert sorted(scans.recordings) == [7, 8] and scans.recordings[7].npz != npz
+
+    stim = resolve_paths(cid_a, config, experiment="stim1")
+    assert sorted(stim.recordings) == [7] and stim.recordings[7].npz == npz
+    assert stim.recordings[7].recording_id.experiment == "stim1"
+    assert resolve_recordings(CultureSelector(experiment="stim1"), config).npz == [npz]
+
+
 def test_resolve_recordings_flattens_a_selection(store):
     config, cid_a, cid_b = store
     recs = resolve_recordings(CultureSelector(cultures=[cid_a, cid_b]), config)
 
-    # Culture A has 2 DIVs, culture B has 1; ordered by exp_id, chip, well, then DIV.
+    # Culture A has 2 DIVs, culture B has 1; ordered by batch_id, chip, well, then DIV.
     assert len(recs) == 3
     assert [r.recording_id.div for r in recs] == [7, 8, 7]
-    assert [r.recording_id.exp_id for r in recs] == ["expA", "expA", "expB"]
+    assert [r.recording_id.batch_id for r in recs] == ["expA", "expA", "expB"]
     assert recs.npz == [r.npz for r in recs]
     assert all(p.exists() for p in recs.npz)
     assert all(p.exists() for p in recs.burst_stats)
@@ -132,10 +173,10 @@ def test_resolve_recordings_to_frame(store):
     config, cid_a, cid_b = store
     df = resolve_recordings(CultureSelector(cultures=[cid_a, cid_b]), config).to_frame()
 
-    assert list(df.columns) == ["exp_id", "chip", "well", "div", "npz", "burst_stats"]
+    assert list(df.columns) == ["batch_id", "chip", "well", "div", "experiment", "npz", "burst_stats"]
     assert len(df) == 3
     assert df["div"].tolist() == [7, 8, 7]
-    assert set(df["exp_id"]) == {"expA", "expB"}
+    assert set(df["batch_id"]) == {"expA", "expB"}
 
 
 def test_resolve_recordings_respects_div_filter(store):
@@ -179,7 +220,7 @@ def test_summaries_honor_embedded_phase_spec(tmp_path, make_recording_data):
     config = Config(data_root=tmp_path)
     spec = {"early": 0.0, "late": {"start": 0.333, "end": 0.833}}
     data = make_recording_data(
-        seed=1, exp_id="expP", chip="C0009", well=0, DIV=7,
+        seed=1, batch_id="expP", chip="C0009", well=0, DIV=7,
         phase_spec=np.asarray(spec, dtype=object),
     )
     _add_recording(config, data, well_no=0)
@@ -380,7 +421,7 @@ def _phased_store(tmp_path, make_recording_data):
     spec = {"early": 0.0, "late": {"start": 0.333, "end": 0.833}}
     _add_recording(
         config,
-        make_recording_data(seed=1, exp_id="expQ", chip="C0014", well=0, DIV=7,
+        make_recording_data(seed=1, batch_id="expQ", chip="C0014", well=0, DIV=7,
                             phase_spec=np.asarray(spec, dtype=object)),
         well_no=0,
     )
@@ -434,7 +475,7 @@ def _stim_store(tmp_path, make_recording_data, *, chip, phase_spec=None, message
         eventtime, messages = _stim_events()
     extra = {} if phase_spec is None else {"phase_spec": np.asarray(phase_spec, dtype=object)}
     data = make_recording_data(
-        seed=1, exp_id="expS", chip=chip, well=0, DIV=7,
+        seed=1, batch_id="expS", chip=chip, well=0, DIV=7,
         eventtime=eventtime, event_messages=messages, **extra,
     )
     _add_recording(config, data, well_no=0)

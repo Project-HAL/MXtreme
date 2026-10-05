@@ -388,7 +388,7 @@ def test_update_burst_log_preserves_step_fields(make_recording_data, tmp_path):
     # Stage A: detection only.
     det = BurstDetector(DETECT).detect(rec)
     io.update_burst_log(tmp_path, rec, det)
-    log1 = pd.read_csv(tmp_path / f"{rec.exp_id}_burst_log.csv")
+    log1 = pd.read_csv(tmp_path / f"{rec.batch_id}_burst_log.csv")
     assert len(log1) == 1
     assert log1.loc[0, "detection_completed_at"] == det.detected_at
     assert pd.isna(log1.loc[0, "features_computed_at"])
@@ -401,7 +401,7 @@ def test_update_burst_log_preserves_step_fields(make_recording_data, tmp_path):
     reloaded.extract_features(rec, BurstFeatureParams())
     io.update_burst_log(tmp_path, rec, reloaded)
 
-    log2 = pd.read_csv(tmp_path / f"{rec.exp_id}_burst_log.csv")
+    log2 = pd.read_csv(tmp_path / f"{rec.batch_id}_burst_log.csv")
     assert len(log2) == 1                                              # same row updated in place
     assert log2.loc[0, "detection_completed_at"] == det.detected_at    # preserved
     assert log2.loc[0, "detect_params"] == detect_params_logged        # preserved
@@ -415,7 +415,7 @@ def test_detect_auto_updates_burst_log(make_recording_data, tmp_path):
     # Detection alone, with burst_data_dir given, writes the log automatically (no manual call).
     det = BurstDetector(DETECT).detect(rec, burst_data_dir=tmp_path)
 
-    log = pd.read_csv(tmp_path / f"{rec.exp_id}_burst_log.csv")
+    log = pd.read_csv(tmp_path / f"{rec.batch_id}_burst_log.csv")
     assert len(log) == 1
     assert log.loc[0, "detection_completed_at"] == det.detected_at
     assert pd.isna(log.loc[0, "features_computed_at"])         # features haven't run yet
@@ -434,7 +434,7 @@ def test_extract_features_auto_updates_log_independently(make_recording_data, tm
     assert reloaded.detected_at is None
     reloaded.extract_features(rec, BurstFeatureParams(), burst_data_dir=tmp_path)
 
-    log = pd.read_csv(tmp_path / f"{rec.exp_id}_burst_log.csv")
+    log = pd.read_csv(tmp_path / f"{rec.batch_id}_burst_log.csv")
     assert len(log) == 1                                       # same row updated in place
     assert log.loc[0, "detection_completed_at"] == detected_at  # preserved across the features-only write
     assert isinstance(log.loc[0, "features_computed_at"], str)  # now set

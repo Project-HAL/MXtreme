@@ -58,7 +58,9 @@ class Recording:
         self.id = id
 
         # --- identity ---
-        self.exp_id = _item(exp_data["exp_id"])
+        # A dict loaded from an .npz saved before batch_id was the identity carries it as exp_id.
+        self.batch_id = _item(exp_data["batch_id"] if "batch_id" in exp_data else exp_data["exp_id"])
+        self.experiment = _item(exp_data.get("experiment") or "")
         self.chip = _item(exp_data["chip"])
         self.well = _item(exp_data["well"])
         self.DIV = _item(exp_data["DIV"])

@@ -128,13 +128,13 @@ def _plot_stim_summary(df: pd.DataFrame, cid, analysis_dir, show_plot, save_plot
 def plot_population_stim_summary(sel_paths, analysis_dir: Path, phase: str = None, savename=None):
     """Stimulation vs DIV pooled across cultures: mean ± SEM, with a faint line per culture.
 
-    :param sel_paths: ``{exp_id: ExperimentPaths}`` from :func:`mxtreme.paths.resolve_paths`.
+    :param sel_paths: ``{batch_id: BatchPaths}`` from :func:`mxtreme.paths.resolve_paths`.
     :param analysis_dir: Analysis output root (typically ``config.analysis_dir``).
     :param phase: If given, restrict to this phase only; ``None`` plots all phases as separate lines.
     :param savename: Filename for the saved figure, written into ``<analysis_dir>/stimulation/``.
     """
 
-    # TODO: update if sel_paths has more than one exp_id, decide whether to combine them or plot them separately
+    # TODO: update if sel_paths has more than one batch_id, decide whether to combine them or plot them separately
 
     pop_df = load_population_summaries(sel_paths, data_dir=analysis_dir/"stimulation", suffix='stim_summary')
 

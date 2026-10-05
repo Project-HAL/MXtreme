@@ -247,12 +247,10 @@ class ActivityScanParams:
         """Build the metadata dict written into the file.
 
         Shaped for :func:`mxtreme.scans.mx_setup.write_metadata`, and therefore for
-        :func:`mxtreme.extract.extract`, which reads the same blob back out. A scan has no
-        experiment name, so ``Exp ID`` carries the batch id -- extraction and the preprocessed tree
-        then file the scan's data under its batch, and nothing downstream needs to change.
+        :func:`mxtreme.extract.extract`, which reads the same blob back out. ``Batch ID`` is the
+        scan's identity: extraction and the preprocessed tree file its data under its batch.
         """
         return {
-            "Exp ID": self.batch_id,
             "Batch ID": self.batch_id,
             "Chip ID": self.chip,
             "Plate date": self.plate_date,

@@ -224,8 +224,8 @@ def plot_population_spatial_summary(sel_paths, analysis_dir: Path, savename: str
     )
 
     n_cultures = pop_df['culture_id'].nunique()
-    n_exps     = len(sel_paths)
-    exp_ids    = list(sel_paths.keys())
+    n_batches  = len(sel_paths)
+    batch_ids  = list(sel_paths.keys())
 
     stats = aggregate_by_div_phase(
         pop_df, value_cols=['n_electrodes', 'pct_chip_covered', 'mean_nn_distance_um', 'electrode_density']
@@ -239,8 +239,8 @@ def plot_population_spatial_summary(sel_paths, analysis_dir: Path, savename: str
         ('electrode_density',   'sem_electrode_density',     'Electrodes / µm²',      'Electrode Density'),
     ]
 
-    exp_label = f"{n_exps} experiments pooled ({', '.join(exp_ids)})" if n_exps > 1 else exp_ids[0]
-    suptitle = f'Population Spatial Summary — {exp_label}\nmean ± SEM, n = {n_cultures} cultures'
+    batch_label = f"{n_batches} batches pooled ({', '.join(batch_ids)})" if n_batches > 1 else batch_ids[0]
+    suptitle = f'Population Spatial Summary — {batch_label}\nmean ± SEM, n = {n_cultures} cultures'
 
     save_path = (Path(analysis_dir) / "spatial" / savename) if savename else None
 

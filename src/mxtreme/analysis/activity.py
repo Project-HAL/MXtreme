@@ -47,7 +47,7 @@ def burst_activity_summary(cpath, analysis_dir: Path, use_existing=True, show_pl
                 p.name: frame_to_sec(p.n_frames, samp_rate) for p in rec.phases
             }
 
-            burst_stats = cpath.recordings[div].burst_stats
+            burst_stats = cpath.recordings[div].require_burst_stats()
             burst_data = pd.read_csv(burst_stats)
 
             # Keep only network bursts (the analogue of the old "HAL_like" class).
@@ -413,7 +413,7 @@ def culture_distributions(cpath, analysis_dir: Path, *, phase: str | None = None
         firing_rates = firing_rate_chan(spikes, rec.samp_rate)
         fr_vals = np.array([v for v in firing_rates.values() if v is not None], dtype=float)
 
-        bursts = pd.read_csv(cpath.recordings[div].burst_stats)
+        bursts = pd.read_csv(cpath.recordings[div].require_burst_stats())
         bursts = bursts[bursts['kind'] == 'network']
         if phase is not None and 'phase' in bursts.columns:
             bursts = bursts[bursts['phase'] == phase]
@@ -448,17 +448,17 @@ def plot_population_burst_summary(
 
     Plots mean ± SEM across cultures vs DIV, one line per phase.
 
-    :param sel_paths: ``{exp_id: ExperimentPaths}``, as returned by
+    :param sel_paths: ``{batch_id: BatchPaths}``, as returned by
         :func:`mxtreme.paths.resolve_paths` for a :class:`~mxtreme.identity.CultureSelector`.
     :param analysis_dir: Root summary directory (typically ``config.analysis_dir``); CSVs are read
-        from ``<analysis_dir>/activity/<exp_id>/<chip>/well<well>/``.
+        from ``<analysis_dir>/activity/<batch_id>/<chip>/well<well>/``.
     :param phase: If given, filter to this phase only; ``None`` plots all phases as separate lines.
     :param savename: Filename for the saved figure, written into ``<analysis_dir>/activity/``. If
         ``None`` the figure is shown but not saved.
 
     .. note::
-       If ``sel_paths`` spans more than one ``exp_id`` the cultures are pooled and a note is added to
-       the figure title. For per-experiment panels, split ``sel_paths`` before calling.
+       If ``sel_paths`` spans more than one batch the cultures are pooled and a note is added to
+       the figure title. For per-batch panels, split ``sel_paths`` before calling.
     """
 
     pop_df = load_population_summaries(
@@ -471,8 +471,8 @@ def plot_population_burst_summary(
         pop_df = pop_df[pop_df['phase']==phase]
 
     n_cultures = pop_df['culture_id'].nunique()
-    n_exps     = len(sel_paths)
-    exp_ids    = list(sel_paths.keys())
+    n_batches  = len(sel_paths)
+    batch_ids  = list(sel_paths.keys())
 
     stats = aggregate_by_div_phase(
         pop_df, value_cols=['burst_rate_hz', 'median_ibi_sec', 'median_size_pct', 'median_dur_sec']
@@ -486,8 +486,8 @@ def plot_population_burst_summary(
         ('burst_rate_hz',   'sem_burst_rate_hz',    'Burst rate (bursts s⁻¹)',      'Burst Rate'),
     ]
 
-    exp_label = f"{n_exps} experiments pooled ({', '.join(exp_ids)})" if n_exps > 1 else exp_ids[0]
-    suptitle = f'Population Burst Activity — {exp_label}\nmean ± SEM, n = {n_cultures} cultures'
+    batch_label = f"{n_batches} batches pooled ({', '.join(batch_ids)})" if n_batches > 1 else batch_ids[0]
+    suptitle = f'Population Burst Activity — {batch_label}\nmean ± SEM, n = {n_cultures} cultures'
 
     save_path = (Path(analysis_dir) / "activity" / savename) if savename else None
 
@@ -504,17 +504,17 @@ def plot_population_channel_activity(sel_paths,
 
     Plots mean ± SEM across cultures vs DIV, one line per phase.
 
-    :param sel_paths: ``{exp_id: ExperimentPaths}``, as returned by
+    :param sel_paths: ``{batch_id: BatchPaths}``, as returned by
         :func:`mxtreme.paths.resolve_paths` for a :class:`~mxtreme.identity.CultureSelector`.
     :param analysis_dir: Root summary directory (typically ``config.analysis_dir``); CSVs are read
-        from ``<analysis_dir>/activity/<exp_id>/<chip>/well<well>/``.
+        from ``<analysis_dir>/activity/<batch_id>/<chip>/well<well>/``.
     :param phase: If given, filter to this phase only; ``None`` plots all phases as separate lines.
     :param savename: Filename for the saved figure, written into ``<analysis_dir>/activity/``. If
         ``None`` the figure is shown but not saved.
 
     .. note::
-       If ``sel_paths`` spans more than one ``exp_id`` the cultures are pooled and a note is added to
-       the figure title. For per-experiment panels, split ``sel_paths`` before calling.
+       If ``sel_paths`` spans more than one batch the cultures are pooled and a note is added to
+       the figure title. For per-batch panels, split ``sel_paths`` before calling.
     """
 
     pop_df = load_population_summaries(
@@ -527,8 +527,8 @@ def plot_population_channel_activity(sel_paths,
         pop_df = pop_df[pop_df['phase'] == phase]
 
     n_cultures = pop_df['culture_id'].nunique()
-    n_exps     = len(sel_paths)
-    exp_ids    = list(sel_paths.keys())
+    n_batches  = len(sel_paths)
+    batch_ids  = list(sel_paths.keys())
 
     stats = aggregate_by_div_phase(
         pop_df, value_cols=['mean_fr_hz', 'mean_isi_msec', 'mean_amp_uv', 'pct_active_chan']
@@ -542,8 +542,8 @@ def plot_population_channel_activity(sel_paths,
         ('pct_active_chan', 'sem_pct_active_chan', 'Active channels (%)',  'Active Channels'),
     ]
 
-    exp_label = f"{n_exps} experiments pooled ({', '.join(exp_ids)})" if n_exps > 1 else exp_ids[0]
-    suptitle = f'Population Channel Activity — {exp_label}\nmean ± SEM, n = {n_cultures} cultures'
+    batch_label = f"{n_batches} batches pooled ({', '.join(batch_ids)})" if n_batches > 1 else batch_ids[0]
+    suptitle = f'Population Channel Activity — {batch_label}\nmean ± SEM, n = {n_cultures} cultures'
 
     save_path = (Path(analysis_dir) / "activity" / savename) if savename else None
 

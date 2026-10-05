@@ -142,8 +142,9 @@ data = extract.extract(str(scan.h5_path))
 
 A raw `.h5` recorded outside MXtreme (MaxLab's own Record tab, a collaborator's export) joins the
 same tree through {func}`mxtreme.store.ingest_recording`. You supply the identity the file cannot —
-its batch, chip, DIV — plus a free-form `exp_id` naming the experiment, which becomes the file-name
-tail and the registry row's `exp_id`:
+its batch, chip, DIV — plus a free-form `experiment` name, which becomes the file-name tail and the
+registry row's `experiment`. The batch stays the recording's identity; the name only tells it apart
+from a scan of the same culture on the same DIV:
 
 ```python
 from mxtreme.store import ingest_recording
@@ -151,7 +152,7 @@ from mxtreme.store import ingest_recording
 ingest_recording(
     "/path/to/export.raw.h5", config,
     batch="fall2026_batch1_DRG", plate_date=260810,
-    chip="M07460", div=21, exp_id="stim_trial_3",
+    chip="M07460", div=21, experiment="stim_trial_3",
 )
 ```
 
@@ -161,7 +162,7 @@ row in `registry.csv`.
 
 A scan recorded by MaxLab Live's own assays (Scope's Activity Scan, a network recording made from
 its Record tab) is not an experiment: pass `kind="activity_scan"` or `kind="network_scan"` instead
-of an `exp_id`, and it is filed under the scan tail and registered as that kind — indistinguishable
+of an `experiment` name, and it is filed under the scan tail and registered as that kind — indistinguishable
 in the store from a scan MXtreme ran, so electrode selection and the analysis chain read it as one.
 `wells=[...]` keeps only the plated wells of a multi-well plate. Before deciding what a file is,
 {func}`mxtreme.store.describe_recording` reads what it says about itself — the chip Scope wrote to

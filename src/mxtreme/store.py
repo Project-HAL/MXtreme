@@ -11,11 +11,12 @@ experiment name::
                     DIV_<div>/
                         plating_<plate_date>_<batch_id>_chip_<chip>_well_<well>_DIV_<div>_activity_scan.raw.h5
                         plating_<plate_date>_<batch_id>_chip_<chip>_well_<well>_DIV_<div>_network_scan.raw.h5
-                        plating_<plate_date>_<batch_id>_chip_<chip>_well_<well>_DIV_<div>_<exp_id>.raw.h5
+                        plating_<plate_date>_<batch_id>_chip_<chip>_well_<well>_DIV_<div>_<experiment>.raw.h5
 
-A *batch* is one plating event, named at the bench when it happens -- see :class:`Batch`. The
-``<exp_id>`` tail is a free string naming one experiment, supplied when an exogenous recording is
-ingested (see :func:`ingest_recording`); scans carry no exp id, their kind is the tail instead.
+A *batch* is one plating event, named at the bench when it happens -- see :class:`Batch` -- and
+its id is the identity everything downstream is keyed by. The ``<experiment>`` tail is a free string
+naming one experiment, supplied when an exogenous recording is ingested (see
+:func:`ingest_recording`); scans carry no experiment name, their kind is the tail instead.
 
 A culture can be network-scanned more than once on one DIV. The first such file is
 ``..._network_scan.raw.h5``; when a second is ingested the two are numbered in arrival order,
@@ -72,8 +73,8 @@ _SCAN_TAIL = re.compile(r"_(activity|network)_scan(_\d+)?\.raw\.h5$")
 #: number after it.
 _NETWORK_INDEX = re.compile(r"_network_scan(?:_(\d+))?\.raw\.h5$")
 
-#: Extracts the experiment-id tail of a store file name: everything after the ``DIV_<div>_`` marker.
-_EXP_TAIL = re.compile(r"_DIV_\d+_(?P<exp_id>.+?)\.raw\.h5$")
+#: Extracts the experiment-name tail of a store file name: everything after the ``DIV_<div>_`` marker.
+_EXP_TAIL = re.compile(r"_DIV_\d+_(?P<experiment>.+?)\.raw\.h5$")
 
 #: Plating dates are ``YYMMDD``, matching :func:`mxtreme.scans.mx_setup.write_metadata`.
 _PLATE_DATE = re.compile(r"^\d{6}$")
@@ -221,7 +222,7 @@ def recording_dir(
 
 
 def recording_stem(batch: Batch | str, plate_date, chip: str, well, div: int) -> str:
-    """Base name shared by every file of one well on one DIV, without the kind/exp-id tail.
+    """Base name shared by every file of one well on one DIV, without the kind/experiment tail.
 
     ``plating_<plate_date>_<batch_id>_chip_<chip>_well_<well>_DIV_<div>``. ``well`` is normally an
     int; a multi-well recording awaiting :func:`split_by_well` uses a joined token (``"0-3"``)
@@ -351,7 +352,7 @@ def recording_kind(h5_path: str | Path) -> str:
 
     The tail is the only thing on disk that tells the kinds apart: the embedded metadata blob
     carries the culture's identity, not what was run on it. A name with neither scan tail is an
-    ingested experiment recording, whose tail is its exp id.
+    ingested experiment recording, whose tail is its experiment name.
     """
     match = _SCAN_TAIL.search(Path(h5_path).name)
     return f"{match.group(1)}_scan" if match else "experiment"
@@ -368,7 +369,7 @@ class RecordingLocation:
     :param well: Well number, from the well directory.
     :param div: Days *in vitro*, from the DIV directory.
     :param kind: See :data:`RECORDING_KINDS`.
-    :param exp_id: The experiment id tail for ``kind="experiment"``; ``""`` for scans.
+    :param experiment: The experiment-name tail for ``kind="experiment"``; ``""`` for scans.
     """
 
     batch: Batch
@@ -378,7 +379,7 @@ class RecordingLocation:
     well: int
     div: int
     kind: str
-    exp_id: str
+    experiment: str
 
 
 def parse_recording_path(h5_path: Path, recordings_dir: Path) -> RecordingLocation | None:
@@ -409,12 +410,12 @@ def parse_recording_path(h5_path: Path, recordings_dir: Path) -> RecordingLocati
         return None
 
     kind = recording_kind(h5_path)
-    exp_id = ""
+    experiment = ""
     if kind == "experiment":
         exp_match = _EXP_TAIL.search(h5_path.name)
         # A foreign file name still has a full identity from the directories; falling back to its
         # stem keeps it indexable rather than skipped.
-        exp_id = exp_match["exp_id"] if exp_match else h5_path.name.removesuffix(".raw.h5").removesuffix(".h5")
+        experiment = exp_match["experiment"] if exp_match else h5_path.name.removesuffix(".raw.h5").removesuffix(".h5")
 
     return RecordingLocation(
         batch=batch,
@@ -424,7 +425,7 @@ def parse_recording_path(h5_path: Path, recordings_dir: Path) -> RecordingLocati
         well=int(well_match.group(1)),
         div=int(div_match.group(1)),
         kind=kind,
-        exp_id=exp_id,
+        experiment=experiment,
     )
 
 
@@ -632,10 +633,11 @@ def derived_files(config, h5_path: str | Path) -> list[Path]:
 
     An activity scan's derivatives are its electrode selection (the figures and the electrode
     list in ``electrode_selection/`` beside it). A network scan's, or an ingested experiment's,
-    are the preprocessed ``.npz`` and the burst CSV for that well and DIV -- under the batch id for
-    a scan (the pipeline files a scan by its batch id, see :func:`mxtreme.scans.activity_scan`),
-    under the experiment name for an experiment. Analysis summaries and reports are per culture
-    across DIVs, and are left alone: they are rebuilt from what remains.
+    are the preprocessed ``.npz`` and the burst CSV for that well and DIV, under the batch id
+    (an experiment's carry its name as a file-name tail, see :func:`mxtreme.io.recording_file_name`;
+    one preprocessed before that sits under a directory named for the experiment instead). Analysis
+    summaries and reports are per culture across DIVs, and are left alone: they are rebuilt from
+    what remains.
 
     :returns: The files that exist, in a stable order. Empty if the path is not in the tree.
     """
@@ -649,31 +651,47 @@ def derived_files(config, h5_path: str | Path) -> list[Path]:
         if selection.is_dir():
             out.extend(sorted(p for p in selection.iterdir() if p.is_file() and f"well{location.well}" in p.name))
         return out
-    exp = location.exp_id or location.batch.id
     well_tail = Path(location.chip) / f"well{location.well}"
-    for root, pattern in (
-        (config.preprocessed_dir / exp / well_tail, f"DIV{location.div}_*exp_data.npz"),
-        (config.burst_data_dir / exp / well_tail, f"DIV{location.div}_*burst_data.csv"),
-    ):
-        if root.is_dir():
-            out.extend(sorted(root.glob(pattern)))
+    tail = f"well{location.well}_{location.experiment}_" if location.experiment else f"well{location.well}_"
+    places = [(location.batch.id, tail)]
+    if location.experiment:  # preprocessed before batch_id was the identity: filed under its name
+        places.append((location.experiment, f"well{location.well}_"))
+    for top, tail in places:
+        for root, pattern in (
+            (config.preprocessed_dir / top / well_tail, f"DIV{location.div}_*{tail}exp_data.npz"),
+            (config.burst_data_dir / top / well_tail, f"DIV{location.div}_*{tail}burst_data.csv"),
+        ):
+            if root.is_dir():
+                out.extend(sorted(root.glob(pattern)))
     return out
 
 
-def _drop_burst_log_rows(config, exp: str, chip: str, well: int, div: int, *, dry_run: bool) -> int:
+def _drop_burst_log_rows(
+    config, batch_id: str, chip: str, well: int, div: int, experiment: str, *, dry_run: bool
+) -> int:
     """Drop one recording's rows from the batch's burst log; return how many."""
-    log_path = config.burst_data_dir / f"{exp}_burst_log.csv"
-    if not log_path.is_file():
-        return 0
-    import pandas as pd
+    from mxtreme.io import read_burst_log
 
-    df = pd.read_csv(log_path)
-    if df.empty or not {"chip", "well", "DIV"} <= set(df.columns):
-        return 0
-    mask = (df["chip"].astype(str) == str(chip)) & (df["well"].astype(str) == str(well)) & (df["DIV"].astype(str) == str(div))
-    n = int(mask.sum())
-    if n and not dry_run:
-        df[~mask].to_csv(log_path, index=False)
+    # An experiment preprocessed before batch_id was the identity logged under its own name.
+    places = [(batch_id, experiment)] + ([(experiment, "")] if experiment else [])
+    n = 0
+    for top, exp in places:
+        log_path = config.burst_data_dir / f"{top}_burst_log.csv"
+        if not log_path.is_file():
+            continue
+        df = read_burst_log(log_path)
+        if df.empty or not {"chip", "well", "DIV"} <= set(df.columns):
+            continue
+        mask = (
+            (df["chip"].astype(str) == str(chip))
+            & (df["well"].astype(str) == str(well))
+            & (df["DIV"].astype(str) == str(div))
+            & (df["experiment"].astype(str) == exp)
+        )
+        hits = int(mask.sum())
+        if hits and not dry_run:
+            df[~mask].to_csv(log_path, index=False)
+        n += hits
     return n
 
 
@@ -736,7 +754,6 @@ def remove_recording(
         raise ValueError(f"{h5_path} does not follow the recordings-tree layout, so its identity is unknown; nothing removed.")
 
     files = [h5_path] + (derived_files(config, h5_path) if derived else [])
-    exp = location.exp_id or location.batch.id
     verb = "Would remove" if dry_run else "Removing"
     for f in files:
         on_progress(f"{verb} {f}")
@@ -761,16 +778,24 @@ def remove_recording(
     if not dry_run:
         registry_rows += io.unregister(
             config.registry_path, chip=location.chip, well=location.well, div=location.div,
-            kind=location.kind, exp_id=location.exp_id, batch_id=location.batch.id,
+            kind=location.kind, batch_id=location.batch.id, experiment=location.experiment,
         )
         if derived and location.kind != "activity_scan":
             registry_rows += io.unregister(
                 config.registry_path, chip=location.chip, well=location.well, div=location.div,
-                kind="preprocessed", exp_id=exp,
+                kind="preprocessed", batch_id=location.batch.id, experiment=location.experiment,
             )
+            if location.experiment:  # preprocessed before batch_id was the identity
+                registry_rows += io.unregister(
+                    config.registry_path, chip=location.chip, well=location.well, div=location.div,
+                    kind="preprocessed", batch_id=location.experiment, experiment="",
+                )
     burst_log_rows = 0
     if derived and location.kind != "activity_scan":
-        burst_log_rows = _drop_burst_log_rows(config, exp, location.chip, location.well, location.div, dry_run=dry_run)
+        burst_log_rows = _drop_burst_log_rows(
+            config, location.batch.id, location.chip, location.well, location.div, location.experiment,
+            dry_run=dry_run,
+        )
 
     pruned: list[Path] = []
     if not dry_run:
@@ -794,7 +819,7 @@ def remove_recording(
             "recording.removed",
             batch_id=location.batch,
             plate_date=location.plate_date,
-            exp_id=location.exp_id,
+            experiment=location.experiment,
             chip=location.chip,
             well=location.well,
             div=location.div,
@@ -820,18 +845,18 @@ def remove_recording(
 # --- describing and ingesting an exogenous recording ----------------------------------------------
 
 
-def _validate_exp_id(exp_id: str) -> str:
-    """Check an experiment id can serve as a file-name tail, and is not a reserved scan tail."""
-    if not isinstance(exp_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", exp_id):
+def _validate_experiment(experiment: str) -> str:
+    """Check an experiment name can serve as a file-name tail, and is not a reserved scan tail."""
+    if not isinstance(experiment, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", experiment):
         raise ValueError(
-            f"exp_id must be a non-empty string of letters, digits, '.', '-' or '_' (and start "
-            f"with a letter or digit), got {exp_id!r}."
+            f"experiment must be a non-empty string of letters, digits, '.', '-' or '_' (and start "
+            f"with a letter or digit), got {experiment!r}."
         )
-    if re.fullmatch(r"(activity|network)_scan(_\d+)?", exp_id):
+    if re.fullmatch(r"(activity|network)_scan(_\d+)?", experiment):
         raise ValueError(
-            f"exp_id {exp_id!r} is reserved for scans; an ingested recording needs its own name."
+            f"experiment {experiment!r} is reserved for scans; an ingested recording needs its own name."
         )
-    return exp_id
+    return experiment
 
 
 def _text(dataset) -> str | None:
@@ -1151,7 +1176,7 @@ def ingest_recording(
     chip: str,
     div: int,
     kind: str = "experiment",
-    exp_id: str | None = None,
+    experiment: str | None = None,
     wells: Iterable[int] | None = None,
     conditions: dict[int, object] | None = None,
     system: str | None = None,
@@ -1164,7 +1189,7 @@ def ingest_recording(
 
     The file is placed in the recordings tree under the identity given here and one row per well
     is upserted into the registry -- exactly as if MXtreme had recorded it. What it is filed *as*
-    is ``kind``: an ``experiment`` (the default) is named ``<stem>_<exp_id>.raw.h5`` after the
+    is ``kind``: an ``experiment`` (the default) is named ``<stem>_<experiment>.raw.h5`` after the
     free-form experiment name; an ``activity_scan`` or ``network_scan`` recorded by MaxLab Live's
     own assays (or any other tool) takes the scan tail instead, ``<stem>_activity_scan.raw.h5``,
     and registers as that kind, so it is indistinguishable in the store from a scan MXtreme ran
@@ -1191,7 +1216,7 @@ def ingest_recording(
         ingest_recording(
             "/data/exports/stim_session.raw.h5", config,
             batch="fall2026_batch1_DRG", plate_date=260810,
-            chip="M07460", div=21, exp_id="burstTrainer_trial3",
+            chip="M07460", div=21, experiment="burstTrainer_trial3",
         )
         ingest_recording(                      # a Scope activity scan
             "/data/scope/M07460_260831.h5", config,
@@ -1207,9 +1232,9 @@ def ingest_recording(
     :param chip: Chip serial, e.g. ``"M07460"``.
     :param div: Days *in vitro* at the time of the recording.
     :param kind: What to file it as -- one of :data:`RECORDING_KINDS`.
-    :param exp_id: For an ``experiment``, its free-form name -- becomes the file-name tail and the
-        registry row's ``exp_id``. Letters, digits, ``.``, ``-``, ``_``. Required for an
-        experiment; not accepted for a scan (a scan's identity is its batch).
+    :param experiment: For an ``experiment``, its free-form name -- becomes the file-name tail and
+        the registry row's ``experiment``. Letters, digits, ``.``, ``-``, ``_``. Required for an
+        experiment; not accepted for a scan. Either way the recording's identity is its batch.
     :param wells: Which of the file's wells to ingest; ``None`` means all of them.
     :param conditions: Optional per-well condition labels, keyed by well number.
     :param system: Which system the chip is on, ``"M1"`` or ``"M2"`` -- it names the chip
@@ -1224,7 +1249,7 @@ def ingest_recording(
     :raises FileNotFoundError: If ``h5_path`` does not exist.
     :raises FileExistsError: If a destination file already exists -- nothing is overwritten. A
         network scan never collides (it takes the next index instead).
-    :raises ValueError: On a malformed batch id, plate date, kind or exp id, a file with no wells,
+    :raises ValueError: On a malformed batch id, plate date, kind or experiment, a file with no wells,
         ``wells`` naming one the file lacks, or no way to tell which system the chip is on.
     """
     import shutil
@@ -1239,14 +1264,15 @@ def ingest_recording(
     if kind not in RECORDING_KINDS:
         raise ValueError(f"kind must be one of {RECORDING_KINDS}, got {kind!r}.")
     if kind == "experiment":
-        if exp_id is None:
-            raise ValueError("An experiment needs an exp_id; a scan takes kind='activity_scan' "
-                             "or 'network_scan' instead.")
-        _validate_exp_id(exp_id)
-        tail = exp_id
+        if experiment is None:
+            raise ValueError("An experiment needs a name (experiment=...); a scan takes "
+                             "kind='activity_scan' or 'network_scan' instead.")
+        _validate_experiment(experiment)
+        tail = experiment
     else:
-        if exp_id is not None:
-            raise ValueError(f"A {kind} carries no exp_id (its identity is the batch); got {exp_id!r}.")
+        if experiment is not None:
+            raise ValueError(f"A {kind} carries no experiment name; got {experiment!r}.")
+        experiment = ""
         tail = kind
     conditions = conditions or {}
     present = wells_in_file(h5_path)
@@ -1319,10 +1345,8 @@ def ingest_recording(
     for well, dest in written.items():
         condition = conditions.get(well)
         _ensure_metadata_blob(dest, {
-            # A scan has no experiment name -- its identity is the batch, as ActivityScanParams
-            # writes it. An experiment carries its own.
-            "Exp ID": exp_id if kind == "experiment" else batch.id,
             "Batch ID": batch.id,
+            **({"Experiment": experiment} if experiment else {}),
             "Chip ID": chip,
             "Plate date": _validate_plate_date(plate_date),
             "DIV": int(div),
@@ -1343,12 +1367,10 @@ def ingest_recording(
     io.register(
         {
             well: {
-                # The blank exp_id is what separates scan rows from `experiment` rows, as
-                # io.register_scan writes them.
-                "exp_id": exp_id if kind == "experiment" else "",
+                "experiment": experiment,
                 "chip": chip,
                 "DIV": int(div),
-                "experimental_condition": conditions.get(well),
+                "exp_condition": conditions.get(well),
                 "batch_id": batch.id,
                 "plate_date": _validate_plate_date(plate_date),
             }
@@ -1370,7 +1392,7 @@ def ingest_recording(
             "recording.ingested",
             batch_id=batch,
             plate_date=plate_date,
-            exp_id=exp_id if kind == "experiment" else batch.id,
+            experiment=experiment,
             chip=chip,
             well=well,
             div=div,
@@ -1450,9 +1472,9 @@ def rename_batch(
 
     A batch id is written into far more than its plating directory: every file name under
     ``recordings/``, ``preprocessed/``, ``burst_data/`` and ``analysis/`` carries it; so do the
-    registry rows, the ``/assay/metadata`` blob inside every raw ``.h5``, the ``exp_id`` and
+    registry rows, the ``/assay/metadata`` blob inside every raw ``.h5``, the ``batch_id`` and
     ``path_to_h5`` fields inside every preprocessed ``.npz`` (which is where a registry rebuild reads
-    identity from), and the ``exp_id`` / ``culture_id`` columns of the burst log and the analysis
+    identity from), and the ``batch_id`` / ``culture_id`` columns of the burst log and the analysis
     summary CSVs. This rewrites all of them, so that afterwards :func:`list_platings`,
     :func:`mxtreme.io.rebuild_registry` and :func:`mxtreme.paths.resolve_paths` all agree on the
     new name. Report PDFs are renamed but not regenerated: their text still says the old name until

@@ -124,7 +124,7 @@ def performance_summary(
     else:
         rows = []
         for div in cpath.recordings:
-            burst_stats = cpath.recordings[div].burst_stats
+            burst_stats = cpath.recordings[div].require_burst_stats()
             burst_data = pd.read_csv(burst_stats)
 
             # np.load is lazy, so reading this one key never decompresses the recording's spike arrays.
@@ -203,7 +203,7 @@ def plot_population_performance_summary(sel_paths,
                                         score_label: str = 'Score'):
     """Learning curve pooled across cultures: score vs DIV (mean ± SEM), with faint per-culture lines.
 
-    :param sel_paths: ``dict[exp_id, ExperimentPaths]`` from :func:`~mxtreme.paths.resolve_paths`.
+    :param sel_paths: ``dict[batch_id, BatchPaths]`` from :func:`~mxtreme.paths.resolve_paths`.
     :param analysis_dir: Analysis output root (typically ``config.analysis_dir``).
     :param phase: If given, restrict to this phase; otherwise pool all phases.
     :param savename: Filename for the saved figure, written into ``<analysis_dir>/performance/``.

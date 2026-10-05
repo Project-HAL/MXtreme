@@ -593,10 +593,10 @@ def plot_population_network_summary(sel_paths, analysis_dir: Path, phase: str = 
 
     Plots mean ± SEM across cultures vs DIV over a faint line per culture, one series per phase.
 
-    :param sel_paths: ``{exp_id: ExperimentPaths}``, as returned by
+    :param sel_paths: ``{batch_id: BatchPaths}``, as returned by
         :func:`mxtreme.paths.resolve_paths` for a :class:`~mxtreme.identity.CultureSelector`.
     :param analysis_dir: Root summary directory (typically ``config.analysis_dir``); CSVs are read
-        from ``<analysis_dir>/network/<exp_id>/<chip>/well<well>/``.
+        from ``<analysis_dir>/network/<batch_id>/<chip>/well<well>/``.
     :param phase: If given, filter to this phase only; ``None`` plots all phases as separate lines.
     :param savename: Filename for the saved figure, written into ``<analysis_dir>/network/``. If
         ``None`` the figure is shown but not saved.
@@ -610,8 +610,8 @@ def plot_population_network_summary(sel_paths, analysis_dir: Path, phase: str = 
         pop_df = pop_df[pop_df['phase'] == phase]
 
     n_cultures = pop_df['culture_id'].nunique()
-    n_exps = len(sel_paths)
-    exp_ids = list(sel_paths.keys())
+    n_batches = len(sel_paths)
+    batch_ids = list(sel_paths.keys())
 
     value_cols = ['mean_corr', 'effective_rank', 'n_pc_90', 'pc1_var_frac']
     stats = aggregate_by_div_phase(pop_df, value_cols=value_cols)
@@ -624,8 +624,8 @@ def plot_population_network_summary(sel_paths, analysis_dir: Path, phase: str = 
         ('pc1_var_frac',   'sem_pc1_var_frac',     'Variance explained',       'PC1 Dominance'),
     ]
 
-    exp_label = f"{n_exps} experiments pooled ({', '.join(exp_ids)})" if n_exps > 1 else exp_ids[0]
-    suptitle = f'Population Network Summary — {exp_label}\nmean ± SEM, n = {n_cultures} cultures'
+    batch_label = f"{n_batches} batches pooled ({', '.join(batch_ids)})" if n_batches > 1 else batch_ids[0]
+    suptitle = f'Population Network Summary — {batch_label}\nmean ± SEM, n = {n_cultures} cultures'
 
     save_path = (Path(analysis_dir) / "network" / savename) if savename else None
 

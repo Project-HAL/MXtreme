@@ -27,7 +27,7 @@ from scipy.spatial.distance import cdist
 from mxtreme import device
 
 
-def MEA(ax, channelmap, stim_elecs, title="MEA Channel Layout", marker_size=36, stim_fontsize=16):
+def MEA(channelmap, ax=None, stim_elecs=None, title="MEA Channel Layout", marker_size=36, stim_fontsize=16):
     """Plot the electrode layout of the MEA, marking stimulation electrodes.
 
     :param ax: Matplotlib axes to draw on.
@@ -38,6 +38,10 @@ def MEA(ax, channelmap, stim_elecs, title="MEA Channel Layout", marker_size=36, 
         drawing the array into a small panel, where ~1k default-sized markers merge into a blob.
     :param stim_fontsize: Size of the ⚡ marking stimulation electrodes; scale it with ``marker_size``.
     """
+    owns_fig = ax is None
+    if owns_fig:
+        _, ax = plt.subplots(1, 1, figsize=(12, 6))
+
     mid_point = (device.CHIP_WIDTH / 2) * device.ELEC_SIZE  # x midpoint of the array
     chip_ht_um = device.CHIP_HEIGHT * device.ELEC_SIZE
 

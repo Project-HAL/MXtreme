@@ -10,7 +10,7 @@ Contents:
 - :func:`register_scan` -- record an activity or network scan in that same registry.
 - :func:`rebuild_registry` -- rebuild that registry by walking the store (recovery path).
 - :func:`save_burst_data` / :func:`load_burst_data` -- per-recording burst CSVs.
-- :func:`update_burst_log` -- per-experiment burst summary CSV.
+- :func:`update_burst_log` -- per-batch burst summary CSV.
 """
 
 from __future__ import annotations
@@ -24,19 +24,75 @@ import numpy as np
 import pandas as pd
 
 
+#: Fields saved as shape-``(1,)`` arrays that are single numbers in a well dict.
+_SCALAR_FIELDS = ("samp_rate", "rec_t_sec")
+
+
+def _unwrap(key: str, value: np.ndarray):
+    """Return one saved field in the form the well dict holds it in (see :func:`load_preprocessed`)."""
+    if value.ndim == 0:
+        return value.item()                      # identity scalars, bin_size, dicts, None
+    if key in _SCALAR_FIELDS:
+        return np.float64(value.ravel()[0])
+    if key == "exp_condition" or value.dtype == object:
+        return value.tolist()                    # [left, right] pair; event_messages, step_log
+    return value
+
+
 def load_preprocessed(filepath: str | Path) -> dict:
-    """Load a preprocessed ``.npz`` produced by :func:`save_preprocessed`.
+    """Load a preprocessed ``.npz`` produced by :func:`save_preprocessed`, as a well dict.
+
+    ``.npz`` files can only hold arrays, so single values are saved wrapped: identity fields and
+    dicts as 0-d arrays, ``samp_rate`` / ``rec_t_sec`` as shape-``(1,)`` arrays, lists of dicts as
+    ``object`` arrays. They are unwrapped here, so the result has the same form as a well dict from
+    :func:`mxtreme.extract.extract` after cleaning -- it can go straight to a
+    :class:`~mxtreme.recording.Recording` or to the :mod:`mxtreme.clean` steps.
 
     :param filepath: Path to the ``.npz`` file.
     :type filepath: str or Path
     :raises FileNotFoundError: If ``filepath`` does not exist.
-    :returns: The saved arrays keyed by name (e.g. ``spike_data``, ``channelmap``, ``samp_rate``).
+    :returns: The saved fields keyed by name (e.g. ``spike_data``, ``channelmap``, ``samp_rate``).
     :rtype: dict
     """
     if not os.path.isfile(filepath):
         raise FileNotFoundError(f"File does not exist: {filepath}")
-    return dict(np.load(filepath, allow_pickle=True))
+    with np.load(filepath, allow_pickle=True) as saved:
+        well = {key: _unwrap(key, saved[key]) for key in saved.files}
+    if well.get("preprocessing_params") is None:
+        well["preprocessing_params"] = {}
+    return _current_identity(well)
 
+
+def _current_identity(well: dict) -> dict:
+    """Bring a well dict's identity up to the current fields, in place: ``batch_id`` + ``experiment``.
+
+    An ``.npz`` saved before ``batch_id`` was the identity carries an ``exp_id`` instead -- the batch
+    id for a scan, the experiment's name for an ingested recording, and it is also the directory the
+    file sits in. Reading it as the ``batch_id`` keeps every such file where path resolution looks
+    for it, without rewriting the store.
+    """
+    legacy = well.pop("exp_id", None)
+    if not well.get("batch_id"):
+        well["batch_id"] = "" if legacy is None else str(legacy)
+    well.setdefault("experiment", "")
+    if well["experiment"] is None:
+        well["experiment"] = ""
+    return well
+
+
+def recording_file_name(div, plate_date, chip, batch_id, well, suffix: str, experiment: str = "") -> str:
+    """The file name a recording's derived files share in ``preprocessed/`` and ``burst_data/``.
+
+    ``DIV<div>_<plate_date>_<chip>_<batch_id>_well<well>[_<experiment>]_<suffix>`` -- the experiment
+    tail only for an ingested experiment, so its files and a scan's of the same DIV sit side by
+    side without either name matching the other's pattern (see :func:`mxtreme.paths.resolve_paths`).
+    """
+    tail = f"_{experiment}" if experiment else ""
+    return f"DIV{div}_{plate_date}_{chip}_{batch_id}_well{well}{tail}_{suffix}"
+
+
+#: dtype of a well's raw channel routing table (``well['mapping']``), as read from the ``.h5``.
+MAPPING_DTYPE = np.dtype([("channel", "<i4"), ("electrode", "<i4"), ("x", "<f8"), ("y", "<f8")])
 
 def _unique_path(path: Path) -> Path:
     """Return ``path`` unchanged, or a suffixed variant (``_01``, ``_02``, ...) if it already exists.
@@ -66,10 +122,12 @@ def save_preprocessed(
 ) -> Path:
     """Write one well's cleaned data to a compressed ``.npz`` under the managed store.
 
-    The file lands at ``<datastore>/<exp_id>/<chip>/well<well>/DIV<DIV>_<plate_date>_<chip>_<exp_id>_well<well>_exp_data.npz``.
+    The file lands at ``<datastore>/<batch_id>/<chip>/well<well>/`` under :func:`recording_file_name`
+    (``DIV<DIV>_<plate_date>_<chip>_<batch_id>_well<well>[_<experiment>]_exp_data.npz``).
     Fields produced by optional cleaning steps (channel map, binning, stimulation removal) are written
     when present and defaulted otherwise, so the pipeline still saves if a user omits a step. The
-    provenance dict ``well['preprocessing_params']`` is saved alongside the data.
+    provenance dict ``well['preprocessing_params']`` is saved alongside the data. Keys are saved under
+    the same names they have in the well dict.
 
     The recording is also upserted into the registry CSV (via :func:`register`) so the registry is
     always refreshed whenever an ``.npz`` is written -- keeping its timestamps current without a
@@ -88,19 +146,20 @@ def save_preprocessed(
     :rtype: Path
     """
     datastore = Path(datastore)
-    exp_id, chip, div, plate_date, well_no = (
-        well["exp_id"], well["chip"], well["DIV"], well["plate_date"], well["well"],
-    )
+    _current_identity(well)
+    batch_id, experiment = well["batch_id"], well["experiment"]
+    chip, div, plate_date, well_no = well["chip"], well["DIV"], well["plate_date"], well["well"]
 
-    out_dir = datastore / exp_id / chip / f"well{well_no}"
+    out_dir = datastore / batch_id / chip / f"well{well_no}"
     os.makedirs(out_dir, exist_ok=True)
-    out_path = out_dir / f"DIV{div}_{plate_date}_{chip}_{exp_id}_well{well_no}_exp_data.npz"
+    out_path = out_dir / recording_file_name(div, plate_date, chip, batch_id, well_no, "exp_data.npz", experiment)
     if not overwrite:
         out_path = _unique_path(out_path)
 
     np.savez_compressed(
         out_path,
-        spike_data=well["data"],
+        spike_data=well["spike_data"],
+        mapping=well.get("mapping", np.zeros(0, dtype=MAPPING_DTYPE)),
         channelmap=well.get("channelmap", np.zeros((0, 5))),
         stim_elecs=well.get("stim_elecs"),
         rec_t_sec=np.array([well.get("rec_t_sec", np.nan)]),
@@ -110,12 +169,13 @@ def save_preprocessed(
         event_messages=well["event_messages"],
         spike_bin=well.get("spike_bin", np.zeros((0, 0))),
         bin_size=well.get("bin_size", np.nan),
-        exp_condition=well["experimental_condition"],
+        exp_condition=well.get("exp_condition"),
         DIV=div,
         plate_date=plate_date,
         well=well_no,
         chip=chip,
-        exp_id=exp_id,
+        batch_id=batch_id,
+        experiment=experiment,
         stim_frames=well.get("stim_frames", []),
         raw_start=well["raw_start"],
         path_to_h5=well["path_to_h5"],
@@ -135,9 +195,9 @@ def save_preprocessed(
     transactions.record(
         transactions.transactions_path_for(registry_path),
         "preprocessed.saved",
-        batch_id=well.get("batch_id") or None,
+        batch_id=batch_id or None,
         plate_date=plate_date,
-        exp_id=exp_id,
+        experiment=experiment,
         chip=chip,
         well=well_no,
         div=div,
@@ -147,16 +207,29 @@ def save_preprocessed(
     return out_path
 
 
-#: Columns identifying one registry row. ``kind`` is part of the key because a scan and the
-#: recordings preprocessed from it share an identity; ``batch_id`` is part of it because a chip is
-#: re-plated across batches, so ``(chip, well, div)`` alone recurs batch after batch.
-REGISTRY_KEY = ["exp_id", "batch_id", "chip", "well", "div", "kind"]
+#: Columns identifying one registry row. ``batch_id`` is part of the key because a chip is
+#: re-plated across batches, so ``(chip, well, div)`` alone recurs batch after batch; ``kind``
+#: because a scan and the recordings preprocessed from it share an identity; ``experiment`` because
+#: an ingested experiment and a scan of the same culture can share a DIV.
+REGISTRY_KEY = ["batch_id", "chip", "well", "div", "kind", "experiment"]
+
+#: Every registry column, in the order they are written.
+REGISTRY_COLUMNS = ["batch_id", "plate_date", "chip", "well", "div", "kind", "experiment", "conditions", "timestamp"]
 
 #: What a registry row describes. ``"preprocessed"`` is one well of a cleaned recording;
 #: ``"activity_scan"`` and ``"network_scan"`` are one well of the corresponding scan's raw ``.h5``;
 #: ``"experiment"`` is one well of an exogenous recording ingested by
-#: :func:`mxtreme.store.ingest_recording` (its ``exp_id`` column carries the experiment's name).
+#: :func:`mxtreme.store.ingest_recording` (its ``experiment`` column carries the experiment's name).
 REGISTRY_KINDS = ("preprocessed", "activity_scan", "network_scan", "experiment")
+
+
+def read_registry(registry_path: str | Path) -> pd.DataFrame:
+    """The registry CSV in the current schema (see :data:`REGISTRY_COLUMNS`), migrated on read.
+
+    An empty frame with those columns if the registry does not exist yet.
+    """
+    df = _read_registry(Path(registry_path))
+    return pd.DataFrame(columns=REGISTRY_COLUMNS) if df.empty else df
 
 
 def _read_registry(registry_path: Path) -> pd.DataFrame:
@@ -170,6 +243,9 @@ def _read_registry(registry_path: Path) -> pd.DataFrame:
       scans were indexed hold cleaned recordings and nothing else, so that is what those rows are;
     - missing ``batch_id`` / ``plate_date`` columns (from before the recordings tree) are added,
       blank -- those rows predate batch identity;
+    - a legacy ``exp_id`` column is folded away: where a row has no ``batch_id`` its ``exp_id`` *is*
+      the batch id (what preprocessing used to write), and where it has both and they differ the
+      ``exp_id`` named an ingested experiment, which moves to ``experiment``;
     - blank string key fields come back from CSV as NaN and are normalized to ``""`` so the string
       comparisons in :func:`register` treat "no value" consistently.
 
@@ -185,15 +261,20 @@ def _read_registry(registry_path: Path) -> pd.DataFrame:
         return df
 
     if "kind" not in df.columns:
-        position = df.columns.get_loc("div") + 1 if "div" in df.columns else len(df.columns)
-        df.insert(position, "kind", "preprocessed")
-    after_exp = df.columns.get_loc("exp_id") + 1 if "exp_id" in df.columns else 0
-    for i, column in enumerate(("batch_id", "plate_date")):
+        df["kind"] = "preprocessed"
+    for column in ("batch_id", "plate_date", "experiment"):
         if column not in df.columns:
-            df.insert(after_exp + i, column, "")
-    for column in ("exp_id", "batch_id"):
-        df[column] = df[column].fillna("")
-    return df
+            df[column] = ""
+    for column in ("batch_id", "experiment"):
+        df[column] = df[column].fillna("").astype(str)
+    if "exp_id" in df.columns:
+        exp = df.pop("exp_id").fillna("").astype(str)
+        batch = df["batch_id"]
+        df["experiment"] = df["experiment"].where(df["experiment"] != "", exp.where((batch != "") & (exp != batch), ""))
+        df["batch_id"] = batch.where(batch != "", exp)
+        df = df.drop_duplicates(subset=REGISTRY_KEY, keep="last")
+    known = [c for c in REGISTRY_COLUMNS if c in df.columns]
+    return df[known + [c for c in df.columns if c not in known]]
 
 
 def register(
@@ -207,9 +288,8 @@ def register(
 
     Rows are keyed by :data:`REGISTRY_KEY`; an existing row for the same key is replaced. Each row
     records a ``timestamp`` and the well's ``conditions`` (whatever the well's
-    ``experimental_condition`` holds, or blank when absent). Batch identity (``batch_id``,
-    ``plate_date``) is recorded when the well dict carries it; rows from before the recordings tree
-    simply leave it blank.
+    ``exp_condition`` holds, or blank when absent). ``experiment`` is blank except for an ingested
+    experiment's rows.
 
     :param data: Mapping of well number to well data dict.
     :type data: dict[int, dict]
@@ -230,15 +310,15 @@ def register(
     df = _read_registry(registry_path)
 
     for well_no, well in data.items():
-        condition = well.get("experimental_condition")
+        condition = well.get("exp_condition")
         new_row = {
-            "exp_id": well.get("exp_id", ""),
-            "batch_id": well.get("batch_id", ""),
+            "batch_id": str(well.get("batch_id") or ""),
             "plate_date": well.get("plate_date", ""),
             "chip": well["chip"],
             "well": well_no,
             "div": well["DIV"],
             "kind": kind,
+            "experiment": str(well.get("experiment") or ""),
             "conditions": "" if condition is None else condition,
             "timestamp": stamp,
         }
@@ -246,12 +326,12 @@ def register(
             # Compare as strings: an older registry on disk may hold a different dtype for
             # `well`/`div`, which would otherwise leak a duplicate row on re-registration.
             mask = (
-                (df["exp_id"].astype(str) == str(new_row["exp_id"]))
-                & (df["batch_id"].astype(str) == str(new_row["batch_id"]))
+                (df["batch_id"].astype(str) == new_row["batch_id"])
                 & (df["chip"].astype(str) == str(well["chip"]))
                 & (df["well"].astype(str) == str(well_no))
                 & (df["div"].astype(str) == str(well["DIV"]))
                 & (df["kind"].astype(str) == str(kind))
+                & (df["experiment"].astype(str) == new_row["experiment"])
             )
             df = df[~mask]
             df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
@@ -270,15 +350,13 @@ def unregister(
     well: int,
     div: int,
     kind: str,
-    exp_id: str | None = None,
     batch_id: str | None = None,
+    experiment: str | None = None,
 ) -> int:
     """Drop the registry rows for one recording, and return how many went.
 
-    The inverse of :func:`register` for one key. ``exp_id`` and ``batch_id`` narrow the match when
-    given; left ``None``, any value matches -- a preprocessed row written by an older flow has a
-    blank ``batch_id`` even though its recording sits in the batch-keyed tree, so the caller that
-    knows only the batch cannot always require it.
+    The inverse of :func:`register` for one key. ``batch_id`` and ``experiment`` narrow the match
+    when given; left ``None``, any value matches.
 
     :returns: The number of rows removed. Zero if the registry does not exist or had no such row.
     """
@@ -292,10 +370,10 @@ def unregister(
         & (df["div"].astype(str) == str(div))
         & (df["kind"].astype(str) == str(kind))
     )
-    if exp_id is not None:
-        mask &= df["exp_id"].astype(str) == str(exp_id)
     if batch_id is not None:
         mask &= df["batch_id"].astype(str) == str(batch_id)
+    if experiment is not None:
+        mask &= df["experiment"].astype(str) == str(experiment)
     n = int(mask.sum())
     if n:
         df[~mask].to_csv(registry_path, index=False)
@@ -353,15 +431,12 @@ def register_scan(
     register(
         {
             well: {
-                # A scan has no experiment name -- its identity is the batch. The blank exp_id is
-                # what separates scan rows from `experiment` rows in the same tree.
-                "exp_id": getattr(params, "exp_id", ""),
                 "batch_id": getattr(params, "batch_id", ""),
                 "plate_date": getattr(params, "plate_date", ""),
                 "chip": params.chip,
                 "DIV": params.div,
                 # `conditions` is empty or one label per well -- validated by ActivityScanParams.
-                "experimental_condition": conditions[i] if i < len(conditions) else None,
+                "exp_condition": conditions[i] if i < len(conditions) else None,
             }
             for i, well in enumerate(params.wells)
         },
@@ -380,7 +455,6 @@ def register_scan(
             f"{kind}.registered",
             batch_id=getattr(params, "batch_id", "") or None,
             plate_date=getattr(params, "plate_date", None) or None,
-            exp_id=getattr(params, "exp_id", ""),
             chip=params.chip,
             well=well,
             div=params.div,
@@ -435,11 +509,13 @@ def rebuild_registry(config, *, registry_path: str | Path | None = None) -> int:
             well_no = _value(npz, "well")
             register(
                 {well_no: {
-                    "exp_id": _value(npz, "exp_id"),
+                    # An .npz saved before batch_id was the identity carries the batch as exp_id.
+                    "batch_id": _value(npz, "batch_id") or _value(npz, "exp_id"),
+                    "experiment": _value(npz, "experiment") or "",
                     "plate_date": _value(npz, "plate_date") or "",
                     "chip": _value(npz, "chip"),
                     "DIV": _value(npz, "DIV"),
-                    "experimental_condition": _value(npz, "exp_condition"),
+                    "exp_condition": _value(npz, "exp_condition"),
                 }},
                 registry_path,
                 timestamp=pd.Timestamp.fromtimestamp(npz_path.stat().st_mtime),
@@ -455,12 +531,12 @@ def rebuild_registry(config, *, registry_path: str | Path | None = None) -> int:
 
         register(
             {location.well: {
-                "exp_id": location.exp_id,
                 "batch_id": location.batch.id,
+                "experiment": location.experiment,
                 "plate_date": location.plate_date,
                 "chip": location.chip,
                 "DIV": location.div,
-                "experimental_condition": _embedded_condition(h5_path, location.well),
+                "exp_condition": _embedded_condition(h5_path, location.well),
             }},
             registry_path,
             kind=location.kind,
@@ -575,7 +651,8 @@ def repair_spike_order(config, *, dry_run: bool = False) -> list[Path]:
         transactions.record(
             config,
             "preprocessed.repaired",
-            exp_id=_scalar(contents.get("exp_id")),
+            batch_id=_scalar(contents.get("batch_id")) or _scalar(contents.get("exp_id")),
+            experiment=_scalar(contents.get("experiment")) or "",
             plate_date=_scalar(contents.get("plate_date")),
             chip=_scalar(contents.get("chip")),
             well=_scalar(contents.get("well")),
@@ -602,11 +679,11 @@ def _scalar(value):
 
 
 def _burst_csv_path(datastore: Path, recording) -> Path:
-    """Return ``<datastore>/<exp>/<chip>/well<well>/DIV<div>_<plate_date>_<chip>_<exp>_well<well>_burst_data.csv``."""
-    out_dir = datastore / recording.exp_id / recording.chip / f"well{recording.well}"
-    return out_dir / (
-        f"DIV{recording.DIV}_{recording.plate_date}_{recording.chip}_"
-        f"{recording.exp_id}_well{recording.well}_burst_data.csv"
+    """Return ``<datastore>/<batch_id>/<chip>/well<well>/`` + :func:`recording_file_name` (``..._burst_data.csv``)."""
+    out_dir = datastore / recording.batch_id / recording.chip / f"well{recording.well}"
+    return out_dir / recording_file_name(
+        recording.DIV, recording.plate_date, recording.chip, recording.batch_id, recording.well,
+        "burst_data.csv", getattr(recording, "experiment", ""),
     )
 
 
@@ -627,7 +704,7 @@ def save_burst_data(burst_set, datastore, recording, *, overwrite: bool = True) 
     """Write a recording's bursts to a CSV under the managed store.
 
     Mirrors the preprocessed-npz layout so path resolution stays symmetric:
-    ``<datastore>/<exp_id>/<chip>/well<well>/DIV<DIV>_..._burst_data.csv``.
+    ``<datastore>/<batch_id>/<chip>/well<well>/DIV<DIV>_..._burst_data.csv``.
 
     :param burst_set: The :class:`~mxtreme.bursting.detection.BurstSet` to write.
     :param datastore: Directory under which to write (typically ``config.burst_data_dir``).
@@ -650,7 +727,8 @@ def save_burst_data(burst_set, datastore, recording, *, overwrite: bool = True) 
     transactions.record(
         transactions.transactions_path_for(datastore),
         "bursts.saved",
-        exp_id=recording.exp_id,
+        batch_id=recording.batch_id,
+        experiment=getattr(recording, "experiment", ""),
         plate_date=getattr(recording, "plate_date", None),
         chip=recording.chip,
         well=recording.well,
@@ -672,11 +750,13 @@ def load_burst_data(path: str | Path):
 
 
 def update_burst_log(datastore, recording, burst_set) -> Path:
-    """Upsert one summary row per recording into the per-experiment burst log.
+    """Upsert one summary row per recording into the per-batch burst log.
 
-    The log lands at ``<datastore>/<exp_id>_burst_log.csv``; rows are keyed by
-    ``(exp_id, chip, well, DIV)``. Recorded per recording: burst counts, detection/feature parameters
-    (JSON), and per-step completion timestamps (``detection_completed_at`` / ``features_computed_at``).
+    The log lands at ``<datastore>/<batch_id>_burst_log.csv``; rows are keyed by
+    ``(batch_id, chip, well, DIV, experiment)``. A log written before ``batch_id`` was the identity
+    (an ``exp_id`` column) is migrated as it is read (:func:`read_burst_log`). Recorded per
+    recording: burst counts, detection/feature parameters (JSON), and per-step completion timestamps
+    (``detection_completed_at`` / ``features_computed_at``).
 
     Updates are **field-wise and None-preserving**: for an existing row, only columns whose new value
     is not ``None`` are overwritten. So a detection-only write followed later by a features-only write
@@ -691,14 +771,15 @@ def update_burst_log(datastore, recording, burst_set) -> Path:
     """
     datastore = Path(datastore)
     os.makedirs(datastore, exist_ok=True)
-    log_path = datastore / f"{recording.exp_id}_burst_log.csv"
+    log_path = datastore / f"{recording.batch_id}_burst_log.csv"
 
     df = burst_set.to_dataframe()
     key = {
-        "exp_id": recording.exp_id,
+        "batch_id": recording.batch_id,
         "chip": recording.chip,
         "well": recording.well,
         "DIV": recording.DIV,
+        "experiment": getattr(recording, "experiment", ""),
     }
     new_row = {
         **key,
@@ -713,7 +794,7 @@ def update_burst_log(datastore, recording, burst_set) -> Path:
         "features_computed_at": burst_set.features_computed_at,
     }
 
-    log = pd.read_csv(log_path) if log_path.exists() else pd.DataFrame()
+    log = read_burst_log(log_path) if log_path.exists() else pd.DataFrame()
     rows = log.to_dict("records") if not log.empty else []
 
     existing = next(
@@ -730,3 +811,21 @@ def update_burst_log(datastore, recording, burst_set) -> Path:
 
     pd.DataFrame(rows).to_csv(log_path, index=False)
     return log_path
+
+
+def read_burst_log(log_path: str | Path) -> pd.DataFrame:
+    """A burst log (see :func:`update_burst_log`) with its identity in the current columns.
+
+    A log written before ``batch_id`` was the identity keys its rows by ``exp_id`` -- which, as the
+    log's own file name shows, was the batch id; it is read as ``batch_id``, with a blank
+    ``experiment``.
+    """
+    log = pd.read_csv(log_path)
+    if "exp_id" in log.columns:
+        legacy = log.pop("exp_id")
+        if "batch_id" not in log.columns:
+            log.insert(0, "batch_id", legacy)
+    if "experiment" not in log.columns:
+        log.insert(log.columns.get_loc("DIV") + 1 if "DIV" in log.columns else len(log.columns), "experiment", "")
+    log["experiment"] = log["experiment"].fillna("")
+    return log

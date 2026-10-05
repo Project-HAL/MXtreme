@@ -36,7 +36,7 @@ data = extract.extract("/path/to/recording.raw.h5")
 ```python
 data = extract.extract(
     "/path/to/recording.raw.h5",
-    metadata={"Exp ID": "Exp1", "Chip ID": "M01234",
+    metadata={"Batch ID": "fall2026_batch1_DRG", "Chip ID": "M01234",
               "Plate date": 250101, "DIV": 0}
     )
 ```
@@ -95,7 +95,7 @@ from mxtreme import io
 from mxtreme.recording import Recording
 
 rec = Recording(0, io.load_preprocessed(paths[0]))
-print(rec.exp_id, rec.chip, rec.well, rec.DIV)
+print(rec.batch_id, rec.chip, rec.well, rec.DIV)
 ```
 
 ## 5. Detect bursts
@@ -169,7 +169,7 @@ from mxtreme.identity import CultureID
 from mxtreme.analysis import generate_report
 
 
-culture = CultureID(exp_id=[EXP_ID], chip=[CHIP_ID], well=[WELL_ID])
+culture = CultureID(batch_id=[BATCH_ID], chip=[CHIP_ID], well=[WELL_ID])
 
 pdf = generate_report(
     culture,
@@ -185,7 +185,7 @@ single {class}`~mxtreme.identity.CultureID`:
 ```python
 from mxtreme.identity import CultureSelector
 
-selection = CultureSelector(exp_ids=["May2025_Wave"])
+selection = CultureSelector(batch_ids=["fall2026_batch1_DRG"])
 
 pdf = generate_report(selection, config)
 ```

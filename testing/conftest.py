@@ -70,7 +70,7 @@ def make_recording_data():
             "plate_date": np.array("250101"),
             "well": np.array(0),
             "chip": np.array("C0001"),
-            "exp_id": np.array("testExp"),
+            "batch_id": np.array("testExp"),
             "stim_frames": np.array([]),
             "raw_start": np.array(0),
             "path_to_h5": np.array("/tmp/fake.raw.h5"),
@@ -102,12 +102,12 @@ def make_well():
         mapping = np.array([(0, 10, 0.0, 0.0), (1, 11, 17.5, 0.0), (2, 12, 35.0, 0.0)], dtype=MAPPING_DTYPE)
         well = {
             "well": 0,
-            "exp_id": "testExp",
+            "batch_id": "testExp",
             "chip": "C0001",
             "plate_date": 250101,
             "DIV": 7,
             "path_to_h5": "/tmp/fake.raw.h5",
-            "data": spikes,
+            "spike_data": spikes,
             "samp_rate": np.float64(20000.0),
             "mapping": mapping,
             "lsb": np.array([1.0]),
@@ -115,7 +115,7 @@ def make_well():
             "raw_start": 50,
             "eventtime": np.array([], dtype="<i8"),
             "event_messages": [],
-            "experimental_condition": np.asarray({"left_stim": 0, "right_stim": 0}),
+            "exp_condition": np.asarray({"left_stim": 0, "right_stim": 0}),
         }
         well.update(overrides)
         return well

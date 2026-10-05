@@ -30,29 +30,29 @@ def _old_refractory(data, refractory_frames):
 
 def test_normalize_time_offsets_by_raw_start(make_well):
     well = make_well(raw_start=50)
-    first = well["data"]["frameno"][0]
+    first = well["spike_data"]["frameno"][0]
     clean.normalize_time(well)
-    assert well["data"]["frameno"][0] == first - 50
+    assert well["spike_data"]["frameno"][0] == first - 50
 
 
 def test_dac_to_voltage_scales_by_lsb(make_well):
     well = make_well(lsb=np.array([2.0]))
-    amps = well["data"]["amplitude"].copy()
+    amps = well["spike_data"]["amplitude"].copy()
     clean.dac_to_voltage(well)
-    np.testing.assert_allclose(well["data"]["amplitude"], amps * 2.0)
+    np.testing.assert_allclose(well["spike_data"]["amplitude"], amps * 2.0)
 
 
 def test_remove_positive_deflections_keeps_only_negative(make_well):
     well = make_well()
     clean.remove_positive_deflections(well)
-    assert (well["data"]["amplitude"] < 0).all()
+    assert (well["spike_data"]["amplitude"] < 0).all()
 
 
 def test_spike_filter_removes_subthreshold_and_stamps(make_well):
     well = make_well()
     clean.remove_positive_deflections(well)
     clean.spike_filter(well, amp_thresh=2e-5)
-    assert (np.abs(well["data"]["amplitude"]) >= 2e-5).all()
+    assert (np.abs(well["spike_data"]["amplitude"]) >= 2e-5).all()
     assert well["preprocessing_params"]["amp_thresh"] == 2e-5
 
 
@@ -65,9 +65,9 @@ def test_spike_filter_raises_when_threshold_too_high(make_well):
 def test_remove_spurious_spikes_enforces_refractory(make_well):
     well = make_well()
     # ch0 has spikes at frames 100 and 120 (1 ms apart); a 2 ms refractory should drop one of them.
-    n_ch0_before = np.sum(well["data"]["channel"] == 0)
+    n_ch0_before = np.sum(well["spike_data"]["channel"] == 0)
     clean.remove_spurious_spikes(well, refractory_period=0.002)
-    n_ch0_after = np.sum(well["data"]["channel"] == 0)
+    n_ch0_after = np.sum(well["spike_data"]["channel"] == 0)
     assert n_ch0_after == n_ch0_before - 1
     assert well["preprocessing_params"]["refractory_period"] == 0.002
 
@@ -75,8 +75,8 @@ def test_remove_spurious_spikes_enforces_refractory(make_well):
 def test_remove_spurious_channels_drops_unmapped(make_well):
     well = make_well()
     clean.remove_spurious_channels(well)
-    assert 9 not in set(well["data"]["channel"].tolist())
-    assert set(well["data"]["channel"].tolist()) <= {0, 1, 2}
+    assert 9 not in set(well["spike_data"]["channel"].tolist())
+    assert set(well["spike_data"]["channel"].tolist()) <= {0, 1, 2}
 
 
 def test_build_channel_map_shape_and_columns(make_well):
@@ -94,9 +94,9 @@ def test_remove_stim_frames_drops_stim_window(make_well):
         eventtime=np.array([480, 520], dtype="<i8"),
         event_messages=[{"start_stimulation": {}}, {"end_stimulation": {}}],
     )
-    assert 500 in well["data"]["frameno"].tolist()
+    assert 500 in well["spike_data"]["frameno"].tolist()
     clean.remove_stim_frames(well, post_stim_period=0.0)
-    assert 500 not in well["data"]["frameno"].tolist()
+    assert 500 not in well["spike_data"]["frameno"].tolist()
     assert len(well["stim_frames"]) > 0
     assert well["preprocessing_params"]["post_stim_period"] == 0.0
 
@@ -132,17 +132,17 @@ def test_remove_spurious_spikes_matches_reference(make_well, seed):
     refractory_frames = refractory_period * samp_rate
 
     reference = _old_refractory(rows, refractory_frames)
-    well = make_well(data=rows.copy(), samp_rate=samp_rate)
+    well = make_well(spike_data=rows.copy(), samp_rate=samp_rate)
     clean.remove_spurious_spikes(well, refractory_period=refractory_period)
 
     for field in ("frameno", "channel", "amplitude"):
-        np.testing.assert_array_equal(well["data"][field], reference[field])
+        np.testing.assert_array_equal(well["spike_data"][field], reference[field])
 
 
 def test_remove_spurious_spikes_all_isis_exceed_refractory(make_well):
     well = make_well()
     clean.remove_spurious_spikes(well, refractory_period=0.002)
     refractory_frames = 0.002 * well["samp_rate"]
-    df = pd.DataFrame(well["data"]).sort_values(["channel", "frameno"])
+    df = pd.DataFrame(well["spike_data"]).sort_values(["channel", "frameno"])
     for _, g in df.groupby("channel"):
         assert (np.diff(g["frameno"]) >= refractory_frames).all()

@@ -87,7 +87,7 @@ def _flatten_cultures(resolved) -> list[CulturePaths]:
     """Return a flat list of ``CulturePaths`` from a ``resolve_paths`` result."""
     if isinstance(resolved, CulturePaths):
         return [resolved]
-    # dict[exp_id, ExperimentPaths]
+    # dict[batch_id, BatchPaths]
     cultures: list[CulturePaths] = []
     for epath in resolved.values():
         cultures.extend(epath.cultures.values())
@@ -207,7 +207,7 @@ def _section_overview(pdf, cultures, single, analysis_dir):
     #         cid = cpath.culture_id
     #         divs = sorted(cpath.recordings)
     #         rows.append([
-    #             cid.exp_id, cid.chip, f"well{cid.well}", _device_type(cid.chip),
+    #             cid.batch_id, cid.chip, f"well{cid.well}", _device_type(cid.chip),
     #             len(divs), ", ".join(str(d) for d in divs),
     #         ])
     #     fig, ax = plt.subplots(figsize=(11, 8.5))
@@ -332,7 +332,7 @@ def _culture_recording_page(pdf, cpath, phase):
     loaded = []
     for div in divs:
         rec = Recording(0, io.load_preprocessed(cpath.recordings[div].npz))
-        loaded.append((rec, pd.read_csv(cpath.recordings[div].burst_stats)))
+        loaded.append((rec, pd.read_csv(cpath.recordings[div].require_burst_stats())))
 
     vmax = _origin_density_vmax(loaded, phase)
 
@@ -436,7 +436,7 @@ def generate_report(
     """Generate a multi-section PDF report for ``target`` and return the written path.
 
     :param target: A :class:`~mxtreme.identity.CultureID` (single culture) or
-        :class:`~mxtreme.identity.CultureSelector` (a group, possibly across experiments).
+        :class:`~mxtreme.identity.CultureSelector` (a group, possibly across batches).
     :param config: The :class:`~mxtreme.config.Config` describing the managed store.
     :param sections: Which sections to include (see module docstring). Defaults to activity +
         bursting + per-culture pages; add ``"stimulation"`` / ``"performance"`` as needed.
@@ -516,7 +516,7 @@ def generate_report(
         transactions.record(
             config,
             "report.written",
-            exp_id=c.culture_id.exp_id,
+            batch_id=c.culture_id.batch_id,
             chip=c.culture_id.chip,
             well=c.culture_id.well,
             data={
