@@ -36,6 +36,13 @@ concepts/configuration
 
 ```{toctree}
 :maxdepth: 2
+:caption: Tutorials
+
+tutorials/selecting-and-resolving
+```
+
+```{toctree}
+:maxdepth: 2
 :caption: Reference
 
 api/index

@@ -46,7 +46,7 @@ from mxtreme.recording import Recording
 from mxtreme import visualizations as viz
 
 from mxtreme.analysis import activity, stimulation, performance
-from mxtreme.analysis._paths import stamp_identity
+from mxtreme.analysis._paths import recording_label, stamp_identity
 from mxtreme.analysis._plotting import plot_cdf_grid, plot_metric_grid, sort_phases
 from mxtreme.analysis._stats import aggregate_by_div_phase
 
@@ -196,7 +196,7 @@ def _section_overview(pdf, cultures, single, analysis_dir):
     #             2, 1, figsize=(11, 8.5), gridspec_kw={"height_ratios": [1, 2]}
     #         )
     #         viz.plot_asdr(rec.spike_bin, ax=ax_asdr, title=f"ASDR — {cid} DIV{div}")
-    #         viz.MEA(ax_mea, rec.channelmap, rec.stim_elecs, title=f"MEA layout — DIV{div}")
+    #         viz.MEA(rec.channelmap, ax=ax_mea, stim_elecs=rec.stim_elecs, title=f"MEA layout — DIV{div}")
     #         fig.tight_layout()
     #         pdf.savefig(fig)
     #         plt.close(fig)
@@ -322,17 +322,18 @@ def _origin_density_vmax(recordings, phase):
 
 
 def _culture_recording_page(pdf, cpath, phase):
-    """Page A: the recording itself over DIV -- ASDR on top, burst-origin map below, one column per DIV."""
+    """Page A: the recording itself over DIV -- ASDR on top, burst-origin map below, one column per
+    recording (several on a DIV with more than one labelled recording)."""
     cid = cpath.culture_id
-    divs = sorted(cpath.recordings)
-    if not divs:
+    recordings = list(cpath.recordings)
+    if not recordings:
         return
 
-    # One load per DIV, reused by both rows and by the shared vmax pass.
+    # One load per recording, reused by both rows and by the shared vmax pass.
     loaded = []
-    for div in divs:
-        rec = Recording(0, io.load_preprocessed(cpath.recordings[div].npz))
-        loaded.append((rec, pd.read_csv(cpath.recordings[div].require_burst_stats())))
+    for rp in recordings:
+        rec = Recording(0, io.load_preprocessed(rp.npz))
+        loaded.append((rec, pd.read_csv(rp.require_burst_stats())))
 
     vmax = _origin_density_vmax(loaded, phase)
 
@@ -341,15 +342,15 @@ def _culture_recording_page(pdf, cpath, phase):
     # ribbon down. Both rows get a height derived from the column width -- the ASDR traces a squat
     # rectangle, the origin maps the array's own 3850 x 2100 µm aspect -- so the page ends up wide and
     # short. PdfPages takes each page at whatever size its figure is.
-    page_w = max(11, 2.4 * len(divs))
-    col_w = page_w / len(divs)
+    page_w = max(11, 2.4 * len(recordings))
+    col_w = page_w / len(recordings)
     asdr_h = col_w / ASDR_PANEL_ASPECT
     origin_h = col_w * device.CHIP_HEIGHT / device.CHIP_WIDTH
     # + room for the suptitle, panel titles and axis labels, which don't scale with the panels.
-    fig, axes = plt.subplots(2, len(divs), figsize=(page_w, asdr_h + origin_h + 1.9), squeeze=False,
+    fig, axes = plt.subplots(2, len(recordings), figsize=(page_w, asdr_h + origin_h + 1.9), squeeze=False,
                              gridspec_kw={"height_ratios": [asdr_h, origin_h]})
 
-    for col, (div, (rec, burst_df)) in enumerate(zip(divs, loaded)):
+    for col, (rp, (rec, burst_df)) in enumerate(zip(recordings, loaded)):
         ax_asdr, ax_origin = axes[0][col], axes[1][col]
 
         # Both rows show the selected phase only, like every other page in the report -- and at this
@@ -360,7 +361,8 @@ def _culture_recording_page(pdf, cpath, phase):
             bins_per_frame = 1 / (rec.samp_rate * rec.bin_size)
             zoom = (window.start_frame * bins_per_frame, window.end_frame * bins_per_frame)
 
-        viz.plot_bursts_on_asdr(rec, burst_df, ax=ax_asdr, zoom=zoom, title=f"DIV{div}")
+        title = recording_label(rp.recording_id.div, rp.recording_id.experiment)
+        viz.plot_bursts_on_asdr(rec, burst_df, ax=ax_asdr, zoom=zoom, title=title)
         # `plot_bursts_on_asdr` works in bins; minutes are what a reader wants on the axis.
         bins_per_min = 60 / rec.bin_size
         ax_asdr.xaxis.set_major_formatter(
@@ -398,7 +400,7 @@ def _culture_recording_page(pdf, cpath, phase):
 
 
 def _culture_distribution_page(pdf, cpath, analysis_dir, phase):
-    """Page B: the distributions behind the summary statistics, one CDF line per DIV."""
+    """Page B: the distributions behind the summary statistics, one CDF line per recording."""
     cid = cpath.culture_id
     dists = activity.culture_distributions(cpath, analysis_dir, phase=phase, use_existing=True)
     if not dists:
@@ -488,7 +490,7 @@ def generate_report(
             f"Cultures:  {len(cultures)}",
             "",
             "Selection:",
-        ] + [f"  - {c.culture_id}  (DIVs {', '.join(str(d) for d in sorted(c.recordings))})"
+        ] + [f"  - {c.culture_id}  ({', '.join(recording_label(r.recording_id.div, r.recording_id.experiment) for r in c.recordings)})"
              for c in cultures] + [
             "",
             f"Sections:  {', '.join(sections)}",
@@ -521,7 +523,8 @@ def generate_report(
             well=c.culture_id.well,
             data={
                 "path": str(output_path),
-                "divs": sorted(int(d) for d in c.recordings),
+                "divs": c.divs,
+                "recordings": [str(r.recording_id) for r in c.recordings],
                 "sections": list(sections),
             },
         )

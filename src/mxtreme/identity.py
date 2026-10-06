@@ -1,3 +1,6 @@
+"""
+``Identity`` holds a set of object used to define groupings over recordings. 
+"""
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -15,6 +18,9 @@ def _normalize(obj, **casts) -> None:
 
 @dataclass(frozen=True)
 class CultureID:
+    """
+    Defines a single culture which may have multiple recordings over multiple DIV. 
+    """
     batch_id: str
     chip: str
     well: str
@@ -29,18 +35,21 @@ class CultureID:
 class RecordingID:
     """One preprocessed recording: a culture on one DIV.
 
-    ``experiment`` names an ingested exogenous recording (``""`` for scans). It is not part of the
-    culture's identity -- it only tells apart two recordings of one culture on the same DIV.
+    ``experiment`` is the recording's label (``""`` for an unlabelled
+    recording). It tells apart two recordings of one
+    culture on the same DIV. TODO: describe experiment=None.
     """
 
     batch_id: str
     chip: str
     well: str
     div: int
-    experiment: str = ""
+    experiment: Optional[str] = None
 
     def __post_init__(self):
-        _normalize(self, batch_id=str, chip=str, well=str, div=int, experiment=str)
+        _normalize(self, batch_id=str, chip=str, well=str, div=int)
+        if self.experiment is not None:
+            _normalize(self, experiment=str)
 
     @property
     def culture(self) -> CultureID:
@@ -52,7 +61,12 @@ class RecordingID:
 
 @dataclass
 class CultureSelector:
+    """
+    Allows the user to select a group of recordings from different batches, cultures, and/or DIVs. 
+    Cultures can be specified directly by passing a list of CultureIDs or by selecting batches. 
+    A set of DIVs or experiment labels can be specified to further define a group of recordings. 
+    """
     batch_ids:  Optional[list[str]]       = None  # matches all cultures in these batches
     cultures:   Optional[list[CultureID]] = None  # explicit culture list (takes precedence)
     divs:       Optional[list[int]]       = None  # None = all DIVs
-    experiment: str                       = ""    # which recordings: "" = scans, else an ingested experiment's name
+    experiment: Optional[str]             = None  # which label: None = any, "" = unlabelled only, else that label

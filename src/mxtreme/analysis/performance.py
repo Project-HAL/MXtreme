@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 
-from mxtreme.analysis._paths import _summary_paths, load_population_summaries
+from mxtreme.analysis._paths import _summary_paths, load_population_summaries, read_cached
 from mxtreme.analysis._plotting import plot_metric_grid
 from mxtreme.analysis._stats import aggregate_by_div_phase
 
@@ -93,7 +93,7 @@ def performance_summary(
     """Per-DIV, per-phase performance score for a culture, using a pluggable objective.
 
     For each recording the network bursts are grouped by phase and scored with ``objective_fn``; the
-    tidy result (``chip, well, div, phase, condition, trained_side, score``) is cached as a CSV and
+    tidy result (``chip, well, div, experiment, phase, condition, trained_side, score``) is cached as a CSV and
     plotted as a learning curve.
 
     Each group is handed to ``objective_fn`` carrying a ``trained_side`` column, derived from the
@@ -107,28 +107,21 @@ def performance_summary(
     :returns: The per-DIV/phase summary DataFrame.
     """
     cid = cpath.culture_id
-    columns = ['chip', 'well', 'div', 'phase', 'condition', 'trained_side', 'score']
+    columns = ['chip', 'well', 'div', 'experiment', 'phase', 'condition', 'trained_side', 'score']
 
     save_path, csv_path = _summary_paths(cpath, analysis_dir, "performance", "performance_summary")
 
     # A cache without `trained_side` predates condition-aware scoring, so its right-trained scores carry
     # the wrong sign. Recompute rather than load it back.
-    cached = pd.read_csv(csv_path) if use_existing and csv_path.exists() else None
-    if cached is not None and 'trained_side' not in cached.columns:
-        print(f"Ignoring pre-condition summary at {csv_path} (no trained_side column); recomputing.")
-        cached = None
-
-    if cached is not None:
-        print(f"Loading existing summary from {csv_path}")
-        summary_df = cached
-    else:
+    summary_df = read_cached(csv_path, use_existing, required=('trained_side', 'experiment'))
+    if summary_df is None:
         rows = []
-        for div in cpath.recordings:
-            burst_stats = cpath.recordings[div].require_burst_stats()
-            burst_data = pd.read_csv(burst_stats)
+        for rp in cpath.recordings:
+            div, experiment = rp.recording_id.div, rp.recording_id.experiment or ""
+            burst_data = pd.read_csv(rp.require_burst_stats())
 
             # np.load is lazy, so reading this one key never decompresses the recording's spike arrays.
-            with np.load(cpath.recordings[div].npz, allow_pickle=True) as npz:
+            with np.load(rp.npz, allow_pickle=True) as npz:
                 condition = npz['exp_condition'] if 'exp_condition' in npz else None
             side = trained_side(condition)
             condition = None if condition is None else np.asarray(condition).ravel().tolist()
@@ -151,6 +144,7 @@ def performance_summary(
                     'chip':         cid.chip,
                     'well':         cid.well,
                     'div':          div,
+                    'experiment':   experiment,
                     'phase':        phase,
                     'condition':    condition,
                     'trained_side': side,

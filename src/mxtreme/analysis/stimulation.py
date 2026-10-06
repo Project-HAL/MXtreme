@@ -4,7 +4,7 @@ from pathlib import Path
 
 from mxtreme import io
 from mxtreme.recording import Recording
-from mxtreme.analysis._paths import _summary_paths, load_population_summaries
+from mxtreme.analysis._paths import _summary_paths, load_population_summaries, read_cached
 from mxtreme.analysis._plotting import plot_metric_grid
 from mxtreme.analysis._stats import aggregate_by_div_phase
 
@@ -30,9 +30,9 @@ def _get_stim_info(rec: Recording):
 
 
 def stim_summary(cpath, analysis_dir: Path, use_existing=True, show_plot=True, save_plot=False):
-    """Summarise stimulation delivered to one culture, one row per DIV and phase.
+    """Summarise stimulation delivered to one culture, one row per recording and phase.
 
-    For each (DIV, phase): ``total_stim_ms`` is the summed pulse phase of the stimulation events that
+    For each (DIV, experiment, phase): ``total_stim_ms`` is the summed pulse phase of the stimulation events that
     fall inside that phase's window (maxlab reports these in **microseconds** as ``phase_us``, so they
     are divided by 1000 to give milliseconds), and ``phase_dur_min`` is the span of the window itself.
 
@@ -44,32 +44,23 @@ def stim_summary(cpath, analysis_dir: Path, use_existing=True, show_plot=True, s
     :param use_existing: Reuse the cached summary CSV when one already exists.
     :param show_plot: Show the per-culture summary figure.
     :param save_plot: Save that figure next to the summary CSV.
-    :returns: One row per DIV/phase with columns ``div``, ``phase``, ``total_stim_ms``,
-        ``phase_dur_min``, ``culture_id``.
+    :returns: One row per recording/phase with columns ``div``, ``experiment``, ``phase``,
+        ``total_stim_ms``, ``phase_dur_min``, ``culture_id``.
     :rtype: pandas.DataFrame
     """
     cid = cpath.culture_id
-    columns = ['div', 'phase', 'total_stim_ms', 'phase_dur_min', 'culture_id']
+    columns = ['div', 'experiment', 'phase', 'total_stim_ms', 'phase_dur_min', 'culture_id']
 
     save_path, csv_path = _summary_paths(cpath, analysis_dir, "stimulation", "stim_summary")
 
     # A cache without `phase` predates per-phase attribution: its stim totals cover whole recordings
     # and can't be filtered to a phase. Recompute rather than load it back.
-    cached = pd.read_csv(csv_path) if use_existing and csv_path.exists() else None
-    if cached is not None and 'phase' not in cached.columns:
-        print(f"Ignoring pre-phase summary at {csv_path} (no phase column); recomputing.")
-        cached = None
-
-    if cached is not None:
-        print(f"Loading existing summary from {csv_path}")
-        summary_df = cached
-    else:
+    summary_df = read_cached(csv_path, use_existing, required=('phase', 'experiment'))
+    if summary_df is None:
         rows = []
-        for div in cpath.recordings:
+        for rp in cpath.recordings:
 
-            npz = cpath.recordings[div].npz
-
-            rec = Recording(0, io.load_preprocessed(npz))
+            rec = Recording(0, io.load_preprocessed(rp.npz))
 
             stim_df = _get_stim_info(rec)
 
@@ -78,7 +69,8 @@ def stim_summary(cpath, analysis_dir: Path, use_existing=True, show_plot=True, s
                     phase.start_frame, phase.end_frame, inclusive='both'
                 )
                 rows.append({
-                    'div':            div,
+                    'div':            rp.recording_id.div,
+                    'experiment':     rp.recording_id.experiment or "",
                     'phase':          phase.name,
                     # phase_us (µs) -> ms
                     'total_stim_ms':  stim_df.loc[in_phase, 'stim_phase'].sum() / 1000,

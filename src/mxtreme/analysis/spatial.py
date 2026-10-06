@@ -10,20 +10,19 @@ from mxtreme import io
 from mxtreme import device
 from mxtreme import visualizations as viz
 from mxtreme.recording import Recording
-from mxtreme.analysis._paths import _summary_paths, load_population_summaries
+from mxtreme.analysis._paths import _summary_paths, load_population_summaries, read_cached, recording_label
 from mxtreme.analysis._plotting import plot_metric_grid
 from mxtreme.analysis._stats import aggregate_by_div_phase
 
 
 def _load_channelmaps(cpath):
-    """{div: (channelmap, stim_elecs)} for every recording in a culture. Not cached by
+    """{(div, experiment): (channelmap, stim_elecs)} for every recording in a culture. Not cached by
     use_existing since the plotting functions below always need the raw arrays, not a tabular
     summary of them."""
     channelmaps = {}
-    for div in cpath.recordings:
-        npz = cpath.recordings[div].npz
-        rec = Recording(0, io.load_preprocessed(npz))
-        channelmaps[div] = (rec.channelmap, rec.stim_elecs)
+    for rp in cpath.recordings:
+        rec = Recording(0, io.load_preprocessed(rp.npz))
+        channelmaps[(rp.recording_id.div, rp.recording_id.experiment or "")] = (rec.channelmap, rec.stim_elecs)
     return channelmaps
 
 
@@ -83,15 +82,14 @@ def mea_layout_summary(cpath, analysis_dir: Path, use_existing=True, show_plot=T
 
     channelmaps = None
 
-    if use_existing and csv_path.exists():
-        print(f"Loading existing summary from {csv_path}")
-        summary_df = pd.read_csv(csv_path)
-    else:
+    summary_df = read_cached(csv_path, use_existing)
+    if summary_df is None:
         channelmaps = _load_channelmaps(cpath)
 
         summary_df = pd.DataFrame([
-            {'culture_id': str(cid), 'div': div, 'phase': 'full', 'n_electrodes': cmap.shape[0]}
-            for div, (cmap, _) in channelmaps.items()
+            {'culture_id': str(cid), 'div': div, 'experiment': experiment, 'phase': 'full',
+             'n_electrodes': cmap.shape[0]}
+            for (div, experiment), (cmap, _) in channelmaps.items()
         ])
 
         os.makedirs(save_path, exist_ok=True)
@@ -107,20 +105,20 @@ def mea_layout_summary(cpath, analysis_dir: Path, use_existing=True, show_plot=T
 
 
 def _plot_mea_layout_summary(channelmaps, cid, analysis_dir: Path, show_plot=True, save_plot=False):
-    """One viz.MEA() panel per distinct electrode configuration across the culture's DIVs."""
+    """One viz.MEA() panel per distinct electrode configuration across the culture's recordings."""
 
-    divs = sorted(channelmaps.keys())
+    keys = sorted(channelmaps.keys())  # (div, experiment)
 
-    # Group DIVs that share an identical electrode configuration so unchanged layouts collapse
-    # into one panel instead of a wall of duplicates.
-    groups = []  # list of [divs], channelmap, stim_elecs
-    for div in divs:
-        cmap, stim_elecs = channelmaps[div]
+    # Group recordings that share an identical electrode configuration so unchanged layouts
+    # collapse into one panel instead of a wall of duplicates.
+    groups = []  # list of [(div, experiment)], channelmap, stim_elecs
+    for key in keys:
+        cmap, stim_elecs = channelmaps[key]
         match = next((g for g in groups if np.array_equal(g[1], cmap)), None)
         if match:
-            match[0].append(div)
+            match[0].append(key)
         else:
-            groups.append(([div], cmap, stim_elecs))
+            groups.append(([key], cmap, stim_elecs))
 
     n_panels = len(groups)
     ncols = min(3, n_panels)
@@ -129,9 +127,9 @@ def _plot_mea_layout_summary(channelmaps, cid, analysis_dir: Path, show_plot=Tru
     fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 5 * nrows), squeeze=False)
     axes = axes.flatten()
 
-    for ax, (div_group, cmap, stim_elecs) in zip(axes, groups):
-        title = f"DIV {','.join(str(d) for d in div_group)}"
-        viz.MEA(ax, cmap, stim_elecs, title=title)
+    for ax, (key_group, cmap, stim_elecs) in zip(axes, groups):
+        title = ", ".join(recording_label(*k) for k in key_group)
+        viz.MEA(cmap, ax=ax, stim_elecs=stim_elecs, title=title)
 
     for ax in axes[len(groups):]:
         ax.set_visible(False)
@@ -159,18 +157,16 @@ def spatial_summary(cpath, analysis_dir: Path, use_existing=True, show_plot=True
 
     save_path, csv_path = _summary_paths(cpath, analysis_dir, "spatial", "spatial_summary")
 
-    if use_existing and csv_path.exists():
-        print(f"Loading existing summary from {csv_path}")
-        summary_df = pd.read_csv(csv_path)
-    else:
+    summary_df = read_cached(csv_path, use_existing)
+    if summary_df is None:
         rows = []
-        for div in cpath.recordings:
-            npz = cpath.recordings[div].npz
-            rec = Recording(0, io.load_preprocessed(npz))
+        for rp in cpath.recordings:
+            rec = Recording(0, io.load_preprocessed(rp.npz))
 
             rows.append({
                 'culture_id': str(cid),
-                'div': div,
+                'div': rp.recording_id.div,
+                'experiment': rp.recording_id.experiment or "",
                 'phase': 'full',
                 **compute_spatial_metrics(rec.channelmap),
             })

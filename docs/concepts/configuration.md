@@ -112,11 +112,13 @@ Three small frozen dataclasses in {mod}`mxtreme.identity` name things without to
 filesystem:
 
 - {class}`~mxtreme.identity.CultureID` — `batch_id`, `chip`, `well`. One culture across all its DIVs.
-- {class}`~mxtreme.identity.RecordingID` — a `CultureID` plus a `div` (and an `experiment` name, `""`
-  for scans). One recording. Its `.culture` property drops back to the culture.
+- {class}`~mxtreme.identity.RecordingID` — a `CultureID` plus a `div`, and optionally an
+  `experiment` label (`None`, the default, takes whichever label that DIV's recording has). One
+  recording. Its `.culture` property drops back to the culture.
 - {class}`~mxtreme.identity.CultureSelector` — a *query*: whole batches by `batch_ids`, an explicit
-  `cultures` list (which takes precedence), an optional `divs` filter (`None` means all), and which
-  recordings — `experiment=""` (the default) for scans, or an ingested experiment's name.
+  `cultures` list (which takes precedence), an optional `divs` filter (`None` means all), and an
+  `experiment` label filter (`None`, the default, matches any label; `""` matches unlabelled
+  recordings only).
 
 ```python
 from mxtreme.identity import CultureID, RecordingID, CultureSelector
@@ -137,17 +139,17 @@ per-batch grouping want:
 | Input | Output |
 |---|---|
 | `RecordingID` | `RecordingPaths` |
-| `CultureID` | `CulturePaths` (all available DIVs) |
+| `CultureID` | `CulturePaths` (every recording, by DIV then `experiment` label) |
 | `CultureSelector` | `dict[batch_id, BatchPaths]` |
 
-**{func}`~mxtreme.paths.resolve_recordings` flattens** any of those into a
+**{func}`~mxtreme.paths.resolve_paths_flat` flattens** any of those into a
 {class}`~mxtreme.paths.RecordingSet` — an ordered, iterable list with `.npz` and `.burst_stats`
 accessors, for the common "just give me the files to loop over" case:
 
 ```python
-from mxtreme.paths import resolve_recordings
+from mxtreme.paths import resolve_paths_flat
 
-recs = resolve_recordings(group, config)
+recs = resolve_paths_flat(group, config)
 for rp in recs:
     ...
 print(recs.npz)          # list[Path] of the cleaned .npz files

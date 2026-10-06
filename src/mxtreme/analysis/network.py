@@ -47,7 +47,10 @@ from mxtreme import io
 from mxtreme.params import NetworkParams
 from mxtreme.recording import Recording
 from mxtreme.utils import get_n_colors
-from mxtreme.analysis._paths import _summary_paths, load_population_summaries
+from mxtreme.analysis._paths import (
+    _summary_paths, load_population_summaries, read_cached, recording_key, recording_label,
+    unflatten_recording_arrays,
+)
 from mxtreme.analysis._plotting import plot_metric_grid, sort_phases
 from mxtreme.analysis._stats import aggregate_by_div_phase
 
@@ -248,10 +251,11 @@ def _phase_columns(rec, phase, decim: int, n_samples: int) -> tuple[int, int]:
 
 def network_summary(cpath, analysis_dir: Path, use_existing=True, show_plot=True, save_plot=False,
                     params: NetworkParams | None = None):
-    """Connectivity and dimensionality metrics per (DIV, phase) for one culture.
+    """Connectivity and dimensionality metrics per (DIV, experiment, phase) for one culture.
 
-    One row per phase per recording, so an unphased culture yields a single ``"full"`` row per DIV and
-    a phased one yields a row per phase. The filter runs **once** per recording over the whole
+    One row per phase per recording, so an unphased culture yields a single ``"full"`` row per
+    recording and a phased one yields a row per phase. Several labelled recordings on one DIV each
+    get their own rows, told apart by ``experiment``. The filter runs **once** per recording over the whole
     timebase and each phase is then a column slice of the result -- cheaper than one pass per phase,
     and it lets a phase inherit the decay tail of whatever preceded it rather than starting from zero.
 
@@ -269,14 +273,13 @@ def network_summary(cpath, analysis_dir: Path, use_existing=True, show_plot=True
 
     save_path, csv_path = _summary_paths(cpath, analysis_dir, "network", "network_summary")
 
-    if use_existing and csv_path.exists():
-        print(f"Loading existing summary from {csv_path}")
-        summary_df = pd.read_csv(csv_path)
-    else:
+    summary_df = read_cached(csv_path, use_existing)
+    if summary_df is None:
         rows = []
 
-        for div in sorted(cpath.recordings):
-            rec = _load_recording(cpath.recordings[div].npz)
+        for rp in cpath.recordings:
+            div, experiment = rp.recording_id.div, rp.recording_id.experiment or ""
+            rec = _load_recording(rp.npz)
 
             decim = _decimation_factor(rec.bin_size, params)
             rates = firing_rate_matrix(rec.spike_bin, rec.bin_size, params)
@@ -289,6 +292,7 @@ def network_summary(cpath, analysis_dir: Path, use_existing=True, show_plot=True
                 rows.append({
                     'culture_id': str(cid),
                     'div': div,
+                    'experiment': experiment,
                     'phase': p.name,
                     **compute_network_metrics(window, params),
                     # Stamped so a cached CSV says what produced it -- `_summary_paths` keys on the
@@ -367,9 +371,10 @@ def _resolve_phase(rec, phase: str | None):
 
 def culture_connectivity(cpath, analysis_dir: Path, *, phase: str | None = None,
                          use_existing: bool = True, params: NetworkParams | None = None):
-    """Per-DIV correlation matrices and variance curves for one culture.
+    """Per-recording correlation matrices and variance curves for one culture.
 
-    Returns ``{div: {key: array}}`` with these keys:
+    Returns ``{(div, experiment): {key: array}}`` -- one entry per recording, so several labelled
+    recordings on one DIV stay apart (``experiment`` is ``""`` for an unlabelled one) -- with keys:
 
     ============== =========================================================================
     ``corr``       ``(n, n)`` electrode x electrode Pearson correlation (Sono et al. Fig. 2B)
@@ -387,7 +392,7 @@ def culture_connectivity(cpath, analysis_dir: Path, *, phase: str | None = None,
     :param phase: Phase to restrict to; ``None`` selects each recording's first phase.
     :param use_existing: Reuse the cached ``.npz`` when one exists.
     :param params: Settings; defaults to :class:`~mxtreme.params.NetworkParams`.
-    :returns: ``{div: {key: numpy array}}``, keyed by DIV.
+    :returns: ``{(div, experiment): {key: numpy array}}``, ordered by DIV then label.
     """
     params = params or NetworkParams()
 
@@ -396,17 +401,17 @@ def culture_connectivity(cpath, analysis_dir: Path, *, phase: str | None = None,
     )
 
     if use_existing and npz_path.exists():
-        print(f"Loading existing connectivity from {npz_path}")
         with np.load(npz_path) as cached:
-            conn: dict[int, dict[str, np.ndarray]] = {}
-            for flat_key in cached.files:
-                div_str, key = flat_key.split("__", 1)
-                conn.setdefault(int(div_str), {})[key] = cached[flat_key]
-        return conn
+            conn = unflatten_recording_arrays(cached)
+        if conn is not None:
+            print(f"Loading existing connectivity from {npz_path}")
+            return dict(sorted(conn.items()))
+        print(f"Ignoring {npz_path} (keyed by DIV only, from before per-recording keys); recomputing.")
 
     conn = {}
-    for div in sorted(cpath.recordings):
-        rec = _load_recording(cpath.recordings[div].npz)
+    for rp in cpath.recordings:
+        div, experiment = rp.recording_id.div, rp.recording_id.experiment or ""
+        rec = _load_recording(rp.npz)
 
         decim = _decimation_factor(rec.bin_size, params)
         rates = firing_rate_matrix(rec.spike_bin, rec.bin_size, params)
@@ -419,7 +424,7 @@ def culture_connectivity(cpath, analysis_dir: Path, *, phase: str | None = None,
         corr, keep = connectivity_matrix(rates, min_var=params.min_var)
         p = variance_explained(rates[keep])
 
-        conn[div] = {
+        conn[(div, experiment)] = {
             'corr':       corr,
             'cumvar':     np.cumsum(p),
             'elec_index': keep,
@@ -428,7 +433,8 @@ def culture_connectivity(cpath, analysis_dir: Path, *, phase: str | None = None,
     os.makedirs(save_path, exist_ok=True)
     np.savez_compressed(
         npz_path,
-        **{f"{div}__{key}": values for div, per_div in conn.items() for key, values in per_div.items()},
+        **{f"{recording_key(*rec_key)}__{key}": values
+           for rec_key, per_rec in conn.items() for key, values in per_rec.items()},
     )
     print(f"Saved connectivity to {npz_path}")
 
@@ -473,9 +479,10 @@ def plot_connectivity_matrix(corr, ax=None, title=None, vmin=-1.0, vmax=1.0, col
 
 def plot_connectivity_grid(conn, cid=None, suptitle=None, save_path=None, show_plot=True,
                            ncols=None, figsize=None, dpi=150):
-    """One correlation heatmap per DIV, on a shared colour scale.
+    """One correlation heatmap per recording, on a shared colour scale.
 
-    :param conn: ``{div: {'corr': matrix, ...}}``, as returned by :func:`culture_connectivity`.
+    :param conn: ``{(div, experiment): {'corr': matrix, ...}}``, as returned by
+        :func:`culture_connectivity`.
     :param cid: Culture id, used to build a default ``suptitle``.
     :param suptitle: Figure title; defaults to one naming ``cid``.
     :param save_path: Full path (including filename) to save to, or None to skip saving.
@@ -485,28 +492,28 @@ def plot_connectivity_grid(conn, cid=None, suptitle=None, save_path=None, show_p
     :param dpi: Resolution for the saved figure and the rasterized heatmaps.
     :returns: The matplotlib :class:`~matplotlib.figure.Figure`, or None if ``conn`` is empty.
     """
-    divs = sorted(conn)
-    if not divs:
+    keys = sorted(conn)
+    if not keys:
         return None
 
-    ncols = ncols or min(4, len(divs))
-    nrows = -(-len(divs) // ncols)
+    ncols = ncols or min(4, len(keys))
+    nrows = -(-len(keys) // ncols)
     figsize = figsize or (3.6 * ncols, 3.9 * nrows)
 
     fig, axes = plt.subplots(nrows, ncols, figsize=figsize, constrained_layout=True, squeeze=False)
     axes = axes.flatten()
 
-    for ax, div in zip(axes, divs):
-        plot_connectivity_matrix(conn[div]['corr'], ax=ax, title=f"DIV{div}", colorbar=False)
+    for ax, key in zip(axes, keys):
+        plot_connectivity_matrix(conn[key]['corr'], ax=ax, title=recording_label(*key), colorbar=False)
         ax.tick_params(labelsize=7)
         ax.set_xlabel(ax.get_xlabel(), fontsize=8)
         ax.set_ylabel(ax.get_ylabel() if ax is axes[0] else "", fontsize=8)
 
-    for ax in axes[len(divs):]:
+    for ax in axes[len(keys):]:
         ax.set_visible(False)
 
     # One colour bar for the figure: every panel already shares the pinned [-1, 1] scale.
-    fig.colorbar(axes[0].images[0], ax=axes[:len(divs)].tolist(), fraction=0.025, pad=0.02,
+    fig.colorbar(axes[0].images[0], ax=axes[:len(keys)].tolist(), fraction=0.025, pad=0.02,
                  label='Pearson r')
 
     fig.suptitle(suptitle or f'Functional Connectivity — {cid}', fontsize=13, fontweight='bold')
@@ -527,13 +534,14 @@ def plot_connectivity_grid(conn, cid=None, suptitle=None, save_path=None, show_p
 
 def plot_variance_explained(conn, cid=None, suptitle=None, save_path=None, show_plot=True,
                             thresholds=(0.8, 0.9), figsize=(7, 5), dpi=150, cmap_name='viridis'):
-    """Cumulative variance explained vs component count, one line per DIV (Sono et al. Fig. 2D).
+    """Cumulative variance explained vs component count, one line per recording (Sono et al. Fig. 2D).
 
     A culture whose curve rises later over development is spreading its dynamics across more
     independent components -- the thing the effective rank in :func:`network_summary` summarizes to one
     number.
 
-    :param conn: ``{div: {'cumvar': array, ...}}``, as returned by :func:`culture_connectivity`.
+    :param conn: ``{(div, experiment): {'cumvar': array, ...}}``, as returned by
+        :func:`culture_connectivity`.
     :param cid: Culture id, used to build a default ``suptitle``.
     :param suptitle: Figure title; defaults to one naming ``cid``.
     :param save_path: Full path (including filename) to save to, or None to skip saving.
@@ -544,19 +552,19 @@ def plot_variance_explained(conn, cid=None, suptitle=None, save_path=None, show_
     :param cmap_name: Sequential colormap mapped over the DIVs, so colour reads as developmental time.
     :returns: The matplotlib :class:`~matplotlib.figure.Figure`, or None if ``conn`` is empty.
     """
-    divs = sorted(conn)
-    if not divs:
+    keys = sorted(conn)
+    if not keys:
         return None
 
     fig, ax = plt.subplots(figsize=figsize, constrained_layout=True)
-    colors = dict(zip(divs, get_n_colors(len(divs), cmap_name=cmap_name)))
+    colors = dict(zip(keys, get_n_colors(len(keys), cmap_name=cmap_name)))
 
-    for div in divs:
-        cumvar = np.asarray(conn[div].get('cumvar', []), dtype=float)
+    for key in keys:
+        cumvar = np.asarray(conn[key].get('cumvar', []), dtype=float)
         if cumvar.size == 0:
             continue
-        ax.plot(np.arange(1, cumvar.size + 1), cumvar, color=colors[div],
-                linewidth=1.5, label=f"DIV{div}")
+        ax.plot(np.arange(1, cumvar.size + 1), cumvar, color=colors[key],
+                linewidth=1.5, label=recording_label(*key))
 
     for threshold in thresholds:
         ax.axhline(threshold, color='gray', linestyle='--', linewidth=0.7, alpha=0.7)
@@ -568,7 +576,7 @@ def plot_variance_explained(conn, cid=None, suptitle=None, save_path=None, show_
     ax.set_ylabel('Cumulative variance explained', fontsize=10)
     ax.set_ylim(0, 1.02)
     ax.grid(True, linestyle='--', linewidth=0.5, alpha=0.6)
-    ax.legend(fontsize=7, framealpha=0.8, ncol=max(1, len(divs) // 6 + 1), loc='lower right')
+    ax.legend(fontsize=7, framealpha=0.8, ncol=max(1, len(keys) // 6 + 1), loc='lower right')
     ax.spines[['top', 'right']].set_visible(False)
 
     fig.suptitle(suptitle or f'Variance Explained — {cid}', fontsize=13, fontweight='bold')

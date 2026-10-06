@@ -44,8 +44,8 @@ def test_raster_on_ax():
 
 def test_mea_runs_with_and_without_stim():
     fig, ax = plt.subplots()
-    viz.MEA(ax, _channelmap(), stim_elecs=None)
-    viz.MEA(ax, _channelmap(), stim_elecs=np.array([0, 5]))
+    viz.MEA(_channelmap(), ax=ax, stim_elecs=None)
+    viz.MEA(_channelmap(), ax=ax, stim_elecs=np.array([0, 5]))
     plt.close(fig)
 
 

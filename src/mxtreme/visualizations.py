@@ -333,7 +333,7 @@ def plot_origin_heatmap(recording, burst_df, ax=None, phase=None, kind="network"
     x_origin = bursts["origin_x"].to_numpy()
     y_origin = bursts["origin_y"].to_numpy()
 
-    MEA(ax, channelmap, recording.stim_elecs, title="", marker_size=elec_marker_size,
+    MEA(channelmap, ax=ax, stim_elecs=recording.stim_elecs, title="", marker_size=elec_marker_size,
         stim_fontsize=max(6, 16 * elec_marker_size / 36))
     # Semi-transparent: with a few hundred bursts these markers otherwise merge into a solid blob and
     # hide both the density layer and their own concentration.
@@ -366,7 +366,7 @@ def plot_burst_vectors(recording, burst_df, ax=None, phase=None, kind="network",
     chip_ht_um = device.CHIP_HEIGHT * device.ELEC_SIZE
     df = _select(burst_df, kind, phase)
 
-    MEA(ax, recording.channelmap, recording.stim_elecs, title="")
+    MEA(recording.channelmap, ax=ax, stim_elecs=recording.stim_elecs, title="")
 
     x_origin = df["origin_x"].to_numpy()
     y_origin = chip_ht_um - df["origin_y"].to_numpy()

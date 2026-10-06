@@ -217,8 +217,9 @@ records detection and feature-extraction timestamps independently. Omit it for p
 
 Each topic module in {mod}`mxtreme.analysis` follows the same two-level shape:
 
-- A **culture-level** function takes one `CulturePaths`, computes across all its DIVs, and writes a
-  tidy per-DIV CSV under `analysis/<category>/<batch_id>/<chip>/well<N>/`.
+- A **culture-level** function takes one `CulturePaths`, computes across all its recordings, and
+  writes a tidy CSV under `analysis/<category>/<batch_id>/<chip>/well<N>/`. Each row carries `div`
+  and `experiment`, so several labelled recordings on one DIV each get their own rows.
 - A **population-level** function reads those CSVs back and pools them across cultures.
 
 | Module | Culture level | Population level |

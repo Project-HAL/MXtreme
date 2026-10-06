@@ -8,7 +8,9 @@ from mxtreme import io
 from mxtreme.params import ActivityParams
 from mxtreme.recording import Recording
 from mxtreme.utils import frame_to_sec
-from mxtreme.analysis._paths import _summary_paths, load_population_summaries
+from mxtreme.analysis._paths import (
+    _summary_paths, load_population_summaries, read_cached, recording_key, unflatten_recording_arrays,
+)
 from mxtreme.analysis._plotting import plot_metric_grid, sort_phases
 from mxtreme.analysis._stats import aggregate_by_div_phase
 
@@ -30,15 +32,13 @@ def burst_activity_summary(cpath, analysis_dir: Path, use_existing=True, show_pl
 
     save_path, csv_path = _summary_paths(cpath, analysis_dir, "activity", "burst_activity_summary")
 
-    if use_existing and csv_path.exists():
-        print(f"Loading existing summary from {csv_path}")
-        summary_df = pd.read_csv(csv_path)
-    else:
+    summary_df = read_cached(csv_path, use_existing)
+    if summary_df is None:
 
-        for div in cpath.recordings:
+        for rp in cpath.recordings:
 
-            npz = cpath.recordings[div].npz
-            rec = _load_recording(npz)
+            div, experiment = rp.recording_id.div, rp.recording_id.experiment or ""
+            rec = _load_recording(rp.npz)
             samp_rate = rec.samp_rate
 
             # Phase windows come from the recording's injected phases (default: a single "full"
@@ -47,8 +47,7 @@ def burst_activity_summary(cpath, analysis_dir: Path, use_existing=True, show_pl
                 p.name: frame_to_sec(p.n_frames, samp_rate) for p in rec.phases
             }
 
-            burst_stats = cpath.recordings[div].require_burst_stats()
-            burst_data = pd.read_csv(burst_stats)
+            burst_data = pd.read_csv(rp.require_burst_stats())
 
             # Keep only network bursts (the analogue of the old "HAL_like" class).
             burst_data = burst_data[burst_data['kind'] == 'network']
@@ -82,6 +81,7 @@ def burst_activity_summary(cpath, analysis_dir: Path, use_existing=True, show_pl
                 rows.append({
                     'culture_id':      cid,
                     'div':             div,
+                    'experiment':      experiment,
                     'phase':           phase,
                     'n_bursts':        len(phase_bursts),
                     'burst_rate_hz':   burst_rate,
@@ -149,15 +149,13 @@ def channel_activity_summary(cpath, analysis_dir: Path, use_existing=True, show_
 
     save_path, csv_path = _summary_paths(cpath, analysis_dir, "activity", "channel_activity_summary")
 
-    if use_existing and csv_path.exists():
-        print(f"Loading existing summary from {csv_path}")
-        summary_df = pd.read_csv(csv_path)
-    else:
+    summary_df = read_cached(csv_path, use_existing)
+    if summary_df is None:
 
-        for div in cpath.recordings:
+        for rp in cpath.recordings:
 
-            npz = cpath.recordings[div].npz
-            rec = _load_recording(npz)
+            div, experiment = rp.recording_id.div, rp.recording_id.experiment or ""
+            rec = _load_recording(rp.npz)
 
             for p in rec.phases:
 
@@ -189,6 +187,7 @@ def channel_activity_summary(cpath, analysis_dir: Path, use_existing=True, show_
                 rows.append({
                     'culture_id':      str(cid),
                     'div':             div,
+                    'experiment':      experiment,
                     'phase':           phase,
                     # Firing rate
                     'mean_fr_hz':      _safe(np.mean,   fr_vals),
@@ -362,9 +361,10 @@ def _phase_window(rec, phase: str | None) -> tuple[str, int, int]:
 
 def culture_distributions(cpath, analysis_dir: Path, *, phase: str | None = None,
                           use_existing: bool = True, params: ActivityParams | None = None):
-    """Per-DIV distributions underlying the activity summaries, for one culture.
+    """Per-recording distributions underlying the activity summaries, for one culture.
 
-    Returns ``{div: {key: values}}`` with these keys:
+    Returns ``{(div, experiment): {key: values}}`` -- one entry per recording, so several labelled
+    recordings on one DIV stay apart (``experiment`` is ``""`` for an unlabelled one) -- with keys:
 
     ============ ===========================================================================
     ``fr_hz``    per-electrode firing rate (:func:`firing_rate_chan`)
@@ -385,7 +385,7 @@ def culture_distributions(cpath, analysis_dir: Path, *, phase: str | None = None
     :param phase: Phase to restrict to; ``None`` selects each recording's first phase.
     :param use_existing: Reuse the cached ``.npz`` when one already exists.
     :param params: Activity settings; defaults to :class:`~mxtreme.params.ActivityParams`.
-    :returns: ``{div: {key: numpy array}}``, keyed by DIV.
+    :returns: ``{(div, experiment): {key: numpy array}}``, ordered by DIV then label.
     """
     params = params or ActivityParams()
     cid = cpath.culture_id
@@ -395,17 +395,17 @@ def culture_distributions(cpath, analysis_dir: Path, *, phase: str | None = None
     )
 
     if use_existing and npz_path.exists():
-        print(f"Loading existing distributions from {npz_path}")
         with np.load(npz_path) as cached:
-            dists: dict[int, dict[str, np.ndarray]] = {}
-            for flat_key in cached.files:
-                div_str, key = flat_key.split("__", 1)
-                dists.setdefault(int(div_str), {})[key] = cached[flat_key]
-        return dists
+            dists = unflatten_recording_arrays(cached)
+        if dists is not None:
+            print(f"Loading existing distributions from {npz_path}")
+            return dict(sorted(dists.items()))
+        print(f"Ignoring {npz_path} (keyed by DIV only, from before per-recording keys); recomputing.")
 
     dists = {}
-    for div in sorted(cpath.recordings):
-        rec = _load_recording(cpath.recordings[div].npz)
+    for rp in cpath.recordings:
+        div, experiment = rp.recording_id.div, rp.recording_id.experiment or ""
+        rec = _load_recording(rp.npz)
         _name, start, stop = _phase_window(rec, phase)
 
         spikes = rec.spike_data[(rec.spike_data["frameno"] >= start) & (rec.spike_data["frameno"] <= stop)]
@@ -413,7 +413,7 @@ def culture_distributions(cpath, analysis_dir: Path, *, phase: str | None = None
         firing_rates = firing_rate_chan(spikes, rec.samp_rate)
         fr_vals = np.array([v for v in firing_rates.values() if v is not None], dtype=float)
 
-        bursts = pd.read_csv(cpath.recordings[div].require_burst_stats())
+        bursts = pd.read_csv(rp.require_burst_stats())
         bursts = bursts[bursts['kind'] == 'network']
         if phase is not None and 'phase' in bursts.columns:
             bursts = bursts[bursts['phase'] == phase]
@@ -421,7 +421,7 @@ def culture_distributions(cpath, analysis_dir: Path, *, phase: str | None = None
 
         peak_sec = frame_to_sec(bursts['peak_frame'].to_numpy(), rec.samp_rate)
 
-        dists[div] = {
+        dists[(div, experiment)] = {
             'fr_hz':    fr_vals,
             'isi_ms':   isi_all(spikes, rec.samp_rate, params),
             'ibi_sec':  np.diff(peak_sec) if len(peak_sec) > 1 else np.array([]),
@@ -431,7 +431,8 @@ def culture_distributions(cpath, analysis_dir: Path, *, phase: str | None = None
     os.makedirs(save_path, exist_ok=True)
     np.savez_compressed(
         npz_path,
-        **{f"{div}__{key}": values for div, per_div in dists.items() for key, values in per_div.items()},
+        **{f"{recording_key(*rec_key)}__{key}": values
+           for rec_key, per_rec in dists.items() for key, values in per_rec.items()},
     )
     print(f"Saved distributions to {npz_path}")
 

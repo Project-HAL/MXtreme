@@ -14,9 +14,10 @@ from mxtreme.identity import CultureID, CultureSelector
 from mxtreme.recording import Recording
 from mxtreme.bursting import BurstDetector
 from mxtreme.params import ActivityParams, BurstDetectParams, BurstFeatureParams, NetworkParams
-from mxtreme.paths import CulturePaths, resolve_paths, resolve_recordings
+from mxtreme.paths import CulturePaths, resolve_paths, resolve_paths_flat
 from mxtreme.analysis import activity, network, performance, stimulation, generate_report
 from mxtreme.analysis._paths import _summary_paths, load_population_summaries
+from mxtreme.analysis._stats import aggregate_by_div_phase
 
 # Detection params tuned for the small synthetic fixture (see test_bursting.py).
 DETECT = BurstDetectParams(n=50, noise_thresh=0.02, burst_thresh=0.15, min_dist_bins=10)
@@ -74,9 +75,9 @@ def test_resolve_single_culture_all_divs(store):
     config, cid_a, _ = store
     cpath = resolve_paths(cid_a, config)
     assert isinstance(cpath, CulturePaths)
-    assert sorted(cpath.recordings) == [7, 8]
-    assert cpath.recordings[7].npz.exists()
-    assert cpath.recordings[7].burst_stats.exists()
+    assert cpath.divs == [7, 8]
+    assert cpath.recording(7).npz.exists()
+    assert cpath.recording(7).burst_stats.exists()
 
 
 def test_resolve_without_burst_data(store):
@@ -93,11 +94,11 @@ def test_resolve_without_burst_data(store):
     assert culture == cid_a
 
     cpath = resolve_paths(culture, config)
-    assert sorted(cpath.recordings) == [7, 8]
-    assert all(r.npz.exists() for r in cpath.recordings.values())
-    assert all(r.burst_stats is None for r in cpath.recordings.values())
+    assert cpath.divs == [7, 8]
+    assert all(r.npz.exists() for r in cpath.recordings)
+    assert all(r.burst_stats is None for r in cpath.recordings)
     with pytest.raises(FileNotFoundError, match="run burst detection"):
-        cpath.recordings[7].require_burst_stats()
+        cpath.recording(7).require_burst_stats()
 
 
 def test_resolve_ignores_activity_scan_rows(store):
@@ -115,8 +116,8 @@ def test_resolve_ignores_activity_scan_rows(store):
     io.register_scan(_ScanParams(), config.registry_path)
     assert len(pd.read_csv(config.registry_path)) == 4  # the scan row really is there
 
-    assert sorted(resolve_paths(cid_a, config).recordings) == [7, 8]
-    assert len(resolve_recordings(CultureSelector(batch_ids=["expA"]), config)) == 2
+    assert resolve_paths(cid_a, config).divs == [7, 8]
+    assert len(resolve_paths_flat(CultureSelector(batch_ids=["expA"]), config)) == 2
 
 
 def test_resolve_reads_a_registry_written_before_scans_were_indexed(store):
@@ -125,32 +126,203 @@ def test_resolve_reads_a_registry_written_before_scans_were_indexed(store):
     df = pd.read_csv(config.registry_path).drop(columns=["kind"])
     df.to_csv(config.registry_path, index=False)
 
-    assert sorted(resolve_paths(cid_a, config).recordings) == [7, 8]
+    assert resolve_paths(cid_a, config).divs == [7, 8]
 
 
-def test_resolve_keeps_an_experiment_apart_from_the_scans_of_its_div(store, make_recording_data):
-    """An ingested experiment on DIV 7 is the same culture, but resolves only when asked for."""
-    config, cid_a, _ = store
-    out_dir = config.preprocessed_dir / "expA" / "C0001" / "well0"
-    npz = out_dir / "DIV7_250101_C0001_expA_well0_stim1_exp_data.npz"
-    np.savez_compressed(npz, **make_recording_data(seed=4, batch_id="expA", experiment="stim1"))
-    io.register(
-        {0: {"batch_id": "expA", "experiment": "stim1", "chip": "C0001", "DIV": 7}},
-        config.registry_path,
-    )
+def _add_labelled(config, make_recording_data, label, div, seed=4, batch="expA", chip="C0001",
+                  with_bursts=False):
+    """Write and register one labelled recording (an ingested experiment's) of culture ``chip``/well0.
 
-    scans = resolve_paths(cid_a, config)
-    assert sorted(scans.recordings) == [7, 8] and scans.recordings[7].npz != npz
+    ``with_bursts`` also runs burst detection, for tests that analyse the recording.
+    """
+    out_dir = config.preprocessed_dir / batch / chip / "well0"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    npz = out_dir / f"DIV{div}_250101_{chip}_{batch}_well0_{label}_exp_data.npz"
+    np.savez_compressed(npz, **make_recording_data(seed=seed, batch_id=batch, chip=chip, DIV=div, experiment=label))
+    if with_bursts:
+        rec = Recording(0, io.load_preprocessed(npz))
+        bursts = BurstDetector(DETECT).detect(rec)
+        bursts.extract_features(rec, BurstFeatureParams())
+        io.save_burst_data(bursts, config.burst_data_dir, rec)
+    io.register({0: {"batch_id": batch, "experiment": label, "chip": chip, "DIV": div}}, config.registry_path)
+    return npz
 
+
+def test_resolve_finds_labelled_recordings_without_being_told_the_label(store, make_recording_data):
+    """Every recording carries a label and each DIV has one: the default resolves them all."""
+    config, _, _ = store
+    culture = CultureID("expA", "C0009", "0")
+    ns = {div: _add_labelled(config, make_recording_data, "NS", div, chip="C0009") for div in (12, 15)}
+    atp = _add_labelled(config, make_recording_data, "NS_ATP1hr", 27, chip="C0009")
+
+    cpath = resolve_paths(culture, config)
+    assert cpath.divs == [12, 15, 27]
+    assert cpath.recording(15).npz == ns[15] and cpath.recording(27).npz == atp
+    assert cpath.recording(27).recording_id.experiment == "NS_ATP1hr"
+
+    from mxtreme.identity import RecordingID
+
+    assert resolve_paths(RecordingID("expA", "C0009", "0", 15), config).npz == ns[15]
+    assert resolve_paths(culture, config, experiment="NS").divs == [12, 15]
+    assert len(resolve_paths(culture, config, experiment="").recordings) == 0
+
+
+def test_resolve_paths_keeps_every_recording_when_a_div_has_several(store, make_recording_data):
+    """Two labels on one DIV both resolve, side by side; picking one takes a label."""
+    config, cid_a, _ = store  # culture A already has an unlabelled recording on DIV 7
+    npz = _add_labelled(config, make_recording_data, "stim1", 7)
+
+    cpath = resolve_paths(cid_a, config)
+    assert [(r.recording_id.div, r.recording_id.experiment) for r in cpath.recordings] == [
+        (7, ""), (7, "stim1"), (8, "")
+    ]
+    assert cpath.divs == [7, 8] and cpath.experiments == ["", "stim1"]
+    assert len(cpath.at_div(7)) == 2
+    with pytest.raises(ValueError, match=r"DIV 7 \('' \(unlabelled\), 'stim1'\)"):
+        cpath.recording(7)
+    assert cpath.recording(7, "stim1").npz == npz
+    assert cpath.recording(7, "").npz != npz
+    with pytest.raises(KeyError):
+        cpath.recording(7, "nope")
+
+    # The same through a selector -- the call that used to raise.
+    batch = resolve_paths(CultureSelector(batch_ids=["expA"]), config)
+    assert len(batch["expA"].cultures[cid_a].recordings) == 3
+
+    # A bare RecordingID on that DIV is still ambiguous.
+    from mxtreme.identity import RecordingID
+
+    with pytest.raises(ValueError, match=r"DIV 7: '' \(unlabelled\), 'stim1'"):
+        resolve_paths(RecordingID("expA", "C0001", "0", 7), config)
+    assert resolve_paths(RecordingID("expA", "C0001", "0", 7, "stim1"), config).npz == npz
+
+    scans = resolve_paths(cid_a, config, experiment="")
+    assert scans.divs == [7, 8] and scans.recording(7).npz != npz
     stim = resolve_paths(cid_a, config, experiment="stim1")
-    assert sorted(stim.recordings) == [7] and stim.recordings[7].npz == npz
-    assert stim.recordings[7].recording_id.experiment == "stim1"
-    assert resolve_recordings(CultureSelector(experiment="stim1"), config).npz == [npz]
+    assert stim.divs == [7] and stim.recording(7).npz == npz
+    assert resolve_paths_flat(CultureSelector(experiment="stim1"), config).npz == [npz]
+
+    everything = resolve_paths_flat(cid_a, config)
+    assert [(r.div, r.experiment) for r in everything.ids] == [(7, ""), (7, "stim1"), (8, "")]
+    assert everything.to_frame()["experiment"].tolist() == ["", "stim1", ""]
 
 
-def test_resolve_recordings_flattens_a_selection(store):
+ATP_LABELS = ("NS_ATP12hr", "NS_ATP1hr", "NS_ATP6hr")
+
+
+@pytest.fixture
+def replicate_store(store, make_recording_data):
+    """Culture ``expA/C0009/well0``: an unlabelled-free culture with DIVs 12 and 27, where DIV 27 has
+    three differently labelled recordings -- the shape of a timed-treatment experiment."""
+    config, _, _ = store
+    _add_labelled(config, make_recording_data, "NS", 12, seed=5, chip="C0009", with_bursts=True)
+    for seed, label in enumerate(ATP_LABELS, start=6):
+        _add_labelled(config, make_recording_data, label, 27, seed=seed, chip="C0009", with_bursts=True)
+    return config, CultureID("expA", "C0009", "0")
+
+
+def test_selector_over_a_batch_with_replicates_on_a_div_resolves(replicate_store):
+    """The reported failure: a batch selector over a culture with several recordings on one DIV."""
+    config, culture = replicate_store
+
+    batch = resolve_paths(CultureSelector(batch_ids=["expA"]), config)
+    cpath = batch["expA"].cultures[culture]
+
+    assert cpath.divs == [12, 27]
+    assert [r.recording_id.experiment for r in cpath.at_div(27)] == list(ATP_LABELS)
+    assert cpath.at_div(27).to_frame()["experiment"].tolist() == list(ATP_LABELS)
+
+
+def test_summaries_keep_replicates_on_a_div_apart(replicate_store):
+    config, culture = replicate_store
+    cpath = resolve_paths(culture, config)
+
+    for df in (
+        activity.channel_activity_summary(cpath, config.analysis_dir, show_plot=False),
+        activity.burst_activity_summary(cpath, config.analysis_dir, show_plot=False),
+        network.network_summary(cpath, config.analysis_dir, show_plot=False),
+        performance.performance_summary(cpath, config.analysis_dir, show_plot=False),
+    ):
+        at_27 = df[df["div"] == 27]
+        assert sorted(at_27["experiment"].unique()) == list(ATP_LABELS)
+        assert set(df.loc[df["div"] == 12, "experiment"]) == {"NS"}
+
+    # Reloading from the cache gives the same labelled rows back.
+    cached = activity.channel_activity_summary(cpath, config.analysis_dir, show_plot=False)
+    assert sorted(cached.loc[cached["div"] == 27, "experiment"].unique()) == list(ATP_LABELS)
+
+    dists = activity.culture_distributions(cpath, config.analysis_dir)
+    assert sorted(dists) == [(12, "NS")] + [(27, label) for label in ATP_LABELS]
+    assert sorted(activity.culture_distributions(cpath, config.analysis_dir)) == sorted(dists)
+
+
+def test_aggregation_groups_by_experiment():
+    df = pd.DataFrame({
+        "culture_id": ["a", "b", "a", "b"],
+        "div": [27, 27, 27, 27],
+        "experiment": ["NS_ATP1hr", "NS_ATP1hr", "NS_ATP6hr", "NS_ATP6hr"],
+        "phase": ["full"] * 4,
+        "x": [1.0, 3.0, 10.0, 30.0],
+    })
+    stats = aggregate_by_div_phase(df, value_cols=["x"]).set_index("experiment")
+    assert stats.loc["NS_ATP1hr", "x"] == 2.0 and stats.loc["NS_ATP6hr", "x"] == 20.0
+
+    # A frame with no experiment column (or unlabelled NaNs read back from CSV) is one group.
+    legacy = aggregate_by_div_phase(df.drop(columns="experiment"), value_cols=["x"])
+    assert len(legacy) == 1 and legacy.iloc[0]["experiment"] == ""
+    unlabelled = aggregate_by_div_phase(df.assign(experiment=np.nan), value_cols=["x"])
+    assert len(unlabelled) == 1
+
+
+def test_summaries_recompute_a_cache_without_experiment(store):
+    """A summary cached before recordings carried labels can't tell replicates apart: recompute it."""
+    config, cid_a, _ = store
+    cpath = resolve_paths(cid_a, config)
+    fresh = activity.channel_activity_summary(cpath, config.analysis_dir, show_plot=False)
+
+    _, csv_path = _summary_paths(cpath, config.analysis_dir, "activity", "channel_activity_summary")
+    stale = fresh.drop(columns="experiment").assign(mean_fr_hz=-1.0)
+    stale.to_csv(csv_path, index=False)
+
+    df = activity.channel_activity_summary(cpath, config.analysis_dir, show_plot=False)
+    assert "experiment" in df.columns
+    assert (df["mean_fr_hz"] != -1.0).all()
+
+
+def test_distributions_recompute_a_div_keyed_cache(store):
+    config, cid_a, _ = store
+    cpath = resolve_paths(cid_a, config)
+    _, npz_path = _summary_paths(cpath, config.analysis_dir, "distributions",
+                                 "default_distributions", ext=".npz")
+    npz_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(npz_path, **{"7__fr_hz": np.array([1.0])})  # the old "<div>__<key>" layout
+
+    dists = activity.culture_distributions(cpath, config.analysis_dir)
+    assert sorted(dists) == [(7, ""), (8, "")]
+
+
+def test_plots_and_report_render_with_replicates(replicate_store, tmp_path):
+    config, culture = replicate_store
+    cpath = resolve_paths(culture, config)
+    sel_paths = resolve_paths(CultureSelector(cultures=[culture]), config)
+
+    activity.channel_activity_summary(cpath, config.analysis_dir, show_plot=False, save_plot=True)
+    activity.burst_activity_summary(cpath, config.analysis_dir, show_plot=False)
+    activity.plot_population_channel_activity(sel_paths, config.analysis_dir, savename="rep.png")
+    assert (config.analysis_dir / "activity" / "rep.png").exists()
+
+    conn = network.culture_connectivity(cpath, config.analysis_dir)
+    network.plot_connectivity_grid(conn, culture, save_path=tmp_path / "g.png", show_plot=False)
+    network.plot_variance_explained(conn, culture, save_path=tmp_path / "v.png", show_plot=False)
+    assert (tmp_path / "g.png").exists() and (tmp_path / "v.png").exists()
+
+    out = generate_report(culture, config, sections=("activity", "bursting"))
+    assert out.exists() and out.stat().st_size > 0
+
+
+def test_resolve_paths_flat_flattens_a_selection(store):
     config, cid_a, cid_b = store
-    recs = resolve_recordings(CultureSelector(cultures=[cid_a, cid_b]), config)
+    recs = resolve_paths_flat(CultureSelector(cultures=[cid_a, cid_b]), config)
 
     # Culture A has 2 DIVs, culture B has 1; ordered by batch_id, chip, well, then DIV.
     assert len(recs) == 3
@@ -162,16 +334,16 @@ def test_resolve_recordings_flattens_a_selection(store):
     assert recs[0] is recs.recordings[0]
 
 
-def test_resolve_recordings_accepts_any_target(store):
+def test_resolve_paths_flat_accepts_any_target(store):
     config, cid_a, _ = store
-    assert len(resolve_recordings(cid_a, config)) == 2          # CultureID -> all DIVs
-    rid = resolve_recordings(cid_a, config).ids[0]
-    assert len(resolve_recordings(rid, config)) == 1            # RecordingID -> just that one
+    assert len(resolve_paths_flat(cid_a, config)) == 2          # CultureID -> all DIVs
+    rid = resolve_paths_flat(cid_a, config).ids[0]
+    assert len(resolve_paths_flat(rid, config)) == 1            # RecordingID -> just that one
 
 
-def test_resolve_recordings_to_frame(store):
+def test_resolve_paths_flat_to_frame(store):
     config, cid_a, cid_b = store
-    df = resolve_recordings(CultureSelector(cultures=[cid_a, cid_b]), config).to_frame()
+    df = resolve_paths_flat(CultureSelector(cultures=[cid_a, cid_b]), config).to_frame()
 
     assert list(df.columns) == ["batch_id", "chip", "well", "div", "experiment", "npz", "burst_stats"]
     assert len(df) == 3
@@ -179,9 +351,9 @@ def test_resolve_recordings_to_frame(store):
     assert set(df["batch_id"]) == {"expA", "expB"}
 
 
-def test_resolve_recordings_respects_div_filter(store):
+def test_resolve_paths_flat_respects_div_filter(store):
     config, cid_a, cid_b = store
-    recs = resolve_recordings(CultureSelector(cultures=[cid_a, cid_b], divs=[8]), config)
+    recs = resolve_paths_flat(CultureSelector(cultures=[cid_a, cid_b], divs=[8]), config)
     assert [r.recording_id.div for r in recs] == [8]
 
 
@@ -239,7 +411,7 @@ def test_performance_summary_default_objective(store):
     config, cid_a, _ = store
     cpath = resolve_paths(cid_a, config)
     df = performance.performance_summary(cpath, config.analysis_dir, show_plot=False)
-    assert list(df.columns) == ["chip", "well", "div", "phase", "condition", "trained_side", "score"]
+    assert list(df.columns) == ["chip", "well", "div", "experiment", "phase", "condition", "trained_side", "score"]
     scores = df["score"].dropna()
     assert ((scores >= 0) & (scores <= 1)).all()
     # Culture A is [2, 0]: every row is scored against the right-hand target.
@@ -342,7 +514,7 @@ def test_generate_report_group_across_experiments(store):
 def test_isi_all_respects_the_isi_threshold(store):
     config, cid_a, _ = store
     cpath = resolve_paths(cid_a, config)
-    rec = Recording(0, io.load_preprocessed(cpath.recordings[7].npz))
+    rec = Recording(0, io.load_preprocessed(cpath.recording(7).npz))
 
     # The fixture's tonic background sits ~5000 frames (500 ms) apart, so a tight threshold keeps only
     # the dense within-burst intervals while a generous one keeps both populations.
@@ -359,13 +531,13 @@ def test_culture_distributions_keys_and_cache(store):
 
     dists = activity.culture_distributions(cpath, config.analysis_dir)
 
-    assert sorted(dists) == [7, 8]
+    assert sorted(dists) == [(7, ""), (8, "")]
     for per_div in dists.values():
         assert set(per_div) == set(activity.DISTRIBUTION_KEYS)
         for key, values in per_div.items():
             assert np.isfinite(values).all(), key
     # Firing rates and burst sizes are per-electrode / per-burst, so they must not be scalars.
-    assert len(dists[7]['fr_hz']) > 1
+    assert len(dists[(7, "")]['fr_hz']) > 1
 
     # The npz cache round-trips to the same arrays.
     cached = activity.culture_distributions(cpath, config.analysis_dir)
@@ -503,7 +675,7 @@ def test_stim_summary_unphased_recording_is_a_single_full_row(tmp_path, make_rec
     # No phase spec -> a single "full" phase spanning the recording, so the whole recording is the
     # window (rather than a negative number left over from the old 20-min pre/post assumption).
     config, cpath = _stim_store(tmp_path, make_recording_data, chip="C0011")
-    rec = Recording(0, io.load_preprocessed(cpath.recordings[7].npz))
+    rec = Recording(0, io.load_preprocessed(cpath.recording(7).npz))
     span_min = rec.phases.phases[0].n_frames / rec.samp_rate / 60
 
     df = stimulation.stim_summary(cpath, config.analysis_dir, show_plot=False)
@@ -663,7 +835,7 @@ def test_culture_connectivity_keys_and_cache(store):
 
     conn = network.culture_connectivity(cpath, config.analysis_dir)
 
-    assert sorted(conn) == [7, 8]
+    assert sorted(conn) == [(7, ""), (8, "")]
     for per_div in conn.values():
         assert set(per_div) == set(network.CONNECTIVITY_KEYS)
         n = per_div["corr"].shape[0]
@@ -678,8 +850,8 @@ def test_culture_connectivity_keys_and_cache(store):
     assert npz_path.exists()
 
     cached = network.culture_connectivity(cpath, config.analysis_dir)
-    assert np.array_equal(cached[7]["corr"], conn[7]["corr"])
-    assert np.array_equal(cached[7]["cumvar"], conn[7]["cumvar"])
+    assert np.array_equal(cached[(7, "")]["corr"], conn[(7, "")]["corr"])
+    assert np.array_equal(cached[(7, "")]["cumvar"], conn[(7, "")]["cumvar"])
 
 
 def test_network_plot_helpers_render(store, tmp_path):
