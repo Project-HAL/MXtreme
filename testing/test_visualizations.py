@@ -42,6 +42,38 @@ def test_raster_on_ax():
     plt.close(fig)
 
 
+@pytest.mark.parametrize("log", [False, True])
+def test_timeseries_heatmap_spans_the_given_time_axis(log):
+    rate = np.random.default_rng(0).poisson(3, size=(12, 50)).astype(float)
+    time = np.arange(50) * 0.5
+
+    fig, ax = plt.subplots()
+    image = viz.plot_timeseries_heatmap(rate, time, rows=np.arange(12), ax=ax, log=log,
+                                        cbar_label="Firing rate (Hz)")
+
+    left, right, bottom, top = image.get_extent()
+    assert (left, right) == (0.0, 25.0)  # last bin's start + its width
+    assert (bottom, top) == (12, 0)      # first row at the top
+    assert ax.get_xlabel() == "Time (s)"
+    assert len(fig.axes) == 2            # the heat map and its colour bar
+    plt.close(fig)
+
+
+def test_timeseries_heatmap_without_time_labels_bins():
+    fig, ax = plt.subplots()
+    viz.plot_timeseries_heatmap(np.zeros((3, 4)), ax=ax, colorbar=False)
+    assert ax.get_xlabel() == "Time (bins)"
+    plt.close(fig)
+
+
+def test_finish_figure_saves_and_closes(tmp_path):
+    fig, _ax = plt.subplots()
+    out = tmp_path / "nested" / "fig.png"
+    assert viz.finish_figure(fig, save_path=out, show_plot=False) is fig
+    assert out.exists()
+    assert not plt.fignum_exists(fig.number)
+
+
 def test_mea_runs_with_and_without_stim():
     fig, ax = plt.subplots()
     viz.MEA(_channelmap(), ax=ax, stim_elecs=None)

@@ -4,6 +4,7 @@ the pluggable performance objective, and PDF report generation."""
 import matplotlib
 matplotlib.use("Agg")  # headless
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pytest
@@ -13,9 +14,9 @@ from mxtreme.config import Config
 from mxtreme.identity import CultureID, CultureSelector
 from mxtreme.recording import Recording
 from mxtreme.bursting import BurstDetector
-from mxtreme.params import ActivityParams, BurstDetectParams, BurstFeatureParams, NetworkParams
+from mxtreme.params import BurstDetectParams, BurstFeatureParams, CommunityParams, NetworkParams
 from mxtreme.paths import CulturePaths, resolve_paths, resolve_paths_flat
-from mxtreme.analysis import activity, network, performance, stimulation, generate_report
+from mxtreme.analysis import activity, network, performance, spatial, stimulation, generate_report
 from mxtreme.analysis._paths import _summary_paths, load_population_summaries
 from mxtreme.analysis._stats import aggregate_by_div_phase
 
@@ -235,25 +236,25 @@ def test_selector_over_a_batch_with_replicates_on_a_div_resolves(replicate_store
 
 def test_summaries_keep_replicates_on_a_div_apart(replicate_store):
     config, culture = replicate_store
-    cpath = resolve_paths(culture, config)
 
     for df in (
-        activity.channel_activity_summary(cpath, config.analysis_dir, show_plot=False),
-        activity.burst_activity_summary(cpath, config.analysis_dir, show_plot=False),
-        network.network_summary(cpath, config.analysis_dir, show_plot=False),
-        performance.performance_summary(cpath, config.analysis_dir, show_plot=False),
+        activity.summarize_spike_activity(culture, config),
+        activity.summarize_burst_activity(culture, config),
+        network.summarize_network_metrics(culture, config),
+        performance.summarize_performance(culture, config),
     ):
         at_27 = df[df["div"] == 27]
         assert sorted(at_27["experiment"].unique()) == list(ATP_LABELS)
         assert set(df.loc[df["div"] == 12, "experiment"]) == {"NS"}
 
     # Reloading from the cache gives the same labelled rows back.
-    cached = activity.channel_activity_summary(cpath, config.analysis_dir, show_plot=False)
+    cached = activity.summarize_spike_activity(culture, config)
     assert sorted(cached.loc[cached["div"] == 27, "experiment"].unique()) == list(ATP_LABELS)
 
-    dists = activity.culture_distributions(cpath, config.analysis_dir)
-    assert sorted(dists) == [(12, "NS")] + [(27, label) for label in ATP_LABELS]
-    assert sorted(activity.culture_distributions(cpath, config.analysis_dir)) == sorted(dists)
+    for distributions in (activity.spike_activity_distributions, activity.burst_activity_distributions):
+        dists = distributions(culture, config)
+        assert sorted(dists) == [(12, "NS")] + [(27, label) for label in ATP_LABELS]
+        assert sorted(distributions(culture, config)) == sorted(dists)
 
 
 def test_aggregation_groups_by_experiment():
@@ -278,13 +279,13 @@ def test_summaries_recompute_a_cache_without_experiment(store):
     """A summary cached before recordings carried labels can't tell replicates apart: recompute it."""
     config, cid_a, _ = store
     cpath = resolve_paths(cid_a, config)
-    fresh = activity.channel_activity_summary(cpath, config.analysis_dir, show_plot=False)
+    fresh = activity.summarize_spike_activity(cid_a, config)
 
-    _, csv_path = _summary_paths(cpath, config.analysis_dir, "activity", "channel_activity_summary")
+    _, csv_path = _summary_paths(cpath, config.analysis_dir, "activity", "spike_activity_summary")
     stale = fresh.drop(columns="experiment").assign(mean_fr_hz=-1.0)
     stale.to_csv(csv_path, index=False)
 
-    df = activity.channel_activity_summary(cpath, config.analysis_dir, show_plot=False)
+    df = activity.summarize_spike_activity(cid_a, config)
     assert "experiment" in df.columns
     assert (df["mean_fr_hz"] != -1.0).all()
 
@@ -293,27 +294,28 @@ def test_distributions_recompute_a_div_keyed_cache(store):
     config, cid_a, _ = store
     cpath = resolve_paths(cid_a, config)
     _, npz_path = _summary_paths(cpath, config.analysis_dir, "distributions",
-                                 "default_distributions", ext=".npz")
+                                 "default_spike_distributions", ext=".npz")
     npz_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(npz_path, **{"7__fr_hz": np.array([1.0])})  # the old "<div>__<key>" layout
 
-    dists = activity.culture_distributions(cpath, config.analysis_dir)
+    dists = activity.spike_activity_distributions(cid_a, config)
     assert sorted(dists) == [(7, ""), (8, "")]
 
 
 def test_plots_and_report_render_with_replicates(replicate_store, tmp_path):
     config, culture = replicate_store
-    cpath = resolve_paths(culture, config)
-    sel_paths = resolve_paths(CultureSelector(cultures=[culture]), config)
 
-    activity.channel_activity_summary(cpath, config.analysis_dir, show_plot=False, save_plot=True)
-    activity.burst_activity_summary(cpath, config.analysis_dir, show_plot=False)
-    activity.plot_population_channel_activity(sel_paths, config.analysis_dir, savename="rep.png")
-    assert (config.analysis_dir / "activity" / "rep.png").exists()
+    for split_by in ("phase", "experiment"):
+        activity.plot_spike_activity_summary(culture, config, split_by=split_by, show_plot=False,
+                                             save_path=tmp_path / f"culture_{split_by}.png")
+        activity.plot_burst_activity_summary(CultureSelector(cultures=[culture]), config,
+                                             split_by=split_by, show_plot=False,
+                                             save_path=tmp_path / f"selection_{split_by}.png")
+        assert (tmp_path / f"culture_{split_by}.png").exists()
+        assert (tmp_path / f"selection_{split_by}.png").exists()
 
-    conn = network.culture_connectivity(cpath, config.analysis_dir)
-    network.plot_connectivity_grid(conn, culture, save_path=tmp_path / "g.png", show_plot=False)
-    network.plot_variance_explained(conn, culture, save_path=tmp_path / "v.png", show_plot=False)
+    network.plot_connectivity_grid(culture, config, save_path=tmp_path / "g.png", show_plot=False)
+    network.plot_pc_variance_explained(culture, config, save_path=tmp_path / "v.png", show_plot=False)
     assert (tmp_path / "g.png").exists() and (tmp_path / "v.png").exists()
 
     out = generate_report(culture, config, sections=("activity", "bursting"))
@@ -365,11 +367,11 @@ def test_resolve_group_across_experiments(store):
     assert len(resolved["expB"].cultures) == 1
 
 
-def test_channel_activity_summary_columns(store):
+def test_spike_activity_summary_columns(store):
     config, cid_a, _ = store
-    cpath = resolve_paths(cid_a, config)
-    df = activity.channel_activity_summary(cpath, config.analysis_dir, show_plot=False)
-    for col in ("culture_id", "div", "phase", "mean_fr_hz", "median_isi_msec", "mean_amp_uv", "pct_active_chan"):
+    df = activity.summarize_spike_activity(cid_a, config)
+    for col in ("batch_id", "culture_id", "chip", "well", "div", "experiment", "phase",
+                "mean_fr_hz", "median_isi_msec", "mean_amp_uv", "pct_active_chan"):
         assert col in df.columns
     assert set(df["div"]) == {7, 8}
     assert set(df["phase"]) == {"full"}
@@ -377,8 +379,7 @@ def test_channel_activity_summary_columns(store):
 
 def test_burst_activity_summary_columns(store):
     config, cid_a, _ = store
-    cpath = resolve_paths(cid_a, config)
-    df = activity.burst_activity_summary(cpath, config.analysis_dir, show_plot=False)
+    df = activity.summarize_burst_activity(cid_a, config)
     for col in ("culture_id", "div", "phase", "burst_rate_hz", "median_ibi_sec", "median_size_pct", "median_dur_sec"):
         assert col in df.columns
     # Burst rate is bursts / phase-seconds and must be finite & non-negative.
@@ -397,26 +398,31 @@ def test_summaries_honor_embedded_phase_spec(tmp_path, make_recording_data):
     )
     _add_recording(config, data, well_no=0)
 
-    cpath = resolve_paths(CultureID("expP", "C0009", "0"), config)
+    culture = CultureID("expP", "C0009", "0")
 
-    ch = activity.channel_activity_summary(cpath, config.analysis_dir, show_plot=False)
+    ch = activity.summarize_spike_activity(culture, config)
     assert set(ch["phase"]) == {"early", "late"}
 
-    bu = activity.burst_activity_summary(cpath, config.analysis_dir, show_plot=False)
+    bu = activity.summarize_burst_activity(culture, config)
     assert set(bu["phase"].dropna()) <= {"early", "late"}
     assert (bu["burst_rate_hz"].dropna() >= 0).all()
 
 
-def test_performance_summary_default_objective(store):
+def test_performance_score_default_objective(store):
     config, cid_a, _ = store
-    cpath = resolve_paths(cid_a, config)
-    df = performance.performance_summary(cpath, config.analysis_dir, show_plot=False)
-    assert list(df.columns) == ["chip", "well", "div", "experiment", "phase", "condition", "trained_side", "score"]
-    scores = df["score"].dropna()
+    rec, bursts = _fixture_recording(config, cid_a)
+
+    df = performance.performance_score(rec, bursts, config.analysis_dir)
+    assert list(df.columns) == ["phase", "n_bursts", "condition", "trained_side", "score"]
+    assert 0 <= df.iloc[0]["score"] <= 1
+    # Culture A is [2, 0]: it is scored against the right-hand target.
+    assert df["trained_side"].tolist() == ["right"] and df["condition"].tolist() == ["[2, 0]"]
+    assert list((config.analysis_dir / "performance").rglob("*_performance_default_direction_objective.csv"))
+
+    table = performance.summarize_performance(cid_a, config)
+    assert set(table["div"]) == {7, 8} and set(table["trained_side"]) == {"right"}
+    scores = table["score"].dropna()
     assert ((scores >= 0) & (scores <= 1)).all()
-    # Culture A is [2, 0]: every row is scored against the right-hand target.
-    assert set(df["trained_side"]) == {"right"}
-    assert df["condition"].tolist() == [[2, 0]] * len(df)
 
 
 @pytest.mark.parametrize("condition, expected", [
@@ -433,7 +439,7 @@ def test_performance_summary_default_objective(store):
 ])
 def test_trained_side_mapping(condition, expected):
     stored = np.asarray(condition) if condition is not None else None
-    assert performance.trained_side(stored) is expected
+    assert performance._trained_side(stored) is expected
 
 
 def _directional_bursts(n_rightward, n_leftward):
@@ -466,30 +472,22 @@ def test_default_objective_with_no_trained_side_is_nan():
     assert np.isnan(performance.default_direction_objective(bursts.assign(trained_side=None)))
 
 
-def test_performance_summary_recomputes_pre_condition_cache(store):
-    """A cached summary without `trained_side` holds wrong-signed scores and must not be reused."""
+def test_performance_caches_each_objective_separately(store, tmp_path):
     config, cid_a, _ = store
-    cpath = resolve_paths(cid_a, config)
-    fresh = performance.performance_summary(cpath, config.analysis_dir, show_plot=False)
 
-    # Overwrite the cache with an old-schema one carrying an obviously bogus score.
-    _, csv_path = _summary_paths(cpath, config.analysis_dir, "performance", "performance_summary")
-    stale = fresh[["chip", "well", "div", "phase"]].copy()
-    stale["score"] = -1.0
-    stale.to_csv(csv_path, index=False)
+    def constant_objective(bursts):
+        return 0.42
 
-    df = performance.performance_summary(cpath, config.analysis_dir, show_plot=False, use_existing=True)
-    assert "trained_side" in df.columns
-    assert (df["score"] != -1.0).all()
+    default = performance.summarize_performance(cid_a, config)
+    custom = performance.summarize_performance(cid_a, config, objective_fn=constant_objective)
+    assert (custom["score"] == 0.42).all()
+    assert not (default["score"] == 0.42).any()  # the custom run didn't overwrite the default cache
+    assert (performance.summarize_performance(cid_a, config)["score"].values == default["score"].values).all()
 
-
-def test_performance_summary_custom_objective(store):
-    config, cid_a, _ = store
-    cpath = resolve_paths(cid_a, config)
-    df = performance.performance_summary(
-        cpath, config.analysis_dir, objective_fn=lambda b: 0.42, show_plot=False, use_existing=False
-    )
-    assert (df["score"] == 0.42).all()
+    performance.plot_performance_summary({"A": CultureSelector(cultures=[cid_a])}, config,
+                                         objective_fn=constant_objective, show_plot=False,
+                                         save_path=tmp_path / "perf.png")
+    assert (tmp_path / "perf.png").exists()
 
 
 def test_generate_report_single_culture(store):
@@ -508,80 +506,355 @@ def test_generate_report_group_across_experiments(store):
     assert out.exists() and out.stat().st_size > 0
 
 
+def test_generate_report_name_keeps_the_default_directory(store):
+    config, cid_a, _ = store
+    out = generate_report(cid_a, config, sections=("activity",), name="ATP dose")
+    assert out == config.analysis_dir / "reports" / "ATP dose.pdf"
+    assert out.exists()
+    assert generate_report(cid_a, config, sections=("activity",), name="again.pdf").name == "again.pdf"
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"name": "a", "output_path": "elsewhere/a.pdf"},
+    {"name": "sub/dir"},
+    {"name": ""},
+])
+def test_generate_report_rejects_a_bad_name(store, kwargs):
+    config, cid_a, _ = store
+    with pytest.raises(ValueError):
+        generate_report(cid_a, config, sections=("activity",), **kwargs)
+
+
+def _fake_culture(batch, chip, well, divs, experiments=("",)):
+    from types import SimpleNamespace as NS
+    return NS(culture_id=NS(batch_id=batch, chip=chip, well=str(well)),
+              recordings=[NS(recording_id=NS(div=d, experiment=e)) for d in divs for e in experiments])
+
+
+def test_report_overview_compacts_divs_and_labels():
+    from mxtreme.analysis import report
+
+    assert report._div_ranges([40, 32, 33, 34, 38, 41, 33]) == "32–34, 38, 40–41"
+    (row,) = report._overview_rows([_fake_culture("b", "M07459", 2, [7, 8, 9],
+                                                  ["NS_ATP12hr", "NS_ATP1hr", ""])])
+    assert row[1:] == ["M07459", "2", "MaxTwo", "9", "7–9", "NS_ATP1hr, NS_ATP12hr"]
+
+
+def test_report_overview_paginates_without_clipping():
+    """A large selection with long labels spills onto continuation pages instead of off the page, and
+    each page names the batch on its first row."""
+    import matplotlib.text
+    from mxtreme.analysis import report
+
+    cultures = [_fake_culture(f"batch_with_a_rather_long_name_{b}", f"M0{chip}", well,
+                              [*range(28, 36), 38, 41, 45], ["NS_ATP1hr", "NS_ATP12hr", "NS_ATP24hr_x"])
+                for b in range(2) for chip in range(4) for well in range(6)]
+    figs = report._overview_figures("Title", ["Generated: today", "Cultures: 48"], cultures)
+    try:
+        assert len(figs) > 1
+        n_rows = 0
+        for fig in figs:
+            fig.canvas.draw()
+            renderer, page = fig.canvas.get_renderer(), fig.bbox
+            for text in fig.findobj(matplotlib.text.Text):
+                if not text.get_text():
+                    continue
+                box = text.get_window_extent(renderer)
+                assert page.x0 - 1 <= box.x0 and box.x1 <= page.x1 + 1, text.get_text()
+                assert page.y0 - 1 <= box.y0 and box.y1 <= page.y1 + 1, text.get_text()
+            (table,) = fig.axes[0].tables
+            cells = table.get_celld()
+            body_rows = sorted({r for r, _c in cells if r > 0})
+            assert cells[(1, 0)].get_text().get_text()  # batch named on each page's first row
+            n_rows += len(body_rows)
+        assert n_rows == len(cultures)
+    finally:
+        for fig in figs:
+            plt.close(fig)
+
+
+def test_metric_grid_tells_experiment_labels_apart_and_drops_full():
+    from mxtreme.analysis._plotting import plot_metric_grid
+
+    rows = [dict(culture_id=f"c{c}", chip="M0", well=c, div=d, experiment=e, phase="full", a=float(c + d))
+            for c in range(3) for e in ("NS_ATP12hr", "NS_ATP1hr") for d in (30, 31)]
+    df = pd.DataFrame(rows)
+    fig = plot_metric_grid(aggregate_by_div_phase(df, ["a"]), [("a", "sem_a", "A", "A")],
+                           overlay_df=df, show_plot=False, ncols=1)
+    ax = fig.axes[0]
+    labels = [t.get_text() for t in ax.get_legend().get_texts()]
+    assert "NS_ATP1hr (mean ± SEM)" in labels and "NS_ATP12hr (mean ± SEM)" in labels
+    assert not any("Full" in label for label in labels)
+
+    bold = [c for c in ax.containers if c.get_label().endswith("(mean ± SEM)")]
+    markers = {c.get_label(): c.lines[0].get_marker() for c in bold}
+    colors = {c.get_label(): c.lines[0].get_color() for c in bold}
+    assert len(set(markers.values())) == 2 and len(set(colors.values())) == 2
+    plt.close(fig)
+
+
+def test_plot_summary_title_drops_an_unphased_phase(store):
+    config, cid_a, cid_b = store
+    fig = activity.plot_spike_activity_summary({"A": CultureSelector(cultures=[cid_a]),
+                                                "B": CultureSelector(cultures=[cid_b])},
+                                               config, show_plot=False)
+    assert "phase" not in fig._suptitle.get_text()
+    plt.close(fig)
+
+
 # --- distributions and per-culture pages -----------------------------------------------------------
 
 
-def test_isi_all_respects_the_isi_threshold(store):
+def test_isi_respects_the_isi_threshold(store):
     config, cid_a, _ = store
-    cpath = resolve_paths(cid_a, config)
-    rec = Recording(0, io.load_preprocessed(cpath.recording(7).npz))
+    rec = Recording(0, io.load_preprocessed(resolve_paths(cid_a, config).recording(7).npz))
 
     # The fixture's tonic background sits ~5000 frames (500 ms) apart, so a tight threshold keeps only
     # the dense within-burst intervals while a generous one keeps both populations.
-    tight = activity.isi_all(rec.spike_data, rec.samp_rate, ActivityParams(isi_threshold_ms=100))
-    loose = activity.isi_all(rec.spike_data, rec.samp_rate, ActivityParams(isi_threshold_ms=10_000))
+    tight = activity.isi(rec, isi_threshold_ms=100, save=False)["isi_ms"]
+    loose = activity.isi(rec, isi_threshold_ms=10_000, save=False)["isi_ms"]
 
     assert len(tight) < len(loose)
     assert (tight < 100).all()
 
 
-def test_culture_distributions_keys_and_cache(store):
+def test_distributions_keys_and_cache(store):
     config, cid_a, _ = store
-    cpath = resolve_paths(cid_a, config)
 
-    dists = activity.culture_distributions(cpath, config.analysis_dir)
+    for distributions, keys in ((activity.spike_activity_distributions, activity.SPIKE_DISTRIBUTION_KEYS),
+                                (activity.burst_activity_distributions, activity.BURST_DISTRIBUTION_KEYS)):
+        dists = distributions(cid_a, config)
 
-    assert sorted(dists) == [(7, ""), (8, "")]
-    for per_div in dists.values():
-        assert set(per_div) == set(activity.DISTRIBUTION_KEYS)
-        for key, values in per_div.items():
-            assert np.isfinite(values).all(), key
-    # Firing rates and burst sizes are per-electrode / per-burst, so they must not be scalars.
-    assert len(dists[(7, "")]['fr_hz']) > 1
+        assert sorted(dists) == [(7, ""), (8, "")]
+        for per_rec in dists.values():
+            assert set(per_rec) == set(keys)
+            for key, values in per_rec.items():
+                assert np.isfinite(values).all(), key
 
-    # The npz cache round-trips to the same arrays.
-    cached = activity.culture_distributions(cpath, config.analysis_dir)
-    for div, per_div in dists.items():
-        for key, values in per_div.items():
-            assert np.array_equal(cached[div][key], values)
+        # The npz cache round-trips to the same arrays.
+        cached = distributions(cid_a, config)
+        for rec_key, per_rec in dists.items():
+            for key, values in per_rec.items():
+                assert np.array_equal(cached[rec_key][key], values)
+
+    # Firing rates are per electrode, so they must not be scalars.
+    assert len(activity.spike_activity_distributions(cid_a, config)[(7, "")]["fr_hz"]) > 1
+
+    with pytest.raises(TypeError, match="per culture"):
+        activity.spike_activity_distributions(CultureSelector(cultures=[cid_a]), config)
 
 
-def test_population_plot_helpers_render(store):
-    # All three population plots now go through the shared metric grid; this exercises that path
-    # (the report only reaches it for activity/bursting).
+def test_population_plot_helpers_render(store, tmp_path):
+    # Every population plot goes through the shared metric grid; this exercises that path.
     config, cid_a, cid_b = store
-    sel_paths = resolve_paths(CultureSelector(cultures=[cid_a, cid_b]), config)
-    for cid in (cid_a, cid_b):
-        cpath = resolve_paths(cid, config)
-        activity.channel_activity_summary(cpath, config.analysis_dir, show_plot=False)
-        activity.burst_activity_summary(cpath, config.analysis_dir, show_plot=False)
-        performance.performance_summary(cpath, config.analysis_dir, show_plot=False)
+    sel = CultureSelector(cultures=[cid_a, cid_b])
+    activity.plot_spike_activity_summary(sel, config, show_plot=False, save_path=tmp_path / "spike.png")
+    activity.plot_burst_activity_summary(sel, config, error="std", show_plot=False,
+                                         save_path=tmp_path / "burst.png")
+    performance.plot_performance_summary(sel, config, show_plot=False, save_path=tmp_path / "perf.png")
 
-    activity.plot_population_channel_activity(sel_paths, config.analysis_dir,
-                                              savename="channel.png")
-    activity.plot_population_burst_summary(sel_paths, config.analysis_dir, savename="burst.png")
-    performance.plot_population_performance_summary(sel_paths, config.analysis_dir,
-                                                    savename="perf.png")
-
-    assert (config.analysis_dir / "activity" / "channel.png").exists()
-    assert (config.analysis_dir / "activity" / "burst.png").exists()
-    assert (config.analysis_dir / "performance" / "perf.png").exists()
+    assert (tmp_path / "spike.png").exists()
+    assert (tmp_path / "burst.png").exists()
+    assert (tmp_path / "perf.png").exists()
 
 
 def test_pooled_summaries_carry_culture_identity(store):
     config, cid_a, cid_b = store
-    sel_paths = resolve_paths(CultureSelector(cultures=[cid_a, cid_b]), config)
-    for cid in (cid_a, cid_b):
-        activity.channel_activity_summary(resolve_paths(cid, config), config.analysis_dir,
-                                          show_plot=False)
+    sel = CultureSelector(cultures=[cid_a, cid_b])
+    sel_paths = resolve_paths(sel, config)
+
+    summary = activity.summarize_spike_activity(sel, config)
+    assert set(summary["culture_id"]) == {str(cid_a), str(cid_b)}
 
     pop_df = load_population_summaries(
-        sel_paths, data_dir=config.analysis_dir / "activity", suffix="channel_activity_summary"
+        sel_paths, data_dir=config.analysis_dir / "activity", suffix="spike_activity_summary"
     )
 
     assert {"culture_id", "chip", "well"} <= set(pop_df.columns)
     assert set(pop_df["chip"]) == {"C0001", "C0002"}
     assert set(pop_df["culture_id"]) == {str(cid_a), str(cid_b)}
+
+
+# --- activity: recording level ---------------------------------------------------------------------
+
+
+def _fixture_recording(config, cid):
+    rp = resolve_paths(cid, config).recording(7)
+    return Recording(0, io.load_preprocessed(rp.npz)), pd.read_csv(rp.require_burst_stats())
+
+
+def test_firing_rate_is_count_over_phase_duration(store, make_recording_data):
+    config, cid_a, _ = store
+    rec, _ = _fixture_recording(config, cid_a)
+
+    df = activity.firing_rate(rec, config.analysis_dir)
+
+    phase = rec.phases.phases[0]
+    duration = phase.n_frames / rec.samp_rate
+    counts = pd.Series(rec.spike_data["channel"]).value_counts()
+    assert set(df["phase"]) == {"full"}
+    assert len(df) == len(np.unique(rec.channelmap[:, 1]))
+    for row in df.itertuples():
+        assert row.n_spikes == counts.get(row.channel, 0)
+        assert row.firing_rate_hz == pytest.approx(row.n_spikes / duration)
+
+    # Saved next to the culture's summaries, named after the recording.
+    saved = list((config.analysis_dir / "activity" / "expA" / "C0001" / "well0").glob("DIV7_*_firing_rate.csv"))
+    assert len(saved) == 1
+
+    # A mapped channel that never fires is listed at 0 Hz rather than dropped.
+    data = make_recording_data(seed=1)
+    data["channelmap"] = np.vstack([data["channelmap"], [[20, 99, 999, 0.0, 0.0]]])
+    silent = activity.firing_rate(Recording(0, data), save=False).set_index("channel")
+    assert silent.loc[99, "n_spikes"] == 0 and silent.loc[99, "firing_rate_hz"] == 0
+
+
+def test_instantaneous_firing_rate_conserves_spikes(store):
+    config, cid_a, _ = store
+    rec, _ = _fixture_recording(config, cid_a)
+
+    ifr = activity.instantaneous_firing_rate(rec, config.analysis_dir, bin_size_sec=2.0)
+
+    n_channels = len(np.unique(rec.channelmap[:, 1]))
+    assert ifr["rate"].shape == (n_channels, len(ifr["time_sec"]))
+    assert ifr["rate"].sum() * 2.0 == pytest.approx(len(rec.spike_data))
+    assert ifr["time_sec"][-1] + 2.0 >= rec.rec_t_sec
+    assert [p[0] for p in ifr["phases"]] == ["full"]
+    assert list((config.analysis_dir / "activity").rglob("*_instantaneous_firing_rate_2s.npz"))
+
+
+def test_isi_levels(store):
+    config, cid_a, _ = store
+    rec, _ = _fixture_recording(config, cid_a)
+
+    per_channel = activity.isi(rec, isi_threshold_ms=np.inf, save=False)
+    merged = activity.isi(rec, level="global", isi_threshold_ms=np.inf, save=False)
+
+    assert {"channel", "phase", "isi_ms"} == set(per_channel.columns)
+    assert {"phase", "isi_ms"} == set(merged.columns)
+    # Within-channel intervals: one fewer than the channel's spikes, for every channel.
+    n_spikes = pd.Series(rec.spike_data["channel"]).value_counts()
+    assert len(per_channel) == int((n_spikes - 1).sum())
+    # Merging every channel into one train leaves one interval per spike (less one), each no longer
+    # than the gap to that spike's own channel predecessor -- so the array-wide ISI is shorter.
+    assert len(merged) == len(rec.spike_data) - 1
+    assert merged["isi_ms"].median() <= per_channel["isi_ms"].median()
+    assert (merged["isi_ms"] >= 0).all()
+
+    with pytest.raises(ValueError, match="level"):
+        activity.isi(rec, level="array", save=False)
+
+
+def test_burst_rate_and_ibi(store):
+    config, cid_a, _ = store
+    rec, bursts = _fixture_recording(config, cid_a)
+
+    rate = activity.burst_rate(rec, bursts, config.analysis_dir)
+    n_network = int((bursts["kind"] == "network").sum())
+    assert rate.loc[0, "n_bursts"] == n_network
+    assert rate.loc[0, "burst_rate_hz"] == pytest.approx(n_network / rate.loc[0, "duration_sec"])
+
+    intervals = activity.ibi(rec, bursts, config.analysis_dir)
+    peaks = np.sort(bursts.loc[bursts["kind"] == "network", "peak_frame"].to_numpy()) / rec.samp_rate
+    assert np.allclose(intervals["ibi_sec"].to_numpy(), np.diff(peaks))
+    assert list((config.analysis_dir / "activity").rglob("*_burst_rate.csv"))
+    assert list((config.analysis_dir / "activity").rglob("*_ibi.csv"))
+
+
+def test_recording_functions_do_not_save_without_an_analysis_dir(store):
+    config, cid_a, _ = store
+    rec, bursts = _fixture_recording(config, cid_a)
+    activity.firing_rate(rec)
+    activity.burst_rate(rec, bursts)
+    assert not (config.analysis_dir / "activity").exists()
+
+
+# --- activity: group level --------------------------------------------------------------------------
+
+
+def test_summarize_at_every_target_level(store):
+    config, cid_a, cid_b = store
+    rid = resolve_paths(cid_a, config).recording(8).recording_id
+
+    one = activity.summarize_spike_activity(rid, config)
+    assert one["div"].tolist() == [8] and "group" not in one.columns
+
+    culture = activity.summarize_spike_activity(cid_a, config)
+    assert sorted(culture["div"]) == [7, 8]
+
+    sel = CultureSelector(cultures=[cid_a, cid_b])
+    assert activity.summarize_burst_activity(sel, config)["culture_id"].nunique() == 2
+
+    groups = activity.summarize_burst_activity(
+        {"A": CultureSelector(cultures=[cid_a]), "B": CultureSelector(cultures=[cid_b])}, config
+    )
+    assert groups.groupby("group")["culture_id"].unique().to_dict() == {"A": [str(cid_a)], "B": [str(cid_b)]}
+    listed = activity.summarize_burst_activity([CultureSelector(cultures=[cid_a])], config)
+    assert set(listed["group"]) == {"Group 1"}
+
+    with pytest.raises(ValueError, match="No data for phase"):
+        activity.summarize_spike_activity(cid_a, config, phase="nope")
+    with pytest.raises(TypeError):
+        activity.summarize_spike_activity("expA", config)
+
+
+def test_summary_cache_fills_in_recordings_incrementally(store):
+    """Summarising one recording caches only it; the culture later reuses it and adds the rest."""
+    config, cid_a, _ = store
+    cpath = resolve_paths(cid_a, config)
+    _, csv_path = _summary_paths(cpath, config.analysis_dir, "activity", "spike_activity_summary")
+
+    activity.summarize_spike_activity(cpath.recording(7).recording_id, config)
+    assert sorted(pd.read_csv(csv_path)["div"]) == [7]
+
+    activity.summarize_spike_activity(cid_a, config)
+    assert sorted(pd.read_csv(csv_path)["div"]) == [7, 8]
+
+
+def test_plot_summary_at_every_target_level(store, tmp_path):
+    config, cid_a, cid_b = store
+    rid = resolve_paths(cid_a, config).recording(7).recording_id
+    targets = {
+        "recording": rid,
+        "culture": cid_a,
+        "selection": CultureSelector(cultures=[cid_a, cid_b]),
+        "groups": {"A": CultureSelector(cultures=[cid_a]), "B": CultureSelector(cultures=[cid_b])},
+    }
+    for name, target in targets.items():
+        for plot in (activity.plot_spike_activity_summary, activity.plot_burst_activity_summary):
+            out = tmp_path / f"{name}_{plot.__name__}.png"
+            fig = plot(target, config, show_plot=False, save_path=out)
+            assert fig is not None and out.exists(), (name, plot.__name__)
+
+    with pytest.raises(ValueError, match="split_by"):
+        activity.plot_spike_activity_summary(cid_a, config, split_by="chip", show_plot=False)
+    with pytest.raises(ValueError, match="error"):
+        activity.plot_spike_activity_summary(cid_a, config, error="ci", show_plot=False)
+
+
+def test_group_comparison_plots_one_series_per_group(store):
+    config, cid_a, cid_b = store
+    fig = activity.plot_spike_activity_summary(
+        {"Left": CultureSelector(cultures=[cid_a]), "Right": CultureSelector(cultures=[cid_b])},
+        config, show_plot=False,
+    )
+    labels = [t.get_text() for t in fig.axes[0].get_legend().get_texts()]
+    assert labels == ["Left", "Right"]
+
+
+def test_distribution_plots_render(store, tmp_path):
+    config, cid_a, _ = store
+    activity.plot_spike_activity_distributions(cid_a, config, show_plot=False, save_path=tmp_path / "s.png")
+    activity.plot_burst_activity_distributions(cid_a, config, show_plot=False, save_path=tmp_path / "b.png")
+    assert (tmp_path / "s.png").exists() and (tmp_path / "b.png").exists()
+
+
+def test_aggregation_can_report_sd():
+    df = pd.DataFrame({"div": [7, 7], "phase": ["full"] * 2, "x": [1.0, 3.0]})
+    stats = aggregate_by_div_phase(df, value_cols=["x"], stat="std")
+    assert stats.loc[0, "std_x"] == pytest.approx(np.std([1.0, 3.0], ddof=1))
+    with pytest.raises(ValueError):
+        aggregate_by_div_phase(df, value_cols=["x"], stat="var")
 
 
 # --- phase selection -------------------------------------------------------------------------------
@@ -608,7 +881,7 @@ def test_generate_report_defaults_to_the_first_phase(tmp_path, make_recording_da
     assert out.exists() and out.stat().st_size > 0
     # The default phase is the first of the sequence, so that phase's distributions are what got cached.
     assert (config.analysis_dir / "distributions" / "expQ" / "C0014" / "well0" /
-            f"{cid}_early_distributions.npz").exists()
+            f"{cid}_early_spike_distributions.npz").exists()
 
 
 def test_generate_report_honors_an_explicit_phase(tmp_path, make_recording_data):
@@ -619,7 +892,7 @@ def test_generate_report_honors_an_explicit_phase(tmp_path, make_recording_data)
 
     assert out.exists() and out.stat().st_size > 0
     assert (config.analysis_dir / "distributions" / "expQ" / "C0014" / "well0" /
-            f"{cid}_late_distributions.npz").exists()
+            f"{cid}_late_spike_distributions.npz").exists()
 
 
 def test_generate_report_rejects_a_phase_the_data_lacks(store):
@@ -651,34 +924,47 @@ def _stim_store(tmp_path, make_recording_data, *, chip, phase_spec=None, message
         eventtime=eventtime, event_messages=messages, **extra,
     )
     _add_recording(config, data, well_no=0)
-    return config, resolve_paths(CultureID("expS", chip, "0"), config)
+    return config, CultureID("expS", chip, "0")
 
 
-def test_stim_summary_attributes_stim_to_the_phase_it_falls_in(tmp_path, make_recording_data):
+def _stim_recording(config, culture):
+    return Recording(0, io.load_preprocessed(resolve_paths(culture, config).recording(7).npz))
+
+
+STIM_SPEC = {"pre": 0.0, "train": 1 / 6, "post": {"start": 0.5, "end": 0.833}}
+
+
+def test_stim_delivered_attributes_stim_to_the_phase_it_falls_in(tmp_path, make_recording_data):
     # The fixture's spikes start at ~frame 3000, so the phases run pre [3k, 103k), train [103k, 303k),
     # post [303k, ...). The five stim pulses sit at 50k..250k, i.e. two in pre and three in train.
-    spec = {"pre": 0.0, "train": 1 / 6, "post": {"start": 0.5, "end": 0.833}}
-    config, cpath = _stim_store(tmp_path, make_recording_data, chip="C0010", phase_spec=spec)
+    config, culture = _stim_store(tmp_path, make_recording_data, chip="C0010", phase_spec=STIM_SPEC)
+    rec = _stim_recording(config, culture)
 
-    df = stimulation.stim_summary(cpath, config.analysis_dir, show_plot=False).set_index("phase")
+    events = stimulation.stim_events(rec, config.analysis_dir)
+    assert events["phase"].tolist() == ["pre", "pre", "train", "train", "train"]
+    assert (events["pulse_phase_us"] == 200.0).all()
 
-    assert set(df.index) == {"pre", "train", "post"}
+    df = stimulation.stim_delivered(rec, config.analysis_dir).set_index("phase")
+    assert df.loc[["pre", "train", "post"], "n_pulses"].tolist() == [2, 3, 0]
     assert df.loc["pre", "total_stim_ms"] == pytest.approx(2 * 200.0 / 1000)
     assert df.loc["train", "total_stim_ms"] == pytest.approx(3 * 200.0 / 1000)
     assert df.loc["post", "total_stim_ms"] == pytest.approx(0.0)
-    # Every pulse is attributed exactly once.
-    assert df["total_stim_ms"].sum() == pytest.approx(5 * 200.0 / 1000)
     assert df.loc["train", "phase_dur_min"] == pytest.approx(1 / 3, abs=1e-3)
+    assert list((config.analysis_dir / "stimulation").rglob("*_stim_delivered.csv"))
+
+    # The group-level table agrees, and carries identity columns.
+    table = stimulation.summarize_stimulation(culture, config).set_index("phase")
+    assert table.loc["train", "total_stim_ms"] == pytest.approx(0.6)
+    assert table["culture_id"].unique().tolist() == [str(culture)]
 
 
-def test_stim_summary_unphased_recording_is_a_single_full_row(tmp_path, make_recording_data):
-    # No phase spec -> a single "full" phase spanning the recording, so the whole recording is the
-    # window (rather than a negative number left over from the old 20-min pre/post assumption).
-    config, cpath = _stim_store(tmp_path, make_recording_data, chip="C0011")
-    rec = Recording(0, io.load_preprocessed(cpath.recording(7).npz))
+def test_stim_delivered_unphased_recording_is_a_single_full_row(tmp_path, make_recording_data):
+    # No phase spec -> a single "full" phase spanning the recording.
+    config, culture = _stim_store(tmp_path, make_recording_data, chip="C0011")
+    rec = _stim_recording(config, culture)
     span_min = rec.phases.phases[0].n_frames / rec.samp_rate / 60
 
-    df = stimulation.stim_summary(cpath, config.analysis_dir, show_plot=False)
+    df = stimulation.stim_delivered(rec, save=False)
 
     assert len(df) == 1
     assert df.iloc[0]["phase"] == "full"
@@ -686,48 +972,39 @@ def test_stim_summary_unphased_recording_is_a_single_full_row(tmp_path, make_rec
     assert df.iloc[0]["total_stim_ms"] == pytest.approx(5 * 200.0 / 1000)
 
 
-def test_stim_summary_tolerates_non_dict_event_messages(tmp_path, make_recording_data):
+def test_stim_events_tolerate_non_dict_event_messages(tmp_path, make_recording_data):
     # Older stores hold plain strings alongside the dict messages; those must be skipped, not raise.
     eventtime = np.array([1000, 50000, 90000], dtype="<i8")
     messages = np.array(
         ["legacy string", {"start_stimulation": "1", "phase_us": 100.0}, {"other_event": "1"}],
         dtype=object,
     )
-    config, cpath = _stim_store(
-        tmp_path, make_recording_data, chip="C0012", eventtime=eventtime, messages=messages,
-    )
+    config, culture = _stim_store(tmp_path, make_recording_data, chip="C0012",
+                                  eventtime=eventtime, messages=messages)
+    rec = _stim_recording(config, culture)
 
-    df = stimulation.stim_summary(cpath, config.analysis_dir, show_plot=False)
-
-    assert df.iloc[0]["total_stim_ms"] == pytest.approx(0.1)
+    assert stimulation.stim_events(rec, save=False)["frame"].tolist() == [50000]
+    assert stimulation.stim_delivered(rec, save=False).iloc[0]["total_stim_ms"] == pytest.approx(0.1)
 
 
 def test_generate_report_with_stimulation_section(tmp_path, make_recording_data):
-    spec = {"pre": 0.0, "train": 1 / 6, "post": {"start": 0.5, "end": 0.833}}
-    config, _ = _stim_store(tmp_path, make_recording_data, chip="C0013", phase_spec=spec)
-
-    out = generate_report(
-        CultureID("expS", "C0013", "0"), config, sections=("activity", "stimulation")
-    )
+    config, culture = _stim_store(tmp_path, make_recording_data, chip="C0013", phase_spec=STIM_SPEC)
+    out = generate_report(culture, config, sections=("activity", "stimulation"))
     assert out.exists() and out.stat().st_size > 0
 
 
-def test_population_stim_plot_renders(tmp_path, make_recording_data):
-    spec = {"pre": 0.0, "train": 1 / 6, "post": {"start": 0.5, "end": 0.833}}
-    config, cpath = _stim_store(tmp_path, make_recording_data, chip="C0015", phase_spec=spec)
-    stimulation.stim_summary(cpath, config.analysis_dir, show_plot=False)
-    sel_paths = resolve_paths(CultureSelector(cultures=[CultureID("expS", "C0015", "0")]), config)
-
-    stimulation.plot_population_stim_summary(sel_paths, config.analysis_dir, phase="train",
-                                             savename="stim.png")
-
-    assert (config.analysis_dir / "stimulation" / "stim.png").exists()
+def test_stimulation_summary_plot_renders(tmp_path, make_recording_data):
+    config, culture = _stim_store(tmp_path, make_recording_data, chip="C0015", phase_spec=STIM_SPEC)
+    out = tmp_path / "stim.png"
+    stimulation.plot_stimulation_summary(CultureSelector(cultures=[culture]), config, phase="train",
+                                         show_plot=False, save_path=out)
+    assert out.exists()
 
 
-# --- network: connectivity and dimensionality ----------------------------------------------------
+# --- network: functional connectivity and PCA ----------------------------------------------------
 
 
-def test_firing_rate_matrix_is_causal_and_peaks_after_the_spike():
+def test_smoothed_rate_is_causal_and_peaks_after_the_spike():
     """A lone spike produces a silent prefix and a double-exponential response peaking at the
     analytic maximum of the difference of the two exponentials."""
     params = NetworkParams(sample_bin_sec=0.01)  # no decimation, so bins map 1:1 to samples
@@ -737,7 +1014,8 @@ def test_firing_rate_matrix_is_causal_and_peaks_after_the_spike():
     spike_bin = np.zeros((1, 2000), dtype=np.uint8)
     spike_bin[0, spike_at] = 1
 
-    rates = network.firing_rate_matrix(spike_bin, bin_size, params)[0]
+    rates = activity._double_exponential(spike_bin, bin_size, params.tau_rise_sec,
+                                         params.tau_decay_sec, params.sample_bin_sec)[0]
 
     assert rates.shape == (2000,)
     assert np.allclose(rates[:spike_at + 1], 0.0)  # causal: nothing before the spike
@@ -748,23 +1026,25 @@ def test_firing_rate_matrix_is_causal_and_peaks_after_the_spike():
     assert np.argmax(rates) == pytest.approx(spike_at + peak_sec / bin_size, abs=3)
 
 
-def test_firing_rate_matrix_decimates_to_the_requested_resolution():
-    spike_bin = np.zeros((4, 1000), dtype=np.uint8)
-    spike_bin[:, ::50] = 1
+def test_smoothed_firing_rate_of_a_recording(store):
+    config, cid_a, _ = store
+    rec, _ = _fixture_recording(config, cid_a)
 
-    rates = network.firing_rate_matrix(spike_bin, 0.01, NetworkParams(sample_bin_sec=0.05))
+    smooth = activity.smoothed_firing_rate(rec, config.analysis_dir, sample_bin_sec=0.05)
 
-    assert rates.shape == (4, 200)  # 1000 bins of 10 ms -> 200 samples of 50 ms
-    assert rates.dtype == np.float32
+    n_bins = rec.spike_bin.shape[1]
+    assert smooth["rate"].shape == (rec.spike_bin.shape[0], -(-n_bins // 5))  # 10 ms bins -> 50 ms
+    assert smooth["rate"].dtype == np.float32
+    assert smooth["sample_bin_sec"] == pytest.approx(0.05)
+    assert smooth["channels"].tolist() == rec.channelmap[:, 1].astype(int).tolist()
+    assert list((config.analysis_dir / "activity").rglob("*_smoothed_firing_rate.npz"))
 
 
-def test_connectivity_matrix_recovers_known_correlations_and_drops_silent_electrodes():
+def test_correlation_recovers_known_correlations_and_drops_silent_electrodes():
     rng = np.random.default_rng(0)
     signal = rng.normal(size=500)
 
-    rates = np.vstack([signal, signal, -signal, np.zeros(500)])
-
-    corr, keep = network.connectivity_matrix(rates)
+    corr, keep = network._correlation(np.vstack([signal, signal, -signal, np.zeros(500)]))
 
     # The constant row has no variance and is dropped; the other three survive, in order.
     assert keep.tolist() == [0, 1, 2]
@@ -773,114 +1053,275 @@ def test_connectivity_matrix_recovers_known_correlations_and_drops_silent_electr
     assert corr[0, 2] == pytest.approx(-1.0, abs=1e-5)
 
 
-def test_variance_explained_and_effective_rank_bracket_the_extremes():
+def test_spectrum_and_effective_rank_bracket_the_extremes():
     rng = np.random.default_rng(1)
 
     # Rank 1: every electrode is a scaled copy of one signal, so one component carries everything.
-    signal = rng.normal(size=400)
-    rank_one = np.outer(np.arange(1, 9), signal)
-    p_one = network.variance_explained(rank_one)
+    p_one = network._spectrum(np.outer(np.arange(1, 9), rng.normal(size=400)))
     assert p_one.sum() == pytest.approx(1.0)
     assert p_one[0] == pytest.approx(1.0, abs=1e-6)
-    assert network.effective_rank(p_one) == pytest.approx(1.0, abs=1e-3)
+    assert network._effective_rank(p_one) == pytest.approx(1.0, abs=1e-3)
 
     # Independent equal-variance electrodes spread variance evenly: effective rank approaches d.
     independent = rng.normal(size=(8, 20_000))
-    assert network.effective_rank(network.variance_explained(independent)) == pytest.approx(8, abs=0.5)
+    assert network._effective_rank(network._spectrum(independent)) == pytest.approx(8, abs=0.5)
 
 
-def test_compute_network_metrics_keys_and_ranges():
-    rng = np.random.default_rng(2)
-    rates = rng.normal(size=(6, 500))
-
-    metrics = network.compute_network_metrics(rates)
-
-    assert metrics["n_electrodes_used"] == 6
-    assert -1 <= metrics["mean_corr"] <= 1
-    assert 1 <= metrics["effective_rank"] <= 6
-    assert metrics["n_pc_80"] <= metrics["n_pc_90"] <= 6
-    assert 0 < metrics["pc1_var_frac"] <= 1
-
-
-def test_network_summary_columns(store):
+def test_recording_level_network_functions(store):
     config, cid_a, _ = store
-    cpath = resolve_paths(cid_a, config)
+    rec, _ = _fixture_recording(config, cid_a)
 
-    df = network.network_summary(cpath, config.analysis_dir, show_plot=False)
+    fc = network.connectivity(rec, config.analysis_dir)
+    n = fc["corr"].shape[0]
+    assert fc["corr"].shape == (n, n) and len(fc["channels"]) == n == fc["elec_index"].size
+    assert fc["phase"] == "full"
 
-    assert {"culture_id", "div", "phase"} <= set(df.columns)
-    assert set(df["div"]) == {7, 8}
-    assert set(df["phase"]) == {"full"}
-    assert df["mean_corr"].between(-1, 1).all()
-    assert (df["effective_rank"] >= 1).all()
-    assert (df["effective_rank"] <= df["n_electrodes_used"]).all()
+    pcs = network.pca(rec, config.analysis_dir, n_components=4)
+    assert pcs["var_frac"].sum() == pytest.approx(1.0)
+    assert np.all(np.diff(pcs["cumvar"]) >= -1e-6) and pcs["cumvar"][-1] == pytest.approx(1.0)
+    assert pcs["components"].shape == (n, 4) and pcs["scores"].shape[0] == 4
+    assert pcs["scores"].shape[1] == pcs["time_sec"].size
+    assert np.all(pcs["components"].sum(axis=0) > 0)  # signs fixed
+    assert np.array_equal(pcs["channels"], fc["channels"])
+
+    metrics = network.network_metrics(rec, config.analysis_dir)
+    assert metrics["phase"].tolist() == ["full"]
+    row = metrics.iloc[0]
+    assert row["n_electrodes_used"] == n
+    assert -1 <= row["mean_corr"] <= 1
+    assert row["effective_rank"] == pytest.approx(pcs["effective_rank"])
+    assert row["n_pc_80"] <= row["n_pc_90"] <= n
     # The fixture's bursts recruit every channel, so the array moves as one: PC1 dominates.
-    assert (df["pc1_var_frac"] > 0.5).all()
-    # Stamped settings make a cached CSV self-describing.
+    assert row["pc1_var_frac"] > 0.5
+    assert row["n_communities"] >= 1 and np.isfinite(row["modularity"])
+
+    saved = {p.name.split("well0_")[-1] for p in (config.analysis_dir / "network").rglob("*")}
+    assert {"connectivity_full.npz", "pca_full.npz", "network_metrics.csv"} <= saved
+
+
+def test_summarize_network_metrics(store):
+    config, cid_a, _ = store
+    df = network.summarize_network_metrics(cid_a, config)
+
+    assert set(df["div"]) == {7, 8} and set(df["phase"]) == {"full"}
+    assert (df["effective_rank"] >= 1).all()
+    # Settings are stamped on every row ...
     assert set(df["sample_bin_sec"]) == {NetworkParams().sample_bin_sec}
+
+    # ... and changing them recomputes instead of reusing rows made under the old ones.
+    coarse = network.summarize_network_metrics(cid_a, config, params=NetworkParams(sample_bin_sec=0.5))
+    assert set(coarse["sample_bin_sec"]) == {0.5}
+
+    # Community settings are stamped and honoured the same way.
+    assert {"modularity", "n_communities", "community_method"} <= set(df.columns)
+    fine = network.summarize_network_metrics(
+        cid_a, config, params=NetworkParams(communities=CommunityParams(resolution=2.0)))
+    assert set(fine["community_resolution"]) == {2.0}
 
 
 def test_network_summary_honors_embedded_phase_spec(tmp_path, make_recording_data):
     config, cid = _phased_store(tmp_path, make_recording_data)
-    cpath = resolve_paths(cid, config)
-
-    df = network.network_summary(cpath, config.analysis_dir, show_plot=False)
-
-    assert set(df["phase"]) == {"early", "late"}
+    assert set(network.summarize_network_metrics(cid, config)["phase"]) == {"early", "late"}
 
 
-def test_culture_connectivity_keys_and_cache(store):
+def test_culture_connectivity_cache(store):
     config, cid_a, _ = store
     cpath = resolve_paths(cid_a, config)
 
-    conn = network.culture_connectivity(cpath, config.analysis_dir)
-
+    conn = network._culture_connectivity(cpath, config.analysis_dir)
     assert sorted(conn) == [(7, ""), (8, "")]
-    for per_div in conn.values():
-        assert set(per_div) == set(network.CONNECTIVITY_KEYS)
-        n = per_div["corr"].shape[0]
-        assert per_div["corr"].shape == (n, n)
-        assert per_div["elec_index"].size == n
-        # A cumulative variance curve is non-decreasing and ends at 1.
-        assert np.all(np.diff(per_div["cumvar"]) >= -1e-6)
-        assert per_div["cumvar"][-1] == pytest.approx(1.0, abs=1e-6)
-
     _save_path, npz_path = _summary_paths(cpath, config.analysis_dir, "network",
                                           "default_connectivity", ext=".npz")
     assert npz_path.exists()
 
-    cached = network.culture_connectivity(cpath, config.analysis_dir)
+    cached = network._culture_connectivity(cpath, config.analysis_dir)
     assert np.array_equal(cached[(7, "")]["corr"], conn[(7, "")]["corr"])
     assert np.array_equal(cached[(7, "")]["cumvar"], conn[(7, "")]["cumvar"])
+    assert np.array_equal(cached[(7, "")]["scores"], conn[(7, "")]["scores"])
+    assert str(cached[(7, "")]["phase"]) == "full"
 
 
-def test_network_plot_helpers_render(store, tmp_path):
+def test_culture_connectivity_recomputes_a_cache_without_trajectories(store):
+    """A cache written before the trajectory arrays existed is recomputed, not half-used."""
     config, cid_a, _ = store
     cpath = resolve_paths(cid_a, config)
-    conn = network.culture_connectivity(cpath, config.analysis_dir)
+    conn = network._culture_connectivity(cpath, config.analysis_dir)
+    _save_dir, npz_path = _summary_paths(cpath, config.analysis_dir, "network",
+                                         "default_connectivity", ext=".npz")
+    old = {k: v for k, v in np.load(npz_path).items() if k.rsplit("__", 1)[-1] in ("corr", "cumvar", "elec_index")}
+    np.savez_compressed(npz_path, **old)
 
-    grid = tmp_path / "conn_grid.png"
-    curves = tmp_path / "var_explained.png"
-    network.plot_connectivity_grid(conn, cid_a, save_path=grid, show_plot=False)
-    network.plot_variance_explained(conn, cid_a, save_path=curves, show_plot=False)
-
-    assert grid.exists() and curves.exists()
+    redone = network._culture_connectivity(cpath, config.analysis_dir)
+    assert np.array_equal(redone[(8, "")]["scores"], conn[(8, "")]["scores"])
 
 
-def test_population_network_summary_renders(store):
+def test_network_plots_render(store, tmp_path):
     config, cid_a, cid_b = store
-    sel = CultureSelector(cultures=[cid_a, cid_b])
-    sel_paths = resolve_paths(sel, config)
+    network.plot_connectivity_grid(cid_a, config, save_path=tmp_path / "grid.png", show_plot=False)
+    network.plot_pc_variance_explained(cid_a, config, save_path=tmp_path / "pcs.png", show_plot=False)
+    network.plot_network_summary(CultureSelector(cultures=[cid_a, cid_b]), config, phase="full",
+                                 show_plot=False, save_path=tmp_path / "summary.png")
+    fig = network.plot_connectivity_grid(cid_a, config, order="communities", show_plot=False,
+                                         save_path=tmp_path / "grid_comm.png")
+    assert "Q =" in fig.axes[0].get_title()
+    fig = network.plot_pc_trajectory_grid(cid_a, config, show_plot=False, save_path=tmp_path / "traj.png")
+    # Unphased data: the phase is left out of the culture-level titles.
+    assert "phase" not in fig._suptitle.get_text()
+    assert all((tmp_path / f).exists()
+               for f in ("grid.png", "pcs.png", "summary.png", "grid_comm.png", "traj.png"))
+    with pytest.raises(ValueError):
+        network.plot_connectivity_grid(cid_a, config, order="nope", show_plot=False)
+    with pytest.raises(ValueError):
+        network.plot_pc_trajectory_grid(cid_a, config, pcs=(1, 4), show_plot=False)
 
-    for epath in sel_paths.values():
-        for cpath in epath.cultures.values():
-            network.network_summary(cpath, config.analysis_dir, show_plot=False)
 
-    pop_df = load_population_summaries(sel_paths, data_dir=config.analysis_dir / "network",
-                                       suffix="network_summary")
-    assert {"culture_id", "chip", "well"} <= set(pop_df.columns)
+# --- network: PCA trajectories and communities ----------------------------------------------------
 
-    network.plot_population_network_summary(sel_paths, config.analysis_dir, phase="full",
-                                            savename="network.png")
 
-    assert (config.analysis_dir / "network" / "network.png").exists()
+def test_pca_scores_project_the_centred_rates_with_fixed_signs():
+    rng = np.random.default_rng(2)
+    rates = rng.normal(size=(6, 300)) + np.outer(np.arange(6), rng.normal(size=300))
+    p, components, scores = network._pca(rates, n_components=3)
+
+    assert p == pytest.approx(network._spectrum(rates))
+    centred = rates - rates.mean(axis=1, keepdims=True)
+    assert scores == pytest.approx(components.T @ centred, abs=1e-4)
+    assert np.all(components.sum(axis=0) > 0)
+    assert components.T @ components == pytest.approx(np.eye(3), abs=1e-8)
+    # The flip is a convention, not a fit: negating the data negates nothing in the output.
+    _p, comp_neg, _scores = network._pca(-rates, n_components=3)
+    assert comp_neg == pytest.approx(components, abs=1e-8)
+
+
+def _planted_corr(sizes=(30, 20, 10), noise=1.0, seed=0):
+    rng = np.random.default_rng(seed)
+    truth = np.repeat(np.arange(len(sizes)), sizes)
+    signal = rng.normal(size=(len(sizes), 3000))[truth] + noise * rng.normal(size=(truth.size, 3000))
+    order = rng.permutation(truth.size)
+    return np.corrcoef(signal[order]), truth[order]
+
+
+def test_communities_recover_a_planted_partition():
+    corr, truth = _planted_corr()
+    found = network.communities(corr)
+
+    assert found["n_communities"] == 3
+    # Each planted block is exactly one community, numbered largest first.
+    for block, size in zip(range(3), (30, 20, 10)):
+        assert set(found["labels"][truth == block]) == {block}
+        assert (found["labels"] == block).sum() == size
+    assert sorted(found["order"]) == list(range(truth.size))
+    assert found["boundaries"].tolist() == [30, 50, 60]
+    # The order groups each community into one contiguous block.
+    assert np.all(np.diff(found["labels"][found["order"]]) >= 0)
+    assert 0 < found["modularity"] < 1
+
+    signed = network.communities(corr, params=CommunityParams(negative="signed"))
+    assert signed["n_communities"] == 3
+
+
+def test_communities_find_one_community_when_everything_is_synchronized():
+    corr = np.full((40, 40), 0.7)
+    np.fill_diagonal(corr, 1.0)
+    found = network.communities(corr)
+    assert found["n_communities"] == 1
+    assert found["modularity"] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_communities_are_reproducible_and_modularity_is_consistent():
+    from mxtreme.analysis import _communities
+
+    corr, _truth = _planted_corr(sizes=(25, 25, 25, 25), noise=3.0, seed=4)
+    params = CommunityParams(seed=7)
+    a, b = network.communities(corr, params=params), network.communities(corr, params=params)
+    assert np.array_equal(a["labels"], b["labels"])
+    # The reported Q is the modularity of the reported partition.
+    B = _communities.modularity_matrix(corr, params.resolution, params.negative)
+    assert a["modularity"] == pytest.approx(_communities.modularity(B, a["labels"]))
+    # More resolution never yields fewer communities here.
+    finer = network.communities(corr, params=CommunityParams(resolution=1.5))
+    assert finer["n_communities"] >= a["n_communities"]
+
+
+def test_communities_reject_an_unknown_method():
+    with pytest.raises(ValueError, match="Available"):
+        network.communities(np.eye(3), params=CommunityParams(method="nope"))
+
+
+def test_communities_of_a_recording_map_channels_and_save(store, tmp_path):
+    config, cid_a, _ = store
+    rec, _ = _fixture_recording(config, cid_a)
+    conn = network.connectivity(rec)
+    found = network.communities(conn, save_path=tmp_path / "comm.csv")
+
+    assert np.array_equal(found["channels"], conn["channels"]) and found["phase"] == "full"
+    table = network.community_table(found)
+    assert list(table.columns) == ["channel", "elec_index", "community"]
+    assert len(table) == len(conn["channels"])
+    saved = pd.read_csv(tmp_path / "comm.csv")
+    pd.testing.assert_frame_equal(saved[["channel", "elec_index", "community"]], table, check_dtype=False)
+    assert {"modularity", "method", "resolution"} <= set(saved.columns)
+
+
+def test_plot_connectivity_and_trajectory(store, tmp_path):
+    from matplotlib.collections import LineCollection
+
+    config, cid_a, _ = store
+    rec, _ = _fixture_recording(config, cid_a)
+    conn = network.connectivity(rec)
+
+    fig = network.plot_connectivity(conn, communities=True, show_plot=False,
+                                    save_path=tmp_path / "fc.png")
+    assert "communities" in fig.axes[0].get_title()
+    with pytest.raises(ValueError):
+        network.plot_connectivity(conn, communities=network.communities(np.eye(3)), show_plot=False)
+
+    fig = network.plot_pc_trajectory(rec, show_plot=False, save_path=tmp_path / "traj.png")
+    assert any(isinstance(c, LineCollection) for c in fig.axes[0].collections)
+    assert fig.axes[0].get_xlabel().startswith("PC1 (")
+
+    # On a caller's axes: draws there, makes no figure of its own.
+    fig, ax = plt.subplots()
+    assert network.plot_pc_trajectory(rec, ax=ax, pcs=(1, 3), colorbar=False) is fig
+    assert ax.get_ylabel().startswith("PC3 (")
+    plt.close(fig)
+    assert (tmp_path / "fc.png").exists() and (tmp_path / "traj.png").exists()
+
+
+def test_animate_pc_trajectory_writes_a_gif(store, tmp_path):
+    from PIL import Image
+
+    config, cid_a, _ = store
+    rec, _ = _fixture_recording(config, cid_a)
+    out = network.animate_pc_trajectory(rec, tmp_path / "anim.gif", duration_sec=1.0, step_sec=0.25,
+                                        raster_window_sec=2.0, dpi=40, order="communities")
+    with Image.open(out) as gif:
+        assert gif.n_frames == 4
+
+    with pytest.raises(ValueError, match="max_frames"):
+        network.animate_pc_trajectory(rec, tmp_path / "long.gif", duration_sec=10.0, step_sec=0.25,
+                                      max_frames=5)
+    with pytest.raises(ValueError, match=".gif or .mp4"):
+        network.animate_pc_trajectory(rec, tmp_path / "anim.avi")
+    assert not (tmp_path / "long.gif").exists()
+
+
+# --- spatial -------------------------------------------------------------------------------------
+
+
+def test_spatial_metrics_and_summary(store, tmp_path):
+    config, cid_a, cid_b = store
+    rec, _ = _fixture_recording(config, cid_a)
+
+    one = spatial.spatial_metrics(rec, config.analysis_dir)
+    assert len(one) == 1 and one.iloc[0]["phase"] == "full"
+    assert one.iloc[0]["n_electrodes"] == rec.channelmap.shape[0]
+    # The fixture lays electrodes on a 350 µm grid, so each one's nearest neighbour is 350 µm away.
+    assert one.iloc[0]["mean_nn_distance_um"] == pytest.approx(350.0)
+
+    table = spatial.summarize_spatial(CultureSelector(cultures=[cid_a, cid_b]), config)
+    assert table["culture_id"].nunique() == 2 and len(table) == 3
+
+    spatial.plot_spatial_summary(cid_a, config, show_plot=False, save_path=tmp_path / "spatial.png")
+    spatial.plot_mea_layouts(cid_a, config, show_plot=False, save_path=tmp_path / "mea.png")
+    assert (tmp_path / "spatial.png").exists() and (tmp_path / "mea.png").exists()

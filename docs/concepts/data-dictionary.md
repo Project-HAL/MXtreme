@@ -1,7 +1,7 @@
-# Data dictionary
+# Data Structures
 
-Between extraction and analysis, a recording is carried around as a plain Python `dict`, one per
-well. This page lists every key in that dict and what it holds, at each of the three places you
+Between extraction and analysis, a recording is carried around as a plain Python `dict`. 
+This page lists every key in that dict and what it holds, at each of the three places you
 meet it:
 
 1. **After extraction**: {func}`mxtreme.extract.extract` returns `dict[int, dict]`, mapping each
@@ -12,18 +12,15 @@ meet it:
    key names**, and {func}`mxtreme.io.load_preprocessed` reads it back as a dict; see
    [The saved `.npz`](#the-saved-npz).
 
-You rarely need the `.npz` dict directly. {class}`~mxtreme.recording.Recording` wraps it and exposes
+{class}`~mxtreme.recording.Recording` wraps the dictionary stored in `.npz` and exposes
 the same data as attributes (see [Recording attributes](#recording-attributes)).
-
-The shapes and dtypes below come from a real one-hour MaxOne recording: 1,016 mapped channels,
-20 kHz sampling, with stimulation.
 
 ## Units at a glance
 
 | Quantity | Unit |
 |---|---|
 | Time: `frameno`, `eventtime`, `raw_start`, `stim_frames` | **frames** (samples). Divide by `samp_rate` to get seconds. |
-| `samp_rate` | Hz (MaxOne: 20000) |
+| `samp_rate` | Hz (MaxOne: 20k, MaxTwo: 10k) |
 | `amplitude` | **DAC units** after extraction; **volts** after {func}`~mxtreme.clean.dac_to_voltage` |
 | `x`, `y` electrode positions | µm |
 | `bin_size`, `rec_t_sec` | seconds |
@@ -39,8 +36,8 @@ at frame 0.
 | Key | Type | Description |
 |---|---|---|
 | `well` | `int` | Well number (0–5; always 0 on a MaxOne). |
-| `batch_id` | `str` | Plating batch, from metadata `"Batch ID"` (files written before it existed: `"Exp ID"`). The recording's identity. |
-| `experiment` | `str` | An ingested experiment's name, from metadata `"Experiment"`; `""` for scans. |
+| `batch_id` | `str` | Plating batch, from metadata `"Batch ID"`. |
+| `experiment` | `str` | An optional label describing the type of recording, from metadata `"Experiment"`; `""` for plain scans. |
 | `chip` | `str` | Chip ID, from metadata `"Chip ID"`. |
 | `plate_date` | `str` or `int` | Plating date, from metadata `"Plate date"`, e.g. `"111825"`. It is stored exactly as the metadata gives it, so it can be a string or an int. |
 | `DIV` | `int` | Days in vitro, from metadata `"DIV"`. |

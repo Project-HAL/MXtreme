@@ -1,4 +1,4 @@
-# Selecting recordings and resolving their paths
+# Selecting recordings and resolving paths
 
 This tutorial shows how {mod}`mxtreme.identity` and {mod}`mxtreme.paths` work together: you pick a
 single recording, a single culture, or a group of cultures, resolve all of their files, and then
@@ -111,7 +111,7 @@ df = recs.to_frame()   # columns: batch_id, chip, well, div, experiment, npz, bu
 df[(df.chip == "P006677") & (df.div >= 14)].npz.tolist()
 ```
 
-## Labelled recordings (`experiment`)
+## Labeled recordings (`experiment`)
 
 A recording can carry an `experiment` label, such as `NS` or `train`, which also ends its file
 name. By default, resolution matches recordings whatever their label, so you don't need to know
@@ -132,9 +132,9 @@ A culture can have more than one recording on the same DIV, as long as each has 
 ```python
 cp = resolve_paths(culture, config)
 cp.divs                          # [12, 27]
-cp.experiments                   # ['NS', 'NS_ATP12hr', 'NS_ATP1hr', 'NS_ATP6hr']
+cp.experiments                   # ['NS', 'train']
 cp.at_div(27).to_frame()         # one row per recording on DIV 27
-cp.recording(27, "NS_ATP1hr")    # one of them, by label
+cp.recording(27, "train")    # one of them, by label
 cp.recording(27)                 # ValueError: names the three labels and asks you to pick one
 ```
 

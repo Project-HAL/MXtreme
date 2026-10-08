@@ -215,22 +215,30 @@ records detection and feature-extraction timestamps independently. Omit it for p
 
 ## Stage 6 — Analysis
 
-Each topic module in {mod}`mxtreme.analysis` follows the same two-level shape:
+Every topic module in {mod}`mxtreme.analysis` works at three levels:
 
-- A **culture-level** function takes one `CulturePaths`, computes across all its recordings, and
-  writes a tidy CSV under `analysis/<category>/<batch_id>/<chip>/well<N>/`. Each row carries `div`
-  and `experiment`, so several labelled recordings on one DIV each get their own rows.
-- A **population-level** function reads those CSVs back and pools them across cultures.
+- **Recording level:** functions take a `Recording` (and, for bursting and performance, its burst
+  table) and return the data, one row per channel, burst or phase. Give them an `analysis_dir` and
+  the result is also saved under `analysis/<category>/<batch_id>/<chip>/well<N>/`.
+- **Group level:** `summarize_*` returns a table and `plot_*_summary` a figure. Both take a
+  `RecordingID`, `CultureID`, `CultureSelector`, or several selectors to compare, along with the
+  `Config`.
+- **Culture level:** plots showing one panel or line per recording of one culture.
 
-| Module | Culture level | Population level |
-|---|---|---|
-| {mod}`~mxtreme.analysis.activity` | `burst_activity_summary`, `channel_activity_summary` | `plot_population_burst_summary`, `plot_population_channel_activity` |
-| {mod}`~mxtreme.analysis.spatial` | `mea_layout_summary`, `spatial_summary` | `plot_population_spatial_summary` |
-| {mod}`~mxtreme.analysis.stimulation` | `stim_summary` | `plot_population_stim_summary` |
-| {mod}`~mxtreme.analysis.performance` | `performance_summary` | `plot_population_performance_summary` |
+| Module | Recording level | Group level | Culture level |
+|---|---|---|---|
+| {mod}`~mxtreme.analysis.activity` | `firing_rate`, `instantaneous_firing_rate`, `smoothed_firing_rate`, `isi`, `burst_rate`, `ibi` | `summarize_spike_activity`, `plot_spike_activity_summary`, and the `burst` pair | `plot_spike_activity_distributions`, `plot_burst_activity_distributions` |
+| {mod}`~mxtreme.analysis.network` | `connectivity`, `communities`, `pca`, `network_metrics`, `plot_connectivity`, `plot_pc_trajectory`, `animate_pc_trajectory` | `summarize_network_metrics`, `plot_network_summary` | `plot_connectivity_grid`, `plot_pc_variance_explained`, `plot_pc_trajectory_grid` |
+| {mod}`~mxtreme.analysis.spatial` | `spatial_metrics` | `summarize_spatial`, `plot_spatial_summary` | `plot_mea_layouts` |
+| {mod}`~mxtreme.analysis.stimulation` | `stim_events`, `stim_delivered` | `summarize_stimulation`, `plot_stimulation_summary` | |
+| {mod}`~mxtreme.analysis.performance` | `performance_score` | `summarize_performance`, `plot_performance_summary` | |
 
-Most culture-level functions take `use_existing=True`, which reuses a previously written CSV instead
-of recomputing — the whole reason the intermediate CSVs exist.
+The group-level functions cache one CSV per culture and topic. Each row is keyed by `div` and
+`experiment`, so several labelled recordings on one DIV each get their own rows. The cache fills in
+one recording at a time, so a later call only computes recordings it hasn't seen.
+`use_existing=False` recomputes the target's recordings. Settings that change the result (the network
+filter's time constants and community-detection settings, the performance objective) are part of the cache, so changing them never
+reuses old rows.
 
 ### Performance scoring is pluggable
 

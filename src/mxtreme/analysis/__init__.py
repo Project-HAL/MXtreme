@@ -1,8 +1,12 @@
 """Topic-oriented analyses plus a PDF report assembler.
 
-Each topic module exposes a culture-level function (operates on one ``CulturePaths``, writes a tidy
-per-DIV CSV under ``config.analysis_dir``) and, where meaningful, a population-level function that
-reads those CSVs back:
+Each topic module works at the same three levels:
+
+- recording level: functions take a ``Recording`` and return its data;
+- group level: ``summarize_*`` / ``plot_*_summary`` take a ``RecordingID`` / ``CultureID`` /
+  ``CultureSelector`` (or several selectors) plus the ``Config``, and cache per-culture CSVs under
+  ``config.analysis_dir``;
+- culture level: plots of one culture's recordings side by side.
 
     from mxtreme.analysis import activity, network, spatial, stimulation, performance
 

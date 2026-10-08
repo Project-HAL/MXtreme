@@ -135,7 +135,7 @@ The default `"isi_rate"` method composes two stages: ISI-N grouping (Bakkum et a
 candidate burst intervals, then rate thresholding within each group to classify peaks as `"network"`
 or `"mini"`. Use `BurstDetector(params, method="isi_n")` for grouping alone.
 
-## 6. Plot
+## 6. Visualize data
 
 Every plotting helper takes an optional `ax`, so the same function works standalone or inside a figure:
 
@@ -162,7 +162,59 @@ plt.show()
 ```
 
 
-## 7. Generate a report over multiple DIVs
+## 7. Analysis
+
+Here, we walk through basic activity analyses that can be run and visualized on a single or group of recordings.
+
+{mod}`mxtreme.analysis.activity` works at two levels.
+
+**One recording.** Pass a `Recording` and get its data back, one row per channel (or burst) per
+phase. Give an `analysis_dir` and the result is also saved next to the culture's other analysis
+outputs. Pass `save=False` to skip that.
+
+```python
+import pandas as pd
+from mxtreme.analysis import activity
+
+fr  = activity.firing_rate(rec, config.analysis_dir)                   # spikes / phase duration, per channel
+ifr = activity.instantaneous_firing_rate(rec, config.analysis_dir)     # channels x 1 s bins
+isi = activity.isi(rec, config.analysis_dir, level="channel")          # or level="global": all channels merged
+
+viz.plot_timeseries_heatmap(ifr["rate"], ifr["time_sec"], rows=ifr["channels"],
+                            cbar_label="Firing rate (Hz)")
+
+# Bursting needs the recording's bursts too.
+rate = activity.burst_rate(rec, burst_df, config.analysis_dir)
+ibi  = activity.ibi(rec, burst_df, config.analysis_dir)
+```
+
+**A recording, a culture, or groups of cultures.** The summary functions take whatever you want to
+look at, plus the `config`:
+
+```python
+from mxtreme.identity import CultureID, CultureSelector
+
+culture = CultureID("fall2026_batch1_DRG", "M01234", "0")
+batch   = CultureSelector(batch_ids=["fall2026_batch1_DRG"])
+
+activity.plot_spike_activity_summary(culture, config)                          # one culture over DIV
+activity.plot_spike_activity_summary(culture, config, split_by="experiment")   # one series per label
+activity.plot_burst_activity_summary(batch, config)                            # each culture + the mean ± SEM
+
+# Compare groups of cultures: one mean ± SEM series per group.
+activity.plot_burst_activity_summary(
+    {"control": CultureSelector(cultures=[...]), "treated": CultureSelector(cultures=[...])},
+    config, phase="full",
+)
+
+table = activity.summarize_spike_activity(batch, config)   # the same numbers as a table
+```
+
+Pass a `RecordingID` to see a single recording. `error="std"` switches the population error bars
+from SEM to SD. For the full distributions behind a culture's summary, use
+`activity.plot_spike_activity_distributions(culture, config)` and its burst counterpart.
+
+## 8. Generate a report over multiple DIVs
 
 ```python
 from mxtreme.identity import CultureID
