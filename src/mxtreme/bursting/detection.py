@@ -40,8 +40,9 @@ KDE_MAX_SAMPLES = 100_000
 
 
 def _rec_label(recording) -> str:
-    """Compact ``exp_id/chip/wellN/DIVd`` identity string for progress messages."""
-    return f"{recording.exp_id}/{recording.chip}/well{recording.well}/DIV{recording.DIV}"
+    """Compact ``batch_id/chip/wellN/DIVd[/experiment]`` identity string for progress messages."""
+    tail = f"/{recording.experiment}" if getattr(recording, "experiment", "") else ""
+    return f"{recording.batch_id}/{recording.chip}/well{recording.well}/DIV{recording.DIV}{tail}"
 
 
 def _log_burst_set(burst_data_dir, recording, burst_set) -> None:

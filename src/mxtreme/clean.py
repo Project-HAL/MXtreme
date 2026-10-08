@@ -38,28 +38,48 @@ def _stamp(well: dict, **params) -> None:
     well.setdefault("preprocessing_params", {}).update(params)
 
 
+def _already(well: dict, flag: str, step: str) -> bool:
+    """True if ``flag`` is set in ``well['preprocessing_params']`` -- i.e. ``step`` has already been
+    applied to this well, so it must not run again."""
+    if well.get("preprocessing_params", {}).get(flag):
+        logger.info("%s already applied to this well; skipping.", step)
+        return True
+    return False
+
+
 def normalize_time(well: dict) -> dict:
     """Offset spike and event frames so the recording starts at frame 0.
 
     Subtracts the raw recording's first frame (``well['raw_start']``) from every spike and event frame.
+    Records ``time_normalized=True`` in ``well['preprocessing_params']``; a well that already carries
+    it is left unchanged, so frames are never shifted twice.
 
     :param well: A well data dict.
-    :returns: The same dict, with normalized ``data['frameno']`` and ``eventtime``.
+    :returns: The same dict, with normalized ``spike_data['frameno']`` and ``eventtime``.
     :rtype: dict
     """
-    well["data"]["frameno"] -= well["raw_start"]
+    if _already(well, "time_normalized", "normalize_time"):
+        return well
+    well["spike_data"]["frameno"] -= well["raw_start"]
     well["eventtime"] = well["eventtime"] - well["raw_start"]
+    _stamp(well, time_normalized=True)
     return well
 
 
 def dac_to_voltage(well: dict) -> dict:
     """Convert spike amplitudes from DAC units to volts by multiplying by the least significant bit.
 
+    Records ``amplitude_units="V"`` in ``well['preprocessing_params']``; a well already in volts is left
+    unchanged, so amplitudes are never scaled twice.
+
     :param well: A well data dict.
-    :returns: The same dict, with ``data['amplitude']`` expressed in volts.
+    :returns: The same dict, with ``spike_data['amplitude']`` expressed in volts.
     :rtype: dict
     """
-    well["data"]["amplitude"] = well["data"]["amplitude"] * well["lsb"]
+    if _already(well, "amplitude_units", "dac_to_voltage"):
+        return well
+    well["spike_data"]["amplitude"] = well["spike_data"]["amplitude"] * well["lsb"]
+    _stamp(well, amplitude_units="V")
     return well
 
 
@@ -70,7 +90,7 @@ def remove_positive_deflections(well: dict) -> dict:
     :returns: The same dict, filtered to negative-amplitude spikes.
     :rtype: dict
     """
-    well["data"] = well["data"][well["data"]["amplitude"] < 0]
+    well["spike_data"] = well["spike_data"][well["spike_data"]["amplitude"] < 0]
     return well
 
 
@@ -84,9 +104,9 @@ def spike_filter(well: dict, amp_thresh: float = 2e-5) -> dict:
     :returns: The same dict, filtered by amplitude.
     :rtype: dict
     """
-    mask = np.abs(well["data"]["amplitude"]) >= amp_thresh
-    well["data"] = well["data"][mask]
-    if len(well["data"]) == 0:
+    mask = np.abs(well["spike_data"]["amplitude"]) >= amp_thresh
+    well["spike_data"] = well["spike_data"][mask]
+    if len(well["spike_data"]) == 0:
         raise ValueError("Amplitude threshold is too high.")
     _stamp(well, amp_thresh=amp_thresh)
     return well
@@ -105,7 +125,7 @@ def remove_spurious_spikes(well: dict, refractory_period: float = 0.002) -> dict
     :rtype: dict
     """
     refractory_frames = refractory_period * well["samp_rate"]
-    data = well["data"]
+    data = well["spike_data"]
     n = len(data)
 
     # Sort by (channel, frame) so refractory violations are adjacent within each channel. Work on a
@@ -132,7 +152,7 @@ def remove_spurious_spikes(well: dict, refractory_period: float = 0.002) -> dict
 
     keep = np.zeros(n, dtype=bool)
     keep[order[alive]] = True                           # map back to original ordering
-    well["data"] = data[keep]
+    well["spike_data"] = data[keep]
     _stamp(well, refractory_period=refractory_period)
     return well
 
@@ -149,8 +169,8 @@ def remove_spurious_channels(well: dict) -> dict:
     """
     if len(well["mapping"]["channel"]) != len(np.unique(well["mapping"]["channel"])):
         logger.warning("Duplicate channels found.")
-    mask = np.isin(well["data"]["channel"], well["mapping"]["channel"])
-    well["data"] = well["data"][mask]
+    mask = np.isin(well["spike_data"]["channel"], well["mapping"]["channel"])
+    well["spike_data"] = well["spike_data"][mask]
     return well
 
 
@@ -213,8 +233,8 @@ def remove_stim_frames(well: dict, post_stim_period: float = 0.0) -> dict:
         [np.arange(s, e + post_stim_frames, dtype=np.int64) for s, e in zip(starts, stops)]
     )
 
-    mask = ~np.isin(well["data"]["frameno"], well["stim_frames"])
-    well["data"] = well["data"][mask]
+    mask = ~np.isin(well["spike_data"]["frameno"], well["stim_frames"])
+    well["spike_data"] = well["spike_data"][mask]
     _stamp(well, post_stim_period=post_stim_period)
     return well
 
@@ -232,16 +252,16 @@ def bin_spikes(well: dict, bin_size: float = 0.01) -> dict:
     :rtype: dict
     """
     bin_win = bin_size * well["samp_rate"]  # bin width in frames
-    rec_t_samp = np.max(well["data"]["frameno"])
+    rec_t_samp = np.max(well["spike_data"]["frameno"])
     num_bins = int(np.ceil(np.divide(rec_t_samp, bin_win)))
 
     num_chan = well["channelmap"].shape[0]
     spike_bin = np.zeros((num_chan, num_bins), dtype=np.uint8)  # binary matrix; uint8 keeps it 8x smaller
-    which_bin = (well["data"]["frameno"] / bin_win).astype(int)
+    which_bin = (well["spike_data"]["frameno"] / bin_win).astype(int)
     which_bin = np.clip(which_bin, 0, num_bins - 1)
 
     mapping = dict(zip(well["channelmap"][:, 1], well["channelmap"][:, 0]))
-    channel_ids = pd.Series(well["data"]["channel"]).map(mapping).to_numpy(dtype=int)
+    channel_ids = pd.Series(well["spike_data"]["channel"]).map(mapping).to_numpy(dtype=int)
     assert len(channel_ids) == len(which_bin)
     spike_bin[channel_ids, which_bin] = 1
 

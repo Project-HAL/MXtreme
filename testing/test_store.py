@@ -67,7 +67,7 @@ def test_layout_and_parse_are_inverses(tmp_path):
     stem = store.recording_stem(BATCH, 260810, "M07460", 4, 21)
     directory = store.recording_dir(config, BATCH, 260810, "M07460", 4, 21, system="M1")
 
-    for tail, kind, exp_id in [
+    for tail, kind, experiment in [
         ("activity_scan", "activity_scan", ""),
         ("network_scan", "network_scan", ""),
         ("network_scan_1", "network_scan", ""),  # MaxLab's collision rename
@@ -79,7 +79,7 @@ def test_layout_and_parse_are_inverses(tmp_path):
         assert location is not None, tail
         assert (location.batch.id, location.plate_date) == (BATCH, 260810)
         assert (location.chip, location.well, location.div) == ("M07460", 4, 21)
-        assert (location.kind, location.exp_id) == (kind, exp_id)
+        assert (location.kind, location.experiment) == (kind, experiment)
 
 
 def test_parse_rejects_paths_outside_the_layout(tmp_path):
@@ -143,7 +143,7 @@ def _multiwell_h5(path, wells=(0, 3), conditions=("ctrl", "drug")):
     import h5py
 
     blob = str({
-        "Exp ID": BATCH, "Chip ID": "C1", "Plate date": 250512, "DIV": 7,
+        "Batch ID": BATCH, "Chip ID": "C1", "Plate date": 250512, "DIV": 7,
         "Well IDs": list(wells), "Conditions": list(conditions),
     })
     with h5py.File(path, "w") as f:
@@ -225,7 +225,7 @@ def test_ingest_files_the_chip_by_the_system_the_file_says(tmp_path):
     """The chip directory's M1/M2 comes from the file's plate description, or from ``system=``;
     a file that says nothing and is given nothing is refused before anything is copied."""
     config = Config(data_root=tmp_path / "ms")
-    kwargs = dict(batch=BATCH, plate_date=260810, chip="M07460", div=21, exp_id="t", on_progress=lambda _: None)
+    kwargs = dict(batch=BATCH, plate_date=260810, chip="M07460", div=21, experiment="t", on_progress=lambda _: None)
 
     [dest] = store.ingest_recording(_single_well_h5(tmp_path / "two.raw.h5", plate="MaxTwo 6 multi-well MEA"), config, **kwargs).values()
     assert dest.parent.parent.parent.name == "chip_M2_M07460"
@@ -236,12 +236,12 @@ def test_ingest_files_the_chip_by_the_system_the_file_says(tmp_path):
 
     mute = _single_well_h5(tmp_path / "mute.raw.h5", plate=None)
     with pytest.raises(ValueError, match="MaxOne or a MaxTwo"):
-        store.ingest_recording(mute, config, **{**kwargs, "exp_id": "u"})
+        store.ingest_recording(mute, config, **{**kwargs, "experiment": "u"})
     assert not list((config.recordings_dir).rglob("*_u.raw.h5"))
-    [given] = store.ingest_recording(mute, config, **{**kwargs, "exp_id": "u"}, system="M1").values()
+    [given] = store.ingest_recording(mute, config, **{**kwargs, "experiment": "u"}, system="M1").values()
     assert "chip_M1_M07460" in str(given)  # the same chip serial cannot be on both, but the store does not police that
     with pytest.raises(ValueError, match="system"):
-        store.ingest_recording(mute, config, **{**kwargs, "exp_id": "v"}, system="M3")
+        store.ingest_recording(mute, config, **{**kwargs, "experiment": "v"}, system="M3")
 
 
 def test_ingest_places_names_and_registers_a_single_well_file(tmp_path):
@@ -250,7 +250,7 @@ def test_ingest_places_names_and_registers_a_single_well_file(tmp_path):
 
     written = store.ingest_recording(
         src, config, batch=BATCH, plate_date=260810, chip="M07460", div=21,
-        exp_id="stim_trial_3", conditions={0: "ctrl"}, on_progress=lambda _: None,
+        experiment="stim_trial_3", conditions={0: "ctrl"}, on_progress=lambda _: None,
     )
 
     dest = written[0]
@@ -259,14 +259,14 @@ def test_ingest_places_names_and_registers_a_single_well_file(tmp_path):
     assert dest.exists() and src.exists()  # copied, not moved, by default
 
     row = pd.read_csv(config.registry_path).iloc[0]
-    assert (row["exp_id"], row["kind"]) == ("stim_trial_3", "experiment")
+    assert (row["experiment"], row["kind"]) == ("stim_trial_3", "experiment")
     assert (row["batch_id"], row["plate_date"]) == (BATCH, 260810)
     assert (int(row["well"]), int(row["div"])) == (0, 21)
     assert row["conditions"] == "ctrl"
 
     # And the ingested file resolves back to exactly the identity it went in under.
     location = store.parse_recording_path(dest, config.recordings_dir)
-    assert (location.kind, location.exp_id, location.well) == ("experiment", "stim_trial_3", 0)
+    assert (location.kind, location.experiment, location.well) == ("experiment", "stim_trial_3", 0)
 
 
 def test_ingest_move_removes_the_source(tmp_path):
@@ -275,7 +275,7 @@ def test_ingest_move_removes_the_source(tmp_path):
 
     written = store.ingest_recording(
         src, config, batch=BATCH, plate_date=260810, chip="M07460", div=21,
-        exp_id="trial", move=True, on_progress=lambda _: None,
+        experiment="trial", move=True, on_progress=lambda _: None,
     )
     assert written[0].exists() and not src.exists()
 
@@ -286,7 +286,7 @@ def test_ingest_splits_a_multiwell_file(tmp_path):
 
     written = store.ingest_recording(
         src, config, batch=BATCH, plate_date=250512, chip="C1", div=7,
-        exp_id="trial", conditions={0: "ctrl", 3: "drug"}, on_progress=lambda _: None,
+        experiment="trial", conditions={0: "ctrl", 3: "drug"}, on_progress=lambda _: None,
     )
 
     assert sorted(written) == [0, 3]
@@ -310,12 +310,12 @@ def test_ingest_stamps_identity_into_a_blob_less_file(tmp_path):
 
     written = store.ingest_recording(
         src, config, batch=BATCH, plate_date=260810, chip="M07460", div=21,
-        exp_id="trial", conditions={0: "ctrl"}, on_progress=lambda _: None,
+        experiment="trial", conditions={0: "ctrl"}, on_progress=lambda _: None,
     )
 
     with h5py.File(written[0], "r") as f:
         blob = eval(f["assay/metadata"][:][0].decode())
-    assert blob["Exp ID"] == "trial" and blob["Batch ID"] == BATCH
+    assert blob["Experiment"] == "trial" and blob["Batch ID"] == BATCH and "Exp ID" not in blob
     assert blob["Well IDs"] == [0] and blob["Conditions"] == ["ctrl"]
     with h5py.File(src, "r") as f:  # the source is never touched
         assert "assay" not in f
@@ -324,7 +324,7 @@ def test_ingest_stamps_identity_into_a_blob_less_file(tmp_path):
     config.registry_path.unlink()
     io.rebuild_registry(config)
     row = pd.read_csv(config.registry_path).iloc[0]
-    assert (row["exp_id"], row["conditions"]) == ("trial", "ctrl")
+    assert (row["experiment"], row["conditions"]) == ("trial", "ctrl")
 
 
 def test_ingest_leaves_an_existing_blob_alone(tmp_path):
@@ -334,20 +334,20 @@ def test_ingest_leaves_an_existing_blob_alone(tmp_path):
     config = Config(data_root=tmp_path / "ms")
     src = _single_well_h5(tmp_path / "export.raw.h5")
     with h5py.File(src, "r+") as f:
-        f.create_dataset("/assay/metadata", data=np.array([b"{'Exp ID': 'original'}"]))
+        f.create_dataset("/assay/metadata", data=np.array([b"{'Batch ID': 'original'}"]))
 
     written = store.ingest_recording(
         src, config, batch=BATCH, plate_date=260810, chip="M07460", div=21,
-        exp_id="trial", on_progress=lambda _: None,
+        experiment="trial", on_progress=lambda _: None,
     )
     with h5py.File(written[0], "r") as f:
-        assert f["assay/metadata"][:][0] == b"{'Exp ID': 'original'}"
+        assert f["assay/metadata"][:][0] == b"{'Batch ID': 'original'}"
 
 
 def test_ingest_refuses_to_overwrite(tmp_path):
     config = Config(data_root=tmp_path / "ms")
     src = _single_well_h5(tmp_path / "export.raw.h5")
-    kwargs = dict(batch=BATCH, plate_date=260810, chip="M07460", div=21, exp_id="trial")
+    kwargs = dict(batch=BATCH, plate_date=260810, chip="M07460", div=21, experiment="trial")
 
     store.ingest_recording(src, config, **kwargs, on_progress=lambda _: None)
     with pytest.raises(FileExistsError):
@@ -394,11 +394,11 @@ def test_ingest_numbers_several_network_scans_of_one_div(tmp_path):
     for p in first.parent.glob("*.h5"):
         assert store.recording_kind(p) == "network_scan"
         location = store.parse_recording_path(p, config.recordings_dir)
-        assert location.kind == "network_scan" and location.exp_id == ""
+        assert location.kind == "network_scan" and location.experiment == ""
     assert [store.network_scan_index(n) for n in names] == [0, 1, 2]
 
     df = pd.read_csv(config.registry_path, keep_default_na=False)
-    assert len(df) == 1 and df.iloc[0]["kind"] == "network_scan" and df.iloc[0]["exp_id"] == ""
+    assert len(df) == 1 and df.iloc[0]["kind"] == "network_scan" and df.iloc[0]["experiment"] == ""
 
     log = [t for t in transactions.read(config) if t.op == "recording.ingested"]
     assert len(log) == 3 and all(t.data["kind"] == "network_scan" for t in log)
@@ -413,14 +413,14 @@ def test_ingest_numbers_several_network_scans_of_one_div(tmp_path):
 
 
 @pytest.mark.parametrize("bad", ["", "has space", "a/b", "activity_scan", "network_scan_2"])
-def test_ingest_rejects_unusable_exp_ids(tmp_path, bad):
+def test_ingest_rejects_unusable_experiment_names(tmp_path, bad):
     config = Config(data_root=tmp_path / "ms")
     src = _single_well_h5(tmp_path / "export.raw.h5")
 
-    with pytest.raises(ValueError, match="exp_id"):
+    with pytest.raises(ValueError, match="experiment"):
         store.ingest_recording(
             src, config, batch=BATCH, plate_date=260810, chip="M07460", div=21,
-            exp_id=bad, on_progress=lambda _: None,
+            experiment=bad, on_progress=lambda _: None,
         )
 
 
@@ -435,7 +435,7 @@ def test_ingest_requires_a_wells_format_file(tmp_path):
     with pytest.raises(ValueError, match="/wells"):
         store.ingest_recording(
             src, config, batch=BATCH, plate_date=260810, chip="M07460", div=21,
-            exp_id="trial", on_progress=lambda _: None,
+            experiment="trial", on_progress=lambda _: None,
         )
 
 
@@ -456,7 +456,7 @@ def _seed_batch(config, batch, chip="P1", div=19):
     rec_dir = store.recording_dir(config, batch, PLATE_DATE, chip, 0, div, system="M1")
     (rec_dir / "electrode_selection").mkdir(parents=True)
     h5_path = rec_dir / f"{stem}_activity_scan.raw.h5"
-    blob = str({"Exp ID": batch, "Batch ID": batch, "Chip ID": chip, "Plate date": PLATE_DATE,
+    blob = str({"Batch ID": batch, "Chip ID": chip, "Plate date": PLATE_DATE,
                 "DIV": div, "Well IDs": [0], "Conditions": []})
     with h5py.File(h5_path, "w") as f:
         f.create_dataset("/assay/metadata", data=np.array([blob.encode("utf-8")]))
@@ -475,13 +475,13 @@ def _seed_batch(config, batch, chip="P1", div=19):
     npz_dir.mkdir(parents=True)
     npz_path = npz_dir / f"DIV{div}_{PLATE_DATE}_{chip}_{batch}_well0_exp_data.npz"
     np.savez_compressed(
-        npz_path, spike_data=np.arange(4), exp_id=np.array(batch), chip=np.array(chip),
+        npz_path, spike_data=np.arange(4), batch_id=np.array(batch), experiment=np.array(""), chip=np.array(chip),
         well=np.array(0), DIV=np.array(div), plate_date=np.array(PLATE_DATE),
         exp_condition=np.asarray(None), path_to_h5=np.array(str(h5_path)),
         step_log=np.asarray([{"step": "normalize_time"}], dtype=object),
     )
     io.register(
-        {0: {"exp_id": batch, "chip": chip, "DIV": div, "plate_date": PLATE_DATE}},
+        {0: {"batch_id": batch, "chip": chip, "DIV": div, "plate_date": PLATE_DATE}},
         config.registry_path,
     )
 
@@ -489,7 +489,7 @@ def _seed_batch(config, batch, chip="P1", div=19):
     burst_dir.mkdir(parents=True)
     (burst_dir / f"DIV{div}_{PLATE_DATE}_{chip}_{batch}_well0_burst_data.csv").write_text("a,b\n1,2\n")
     (config.burst_data_dir / f"{batch}_burst_log.csv").write_text(
-        f"exp_id,chip,well,DIV\n{batch},{chip},0,{div}\n"
+        f"batch_id,chip,well,DIV\n{batch},{chip},0,{div}\n"
     )
 
     summary_dir = config.analysis_dir / "activity" / batch / chip / "well0"
@@ -552,7 +552,7 @@ def test_rename_batch_renames_everything_the_store_names(tmp_path):
         assert f["/wells/well000/rec0000/spikes"][()].tolist() == [0, 1, 2, 3, 4]
     npz_path = next(p for p in config.preprocessed_dir.rglob("*.npz") if NEW in p.name)
     with np.load(npz_path, allow_pickle=True) as npz:
-        assert npz["exp_id"].item() == NEW
+        assert npz["batch_id"].item() == NEW
         assert npz["path_to_h5"].item() == str(h5_path)
         assert npz["spike_data"].tolist() == [0, 1, 2, 3]
     assert npz_path.stat().st_mtime == npz_before  # a rebuilt registry keeps its timestamps
@@ -563,7 +563,7 @@ def test_rename_batch_renames_everything_the_store_names(tmp_path):
     # And a registry rebuilt from disk agrees with the one rewritten in place.
     rebuilt = tmp_path / "rebuilt.csv"
     io.rebuild_registry(config, registry_path=rebuilt)
-    key = ["exp_id", "batch_id", "chip", "well", "div", "kind"]
+    key = ["batch_id", "chip", "well", "div", "kind", "experiment"]
     live = pd.read_csv(config.registry_path).fillna("")[key].astype(str)
     fresh = pd.read_csv(rebuilt).fillna("")[key].astype(str)
     assert set(map(tuple, live.values)) == set(map(tuple, fresh.values))
@@ -750,7 +750,7 @@ def test_describe_keeps_mxtreme_scan_metadata(tmp_path):
 
 def test_ingest_files_a_scope_activity_scan_as_an_activity_scan(tmp_path):
     """An outside scan lands under the scan tail and registers as a scan, so it reads back exactly
-    like one MXtreme ran: kind from the name, blank exp_id, blob carrying the batch as exp id."""
+    like one MXtreme ran: kind from the name, no experiment name, blob carrying the batch."""
     import h5py
 
     from mxtreme.scans.electrode_selection import load_activity_scan
@@ -769,23 +769,23 @@ def test_ingest_files_a_scope_activity_scan_as_an_activity_scan(tmp_path):
     assert dest.name.endswith("_well_1_DIV_22_activity_scan.raw.h5")
     assert store.recording_kind(dest) == "activity_scan"
     location = store.parse_recording_path(dest, config.recordings_dir)
-    assert (location.kind, location.well, location.div) == ("activity_scan", 1, 22) and not location.exp_id
+    assert (location.kind, location.well, location.div) == ("activity_scan", 1, 22) and not location.experiment
 
     df = pd.read_csv(config.registry_path, keep_default_na=False)
     assert len(df) == 1
     row = df.iloc[0]
-    assert (row["kind"], row["exp_id"], int(row["well"]), int(row["div"])) == ("activity_scan", "", 1, 22)
+    assert (row["kind"], row["experiment"], int(row["well"]), int(row["div"])) == ("activity_scan", "", 1, 22)
 
     with h5py.File(dest, "r") as f:
         blob = eval(f["assay/metadata"][:][0].decode())
         assert list(f["wells"]) == ["well001"]
-    assert blob["Exp ID"] == "spring2024_batch1_DRG" and blob["Well IDs"] == [1]
+    assert blob["Batch ID"] == "spring2024_batch1_DRG" and blob["Well IDs"] == [1]
     assert sorted(load_activity_scan(str(dest))) == [1]  # the selection pipeline reads it
 
     log = transactions.read(config)
     assert [t.op for t in log] == ["recording.ingested"]
     assert (log[0].actor, log[0].note, log[0].data["kind"]) == ("kam", "from the Scope archive", "activity_scan")
-    assert log[0].exp_id == "spring2024_batch1_DRG"
+    assert (log[0].batch_id, log[0].experiment) == ("spring2024_batch1_DRG", "")
     assert src.exists()  # copied; only the chosen well was split out
 
 
@@ -805,19 +805,19 @@ def test_ingest_derives_record_time_for_a_scan_that_lacks_it(tmp_path):
         assert int(f["assay/inputs/record_time"][0]) == 30  # from the start/stop stamps
 
 
-def test_ingest_wells_must_exist_and_a_scan_takes_no_exp_id(tmp_path):
+def test_ingest_wells_must_exist_and_a_scan_takes_no_experiment(tmp_path):
     config = Config(data_root=tmp_path / "ms")
     src = _scope_activity_scan_h5(tmp_path / "scan.h5")
     common = {"batch": BATCH, "plate_date": 240328, "chip": "M07474", "div": 22, "on_progress": lambda _: None}
 
     with pytest.raises(ValueError, match="holds no well"):
         store.ingest_recording(src, config, kind="activity_scan", wells=[5], **common)
-    with pytest.raises(ValueError, match="exp_id"):
-        store.ingest_recording(src, config, kind="network_scan", exp_id="x", **common)
-    with pytest.raises(ValueError, match="exp_id"):
+    with pytest.raises(ValueError, match="experiment"):
+        store.ingest_recording(src, config, kind="network_scan", experiment="x", **common)
+    with pytest.raises(ValueError, match="experiment"):
         store.ingest_recording(src, config, **common)  # an experiment with no name
     with pytest.raises(ValueError, match="kind"):
-        store.ingest_recording(src, config, kind="stimulation", exp_id="x", **common)
+        store.ingest_recording(src, config, kind="stimulation", experiment="x", **common)
     assert not (config.data_root / "recordings").exists()
 
 

@@ -16,6 +16,13 @@ def config(tmp_path):
 BATCH = "fall2026_batch1_DRG"
 
 
+def _legacy_line(config, op, **identity):
+    """Append a line the way the log was written before batch_id was the identity: ``exp_id`` keyed."""
+    config.transactions_path.parent.mkdir(parents=True, exist_ok=True)
+    with config.transactions_path.open("a") as f:
+        f.write(json.dumps({"time": "2026-08-20T10:00:00-04:00", "op": op, **identity}) + "\n")
+
+
 def test_record_appends_one_json_line_per_call(config):
     tx.record(config, "culture.mark_dead", batch_id=BATCH, plate_date=260813, chip="P1", well=0, actor="kam")
     tx.record(config, "batch.mark_dead", batch_id=BATCH, plate_date=260813, note="contamination")
@@ -209,7 +216,7 @@ def test_chip_devices(config):
 class _ScanParams:
     def __init__(self, wells=(0,), conditions=()):
         self.wells, self.conditions = list(wells), list(conditions)
-        self.exp_id, self.batch_id, self.plate_date = "", BATCH, 260813
+        self.batch_id, self.plate_date = BATCH, 260813
         self.chip, self.div = "P1", 7
 
 
@@ -236,7 +243,7 @@ def test_save_preprocessed_journals_the_npz(config, make_well):
     out = io.save_preprocessed(config.preprocessed_dir, well, registry_path=config.registry_path)
     log = tx.read(config)
     assert len(log) == 1 and log[0].op == "preprocessed.saved"
-    assert log[0].exp_id == "testExp" and log[0].batch_id == "" and log[0].chip == "C0001"
+    assert log[0].batch_id == "testExp" and log[0].experiment == "" and log[0].chip == "C0001"
     assert log[0].well == 0 and log[0].div == 7 and log[0].plate_date == 250101
     assert log[0].data == {"path": str(out), "source": "/tmp/fake.raw.h5"}
 
@@ -255,11 +262,11 @@ def test_save_burst_data_journals_the_csv(config):
         def __len__(self):
             return 2
 
-    recording = SimpleNamespace(exp_id=BATCH, chip="P1", well=0, DIV=7, plate_date=260813)
+    recording = SimpleNamespace(batch_id=BATCH, chip="P1", well=0, DIV=7, plate_date=260813)
     out = io.save_burst_data(FakeBurstSet(), config.burst_data_dir, recording)
     log = tx.read(config)
     assert [t.op for t in log] == ["bursts.saved"]
-    assert log[0].exp_id == BATCH and log[0].chip == "P1" and log[0].div == 7
+    assert log[0].batch_id == BATCH and log[0].chip == "P1" and log[0].div == 7
     assert log[0].data == {"path": str(out), "n_bursts": 2}
 
 
@@ -279,13 +286,13 @@ def test_ingest_journals_each_well(config, tmp_path):
         plate_date=260813,
         chip="P1",
         div=9,
-        exp_id="stim1",
+        experiment="stim1",
         system="M1",
         on_progress=lambda _: None,
     )
     log = tx.read(config)
     assert [t.op for t in log] == ["recording.ingested"]
-    assert log[0].exp_id == "stim1" and log[0].batch_id == BATCH and log[0].div == 9
+    assert log[0].experiment == "stim1" and log[0].batch_id == BATCH and log[0].div == 9
     assert log[0].data == {
         "source": str(src), "path": str(written[0]), "moved": False, "kind": "experiment", "system": "M1",
     }
@@ -301,10 +308,10 @@ def test_rebuild_registry_journals_once(config, make_well):
     assert tx.read(config)[-1].data["n_recordings"] == 1
 
 
-def test_for_culture_matches_by_batch_or_exp_id_and_includes_batch_level(config):
+def test_for_culture_matches_by_batch_and_includes_batch_level(config):
     tx.record(config, "activity_scan.registered", batch_id=BATCH, plate_date=260813, chip="P1", well=0, div=7)
-    tx.record(config, "preprocessed.saved", exp_id=BATCH, chip="P1", well=0, div=7)  # older flow: exp id only
-    tx.record(config, "preprocessed.saved", exp_id=BATCH, chip="P1", well=1, div=7)  # another well
+    _legacy_line(config, "preprocessed.saved", exp_id=BATCH, chip="P1", well=0, div=7)  # older flow: exp id only
+    tx.record(config, "preprocessed.saved", batch_id=BATCH, chip="P1", well=1, div=7)  # another well
     tx.record(
         config,
         "activity_scan.registered",
@@ -323,7 +330,7 @@ def test_for_culture_matches_by_batch_or_exp_id_and_includes_batch_level(config)
 def test_reading_follows_a_batch_rename(config):
     old, new = "summer2026_batch1_DRG", BATCH
     tx.record(config, "activity_scan.registered", batch_id=old, plate_date=260813, chip="P1", well=0, div=7)
-    tx.record(config, "preprocessed.saved", exp_id=old, chip="P1", well=0, div=7)  # older flow: exp id only
+    _legacy_line(config, "preprocessed.saved", exp_id=old, chip="P1", well=0, div=7)  # older flow: exp id only
     tx.record(config, "culture.mark_dead", batch_id=old, plate_date=260813, chip="P1", well=0)
     tx.record(
         config, "chip.set_device", batch_id=old, plate_date=260813, chip="P1", data={"device": "MaxOne+"}
@@ -333,8 +340,8 @@ def test_reading_follows_a_batch_rename(config):
     tx.record(config, "note", batch_id=old, plate_date=270101, note="a later batch reusing the old id")
 
     log = tx.read(config)
-    assert [t.batch_id or t.exp_id for t in log[:6]] == [new] * 6
-    assert (log[1].batch_id, log[1].exp_id) == ("", new)  # the exp-id-only record follows too
+    assert [t.batch_id for t in log[:6]] == [new] * 6
+    assert (log[1].batch_id, log[1].experiment) == (new, "")  # the exp-id-only record follows too
     assert log[4].data == {"old": old, "new": new}  # the rename record remembers what it was
     assert log[6].batch_id == old  # a record after the rename is left as written
     assert [t.op for t in tx.for_culture(log, new, 260813, "P1", 0)] == [
@@ -352,6 +359,17 @@ def test_reading_follows_a_batch_rename(config):
     assert json.loads(config.transactions_path.read_text().splitlines()[0])["batch_id"] == old
 
 
+def test_a_legacy_line_naming_an_experiment_reads_it_as_the_experiment(config):
+    """Before batch_id was the identity, an ingested experiment's lines carried both ids."""
+    _legacy_line(config, "recording.ingested", batch_id=BATCH, exp_id="stim1", chip="P1", well=0, div=9)
+    _legacy_line(config, "activity_scan.registered", batch_id=BATCH, exp_id=BATCH, chip="P1", well=0, div=9)
+
+    ingested, scanned = tx.read(config)
+    assert (ingested.batch_id, ingested.experiment) == (BATCH, "stim1")
+    assert (scanned.batch_id, scanned.experiment) == (BATCH, "")
+    assert not hasattr(ingested, "exp_id")
+
+
 def test_renames_chain(config):
     a, b, c = "summer2026_batch1_DRG", "fall2026_batch1_DRG", "fall2026_batch9_DRG"
     tx.record(config, "batch.mark_dead", batch_id=a, plate_date=260813)
@@ -366,9 +384,9 @@ def test_renames_chain(config):
 
 def test_journal_ops_need_their_identity(config):
     with pytest.raises(ValueError):
-        tx.record(config, "preprocessed.saved", exp_id="x", chip="P1", well=0)  # no DIV
+        tx.record(config, "preprocessed.saved", batch_id="x", chip="P1", well=0)  # no DIV
     with pytest.raises(ValueError):
-        tx.record(config, "bursts.saved", chip="P1", well=0, div=1)  # neither batch nor exp id
+        tx.record(config, "bursts.saved", chip="P1", well=0, div=1)  # no batch
     tx.record(config, "registry.rebuilt", data={"n_recordings": 0})  # store-level needs nothing
     assert tx.read(config)[0].scope == "store"
 

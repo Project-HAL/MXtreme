@@ -21,13 +21,14 @@ def test_extract_reads_embedded_metadata():
     data = extract.extract(str(_P004722))
     assert list(data) == [0]                     # MaxOne -> single well
     well = data[0]
-    assert well["exp_id"] == "m1BurstTrainer"
+    # A blob written before 'Batch ID' existed: its 'Exp ID' is read as the batch.
+    assert well["batch_id"] == "m1BurstTrainer" and well["experiment"] == ""
     assert well["chip"] == "P004722"
     assert well["DIV"] == 48
     assert well["well"] == 0
-    for key in ("data", "samp_rate", "mapping", "lsb", "raw_start"):
+    for key in ("spike_data", "samp_rate", "mapping", "lsb", "raw_start"):
         assert key in well
-    assert well["data"].shape[0] > 0
+    assert well["spike_data"].shape[0] > 0
 
 
 def test_extract_propagates_phases_metadata():

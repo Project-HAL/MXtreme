@@ -1,49 +1,44 @@
-import os
+"""Spatial layout of a recording: where on the array its electrodes are, and how they're spread.
+
+Recording level: :func:`spatial_metrics` describes one recording's electrode configuration.
+
+Group level: :func:`summarize_spatial` / :func:`plot_spatial_summary` take a ``RecordingID``,
+``CultureID``, ``CultureSelector`` or several selectors, as in :mod:`~mxtreme.analysis.activity`.
+
+Culture level: :func:`plot_mea_layouts` draws each distinct electrode configuration a culture was
+recorded with. There is no population version: overlaying absolute electrode positions from cultures
+on different physical chips isn't meaningful the way averaging a scalar is.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-from pathlib import Path
 from scipy.spatial import ConvexHull
 from scipy.spatial.distance import cdist
 
-from mxtreme import io
-from mxtreme import device
+from mxtreme import device, io
 from mxtreme import visualizations as viz
+from mxtreme.config import Config
+from mxtreme.identity import CultureID
+from mxtreme.paths import CulturePaths, resolve_paths
 from mxtreme.recording import Recording
-from mxtreme.analysis._paths import _summary_paths, load_population_summaries
-from mxtreme.analysis._plotting import plot_metric_grid
-from mxtreme.analysis._stats import aggregate_by_div_phase
+from mxtreme.analysis._group import SummarySpec, culture_summary, fill_docs, plot_summary, summarize
+from mxtreme.analysis._paths import recording_label
+
+__all__ = ["spatial_metrics", "summarize_spatial", "plot_spatial_summary", "plot_mea_layouts"]
 
 
-def _load_channelmaps(cpath):
-    """{div: (channelmap, stim_elecs)} for every recording in a culture. Not cached by
-    use_existing since the plotting functions below always need the raw arrays, not a tabular
-    summary of them."""
-    channelmaps = {}
-    for div in cpath.recordings:
-        npz = cpath.recordings[div].npz
-        rec = Recording(0, io.load_preprocessed(npz))
-        channelmaps[div] = (rec.channelmap, rec.stim_elecs)
-    return channelmaps
-
-
-def compute_spatial_metrics(channelmap):
-    """
-    Spatial spread metrics for a recording's electrode configuration.
-
-    :param channelmap: (n_electrodes, 5) array [index, channel, electrode, x_um, y_um]
-    :return: dict of metrics
-    """
-    xy = channelmap[:, 3:5]
+def _metrics(channelmap) -> dict:
+    """Electrode-spread metrics of a ``(n, 5)`` channel map (``index, channel, electrode, x, y``)."""
+    xy = np.asarray(channelmap)[:, 3:5]
     n_electrodes = xy.shape[0]
+    centroid_x, centroid_y = xy.mean(axis=0) if n_electrodes else (np.nan, np.nan)
 
-    centroid_x, centroid_y = xy.mean(axis=0)
-
-    if n_electrodes >= 3:
-        hull_area_um2 = ConvexHull(xy).volume  # 2D points -> ConvexHull.volume is the area
-    else:
-        hull_area_um2 = np.nan
-
+    hull_area_um2 = ConvexHull(xy).volume if n_electrodes >= 3 else np.nan  # 2-D: volume is the area
     chip_area_um2 = (device.CHIP_WIDTH * device.ELEC_SIZE) * (device.CHIP_HEIGHT * device.ELEC_SIZE)
     pct_chip_covered = 100 * hull_area_um2 / chip_area_um2 if not np.isnan(hull_area_um2) else np.nan
     electrode_density = n_electrodes / hull_area_um2 if hull_area_um2 else np.nan
@@ -52,197 +47,152 @@ def compute_spatial_metrics(channelmap):
         dists = cdist(xy, xy)
         np.fill_diagonal(dists, np.inf)
         nn_dists = dists.min(axis=1)
-        mean_nn_distance_um = nn_dists.mean()
-        median_nn_distance_um = np.median(nn_dists)
+        mean_nn, median_nn = nn_dists.mean(), np.median(nn_dists)
     else:
-        mean_nn_distance_um = np.nan
-        median_nn_distance_um = np.nan
+        mean_nn = median_nn = np.nan
 
     return {
-        'n_electrodes':          n_electrodes,
-        'centroid_x_um':         centroid_x,
-        'centroid_y_um':         centroid_y,
-        'hull_area_um2':         hull_area_um2,
-        'pct_chip_covered':      pct_chip_covered,
-        'mean_nn_distance_um':   mean_nn_distance_um,
-        'median_nn_distance_um': median_nn_distance_um,
-        'electrode_density':     electrode_density,
+        "n_electrodes": n_electrodes,
+        "centroid_x_um": centroid_x,
+        "centroid_y_um": centroid_y,
+        "hull_area_um2": hull_area_um2,
+        "pct_chip_covered": pct_chip_covered,
+        "mean_nn_distance_um": mean_nn,
+        "median_nn_distance_um": median_nn,
+        "electrode_density": electrode_density,
     }
 
 
-def mea_layout_summary(cpath, analysis_dir: Path, use_existing=True, show_plot=True, save_plot=False):
+# --- recording level ------------------------------------------------------------------------------
+
+
+def spatial_metrics(rec: Recording, analysis_dir=None, *, save: bool = True) -> pd.DataFrame:
+    """Spread of one recording's electrodes over the array.
+
+    The configuration is fixed for a recording, so there is one row (phase ``"full"``).
+
+    :param rec: The recording.
+    :param analysis_dir: Analysis output root; saved there as ``..._spatial_metrics.csv`` when ``save``
+        is on.
+    :param save: Write the result (needs ``analysis_dir``).
+    :returns: One row: ``phase``, ``n_electrodes``, ``centroid_x_um`` / ``centroid_y_um``,
+        ``hull_area_um2`` (convex hull of the electrodes), ``pct_chip_covered`` (that hull as a % of the
+        array), ``mean_nn_distance_um`` / ``median_nn_distance_um`` (distance from each electrode to
+        its nearest recorded neighbour -- how tightly the electrodes are packed), and
+        ``electrode_density`` (electrodes per µm² of hull).
     """
-    Visualizes the MEA electrode configuration (core.visualizations.MEA) for a culture. Plots
-    one panel per distinct electrode configuration found across the culture's DIVs -- a single
-    panel if the configuration never changes, otherwise one per DIV (or DIV group) so any change
-    over time is visible.
+    df = pd.DataFrame([{"phase": "full", **_metrics(rec.channelmap)}])
+
+    if save and analysis_dir is not None:
+        out_dir = Path(analysis_dir) / "spatial" / str(rec.batch_id) / str(rec.chip) / f"well{rec.well}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / io.recording_file_name(rec.DIV, rec.plate_date, rec.chip, rec.batch_id,
+                                                rec.well, "spatial_metrics.csv", rec.experiment or "")
+        df.to_csv(path, index=False)
+        print(f"Saved spatial metrics to {path}")
+    return df
+
+
+# --- group level ----------------------------------------------------------------------------------
+
+_SPEC = SummarySpec(
+    title="Electrode Layout",
+    metrics=[
+        ("n_electrodes",        None, "Electrode count",                 "Electrode Count"),
+        ("pct_chip_covered",    None, "Chip covered (%)",                "Chip Coverage"),
+        ("mean_nn_distance_um", None, "Mean nearest-neighbour dist. (µm)", "Electrode Spacing"),
+        ("electrode_density",   None, "Electrodes / µm²",                "Electrode Density"),
+    ],
+)
+
+
+def _spatial_rows(rp) -> list[dict]:
+    rec = Recording(0, io.load_preprocessed(rp.npz))
+    return [{"div": rp.recording_id.div, "experiment": rp.recording_id.experiment or "",
+             "phase": "full", **_metrics(rec.channelmap)}]
+
+
+def _culture_spatial_summary(cpath, analysis_dir: Path, use_existing: bool = True) -> pd.DataFrame:
+    """Per-culture spatial metrics (one row per recording), cached."""
+    return culture_summary(cpath, analysis_dir, "spatial", "spatial_summary", _spatial_rows, use_existing)
+
+
+def summarize_spatial(target, config: Config, *, use_existing: bool = True) -> pd.DataFrame:
+    """Table of electrode-spread metrics: one row per recording (columns as in :func:`spatial_metrics`).
+
+    Identity columns lead: ``batch_id, culture_id, chip, well, div, experiment, phase``, plus ``group``
+    when several selectors are given.
+
+    {target}
+    :param use_existing: Reuse cached per-culture summaries; ``False`` recomputes the target's
+        recordings.
+    :returns: The summary table.
     """
-    cid = cpath.culture_id
+    return summarize(target, config, _culture_spatial_summary, use_existing=use_existing)[0]
 
-    save_path, csv_path = _summary_paths(cpath, analysis_dir, "spatial", "mea_layout_summary")
 
-    channelmaps = None
+def plot_spatial_summary(target, config: Config, *, split_by: str = "phase", error: str = "sem",
+                         show_plot: bool = True, save_path=None):
+    """Four-panel electrode-spread summary: electrode count, chip coverage, spacing, density, vs DIV.
 
-    if use_existing and csv_path.exists():
-        print(f"Loading existing summary from {csv_path}")
-        summary_df = pd.read_csv(csv_path)
+    {plot_doc}
+    """
+    return plot_summary(target, config, _culture_spatial_summary, _SPEC, split_by=split_by,
+                        error=error, show_plot=show_plot, save_path=save_path)
+
+
+fill_docs(summarize_fns=(summarize_spatial,), plot_fns=((plot_spatial_summary, None),))
+# One phase only, so the shared plot docstring's phase notes don't apply.
+plot_spatial_summary.__doc__ = plot_spatial_summary.__doc__.replace(
+    """    :param phase: The phase to plot. Required in effect when splitting by experiment or comparing
+        groups (defaults to the first phase); otherwise ``None`` plots every phase.
+""", "")
+
+
+# --- culture level --------------------------------------------------------------------------------
+
+
+def plot_mea_layouts(culture, config: Config, *, show_plot: bool = True, save_path=None):
+    """The electrode configurations one culture was recorded with, drawn on the array.
+
+    Recordings sharing an identical configuration collapse into one panel, so a culture whose layout
+    never changed gets a single panel, and any change over time shows up as a new one.
+
+    :param culture: A :class:`~mxtreme.identity.CultureID`.
+    :param config: The :class:`~mxtreme.config.Config` describing the store.
+    :param show_plot: Show the figure.
+    :param save_path: Full path (including filename) to save the figure to.
+    :returns: The matplotlib Figure (``None`` if the culture has no recordings).
+    """
+    if isinstance(culture, CulturePaths):
+        cpath = culture
+    elif isinstance(culture, CultureID):
+        cpath = resolve_paths(culture, config)
     else:
-        channelmaps = _load_channelmaps(cpath)
+        raise TypeError(f"Pass a CultureID, not {type(culture).__name__}.")
 
-        summary_df = pd.DataFrame([
-            {'culture_id': str(cid), 'div': div, 'phase': 'full', 'n_electrodes': cmap.shape[0]}
-            for div, (cmap, _) in channelmaps.items()
-        ])
-
-        os.makedirs(save_path, exist_ok=True)
-        summary_df.to_csv(csv_path, index=False)
-        print(f"Saved summary to {save_path}")
-
-    if show_plot or save_plot:
-        if channelmaps is None:
-            channelmaps = _load_channelmaps(cpath)
-        _plot_mea_layout_summary(channelmaps, cid, analysis_dir=save_path, show_plot=show_plot, save_plot=save_plot)
-
-    return summary_df
-
-
-def _plot_mea_layout_summary(channelmaps, cid, analysis_dir: Path, show_plot=True, save_plot=False):
-    """One viz.MEA() panel per distinct electrode configuration across the culture's DIVs."""
-
-    divs = sorted(channelmaps.keys())
-
-    # Group DIVs that share an identical electrode configuration so unchanged layouts collapse
-    # into one panel instead of a wall of duplicates.
-    groups = []  # list of [divs], channelmap, stim_elecs
-    for div in divs:
-        cmap, stim_elecs = channelmaps[div]
-        match = next((g for g in groups if np.array_equal(g[1], cmap)), None)
+    groups = []  # ([(div, experiment), ...], channelmap, stim_elecs)
+    for rp in cpath.recordings:
+        rec = Recording(0, io.load_preprocessed(rp.npz))
+        key = (rp.recording_id.div, rp.recording_id.experiment or "")
+        match = next((g for g in groups if np.array_equal(g[1], rec.channelmap)), None)
         if match:
-            match[0].append(div)
+            match[0].append(key)
         else:
-            groups.append(([div], cmap, stim_elecs))
+            groups.append(([key], rec.channelmap, rec.stim_elecs))
+    if not groups:
+        return None
 
-    n_panels = len(groups)
-    ncols = min(3, n_panels)
-    nrows = -(-n_panels // ncols)
-
+    ncols = min(3, len(groups))
+    nrows = -(-len(groups) // ncols)
     fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 5 * nrows), squeeze=False)
     axes = axes.flatten()
-
-    for ax, (div_group, cmap, stim_elecs) in zip(axes, groups):
-        title = f"DIV {','.join(str(d) for d in div_group)}"
-        viz.MEA(ax, cmap, stim_elecs, title=title)
-
+    for ax, (keys, cmap, stim_elecs) in zip(axes, groups):
+        viz.MEA(cmap, ax=ax, stim_elecs=stim_elecs, title=", ".join(recording_label(*k) for k in keys))
     for ax in axes[len(groups):]:
         ax.set_visible(False)
 
-    config_note = f' ({n_panels} configurations across DIVs)' if n_panels > 1 else ''
-    fig.suptitle(f'MEA Layout — {cid}{config_note}', fontsize=13, fontweight='bold')
+    note = f" ({len(groups)} configurations)" if len(groups) > 1 else ""
+    fig.suptitle(f"MEA Layout — {cpath.culture_id}{note}", fontsize=13, fontweight="bold")
     fig.tight_layout()
-
-    if save_plot:
-        os.makedirs(analysis_dir, exist_ok=True)
-        plot_path = analysis_dir / f"{cid}_mea_layout_summary.png"
-        fig.savefig(plot_path, dpi=150, bbox_inches='tight')
-        print(f"Saved plot → {plot_path}")
-
-    if show_plot:
-        plt.show()
-    else:
-        plt.close(fig)
-
-
-def spatial_summary(cpath, analysis_dir: Path, use_existing=True, show_plot=True, save_plot=False):
-    """Electrode spread metrics (compute_spatial_metrics) per DIV for a culture."""
-
-    cid = cpath.culture_id
-
-    save_path, csv_path = _summary_paths(cpath, analysis_dir, "spatial", "spatial_summary")
-
-    if use_existing and csv_path.exists():
-        print(f"Loading existing summary from {csv_path}")
-        summary_df = pd.read_csv(csv_path)
-    else:
-        rows = []
-        for div in cpath.recordings:
-            npz = cpath.recordings[div].npz
-            rec = Recording(0, io.load_preprocessed(npz))
-
-            rows.append({
-                'culture_id': str(cid),
-                'div': div,
-                'phase': 'full',
-                **compute_spatial_metrics(rec.channelmap),
-            })
-
-        summary_df = pd.DataFrame(rows)
-
-        os.makedirs(save_path, exist_ok=True)
-        summary_df.to_csv(csv_path, index=False)
-        print(f"Saved summary to {save_path}")
-
-    if show_plot or save_plot:
-        _plot_spatial_summary(summary_df, cid, analysis_dir=save_path, show_plot=show_plot, save_plot=save_plot)
-
-    return summary_df
-
-
-def _plot_spatial_summary(df: pd.DataFrame, cid, analysis_dir: Path, show_plot=True, save_plot=False):
-    """Four-panel grid of electrode-spread metrics vs DIV (see compute_spatial_metrics)."""
-
-    metrics = [
-        # (y_col,                  err_col,  y_label,                  panel_title)
-        ('n_electrodes',           None,   'Electrode count',          'Electrode Count'),
-        ('pct_chip_covered',       None,   'Chip covered (%)',         'Chip Coverage'),
-        ('mean_nn_distance_um',    None,   'Mean NN distance (µm)',    'Electrode Spacing'),
-        ('electrode_density',      None,   'Electrodes / µm²',         'Electrode Density'),
-    ]
-
-    save_path = (analysis_dir / f"{cid}_spatial_summary.png") if save_plot else None
-
-    plot_metric_grid(
-        df, metrics,
-        suptitle=f'Spatial Summary — {cid}',
-        save_path=save_path,
-        show_plot=show_plot,
-        figsize=(11, 8),
-        dpi=150,
-    )
-
-
-def plot_population_spatial_summary(sel_paths, analysis_dir: Path, savename: str = None):
-    """
-    Aggregate per-culture spatial (electrode spread) summaries and plot population-level
-    measures (mean ± SEM across cultures) vs DIV.
-
-    No MEA-layout population counterpart -- overlaying absolute electrode positions across
-    cultures on different physical chips isn't meaningful the way averaging a scalar metric is;
-    mea_layout_summary is a per-culture-only diagnostic.
-    """
-    pop_df = load_population_summaries(
-        sel_paths, data_dir=analysis_dir / "spatial", suffix='spatial_summary'
-    )
-
-    n_cultures = pop_df['culture_id'].nunique()
-    n_exps     = len(sel_paths)
-    exp_ids    = list(sel_paths.keys())
-
-    stats = aggregate_by_div_phase(
-        pop_df, value_cols=['n_electrodes', 'pct_chip_covered', 'mean_nn_distance_um', 'electrode_density']
-    )
-
-    metrics = [
-        # (y_col,                err_col,                     y_label,                 panel_title)
-        ('n_electrodes',        'sem_n_electrodes',          'Electrode count',       'Electrode Count'),
-        ('pct_chip_covered',    'sem_pct_chip_covered',      'Chip covered (%)',      'Chip Coverage'),
-        ('mean_nn_distance_um', 'sem_mean_nn_distance_um',   'Mean NN distance (µm)', 'Electrode Spacing'),
-        ('electrode_density',   'sem_electrode_density',     'Electrodes / µm²',      'Electrode Density'),
-    ]
-
-    exp_label = f"{n_exps} experiments pooled ({', '.join(exp_ids)})" if n_exps > 1 else exp_ids[0]
-    suptitle = f'Population Spatial Summary — {exp_label}\nmean ± SEM, n = {n_cultures} cultures'
-
-    save_path = (Path(analysis_dir) / "spatial" / savename) if savename else None
-
-    plot_metric_grid(stats, metrics, suptitle=suptitle, save_path=save_path,
-                      show_plot=True, figsize=(11, 8), dpi=300)
+    return viz.finish_figure(fig, save_path=save_path, show_plot=show_plot)

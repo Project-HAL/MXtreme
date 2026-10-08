@@ -14,13 +14,14 @@ deleted; a correction is another line. A partial line from a crash mid-write cos
 and a line that does not parse is skipped on read rather than hiding everything before it.
 
 Each record carries ``time`` (ISO 8601, local time with offset), ``op`` (see :data:`OPS`), as much
-identity as the operation has -- ``batch_id``, ``plate_date``, ``exp_id``, ``chip``, ``well``,
-``div`` -- who did it (``actor``, defaulting to the OS user for MXtreme's own journal entries), a
+identity as the operation has -- ``batch_id``, ``plate_date``, ``chip``, ``well``, ``div``, and
+``experiment`` for an ingested experiment's recordings -- who did it (``actor``, defaulting to the OS user for MXtreme's own journal entries), a
 free-text ``note`` and any op-specific ``data`` (paths written, counts, the device declared).
 
-Identity is recorded as the writer knows it. A scan knows its batch; a preprocessed ``.npz`` written
-from an older flow may know only its ``exp_id`` (which, for scans, *is* the batch id). Readers that
-want one culture's entries use :func:`for_culture`, which matches either way.
+Lines written before ``batch_id`` was the identity may carry an ``exp_id`` instead, which for
+anything MXtreme scanned *is* the batch id. The file is never rewritten; readers fold it into
+``batch_id`` (or, where a line has both and they differ, into ``experiment``) as they read
+(:func:`iter_transactions`). Readers that want one culture's entries use :func:`for_culture`.
 
 A batch keeps its history through a rename. :func:`mxtreme.store.rename_batch` journals a
 ``batch.renamed`` against the new id, and readers apply it to the records before it: everything
@@ -76,7 +77,7 @@ OPS: dict[str, str] = {
 #: Ops whose identity is validated the way the recordings tree validates it (a real batch id, a
 #: ``YYMMDD`` plate date). These come from people, typed or clicked, and a placeholder identity
 #: would make a decision about nothing. MXtreme's own journal entries carry whatever the writer
-#: knew, which for an older flow can be an ``exp_id`` alone.
+#: knew, which need not be a batch id in the current convention (or a plate date).
 STRICT_OPS = frozenset(
     {
         "culture.mark_dead",
@@ -115,9 +116,10 @@ class Transaction:
 
     :param time: When it was recorded, ISO 8601.
     :param op: One of :data:`OPS`.
-    :param batch_id: The batch the record is about; ``""`` when the writer knew only an exp id.
+    :param batch_id: The batch the record is about; ``""`` for store-level ops.
     :param plate_date: Its plating date (``YYMMDD``), or ``None`` when unknown.
-    :param exp_id: The experiment the record is about (the batch id, for scans); ``""`` if none.
+    :param experiment: The ingested experiment the record is about; ``""`` for scans and anything
+        not about one recording.
     :param chip: The chip, for chip-, culture- and recording-level ops; ``None`` otherwise.
     :param well: The well, for culture- and recording-level ops; ``None`` otherwise.
     :param div: Days *in vitro*, for recording-level ops; ``None`` otherwise.
@@ -130,7 +132,7 @@ class Transaction:
     op: str
     batch_id: str = ""
     plate_date: int | None = None
-    exp_id: str = ""
+    experiment: str = ""
     chip: str | None = None
     well: int | None = None
     div: int | None = None
@@ -209,7 +211,7 @@ def record(
     *,
     batch_id: str | Batch | None = None,
     plate_date=None,
-    exp_id: str | None = None,
+    experiment: str | None = None,
     chip: str | None = None,
     well: int | None = None,
     div: int | None = None,
@@ -228,10 +230,10 @@ def record(
     :param config: The :class:`~mxtreme.config.Config` of the store, or a path to the log file (see
         :func:`transactions_path_for`), or the store's root directory.
     :param op: One of :data:`OPS`.
-    :param batch_id: The batch, as a :class:`~mxtreme.store.Batch` or its id string. Optional for
-        MXtreme's journal ops, where an older flow may know only ``exp_id``.
+    :param batch_id: The batch, as a :class:`~mxtreme.store.Batch` or its id string. Required for
+        every op below store level; validated in full for the strict ops.
     :param plate_date: The plating date, ``YYMMDD``. Required with ``batch_id`` for strict ops.
-    :param exp_id: The experiment name (a scan's is its batch id).
+    :param experiment: An ingested experiment's name, for a record about one of its recordings.
     :param chip: Chip serial; required for chip-, culture- and recording-level ops.
     :param well: Well number; required for culture- and recording-level ops.
     :param div: Days *in vitro*; required for recording-level ops.
@@ -265,8 +267,8 @@ def record(
         raise ValueError(f"{op} needs a well.")
     if scope == "recording" and div is None:
         raise ValueError(f"{op} needs a DIV.")
-    if scope in ("batch", "chip", "culture", "recording") and not batch_id and not exp_id:
-        raise ValueError(f"{op} needs a batch id or an exp id.")
+    if scope in ("batch", "chip", "culture", "recording") and not batch_id:
+        raise ValueError(f"{op} needs a batch id.")
     if op == "chip.set_device" and data.get("device") not in DEVICES:
         raise ValueError(f"chip.set_device needs data['device'] in {DEVICES}, got {data.get('device')!r}.")
     if op == "treatment.applied":
@@ -279,7 +281,7 @@ def record(
         op=op,
         batch_id=batch_id,
         plate_date=plate_date,
-        exp_id="" if exp_id is None else str(exp_id),
+        experiment="" if experiment is None else str(experiment),
         chip=chip,
         well=well,
         div=div,
@@ -361,7 +363,7 @@ def iter_transactions(config) -> Iterator[Transaction]:
     them rather than nothing.
 
     A ``batch.renamed`` record (written by :func:`mxtreme.store.rename_batch`) is applied to the
-    records before it: a ``batch_id`` or ``exp_id`` equal to the old id reads back as the new one,
+    records before it: a ``batch_id`` equal to the old id reads back as the new one,
     so marks, scans and analyses journaled before the rename still belong to the batch afterwards,
     and the folds (:func:`batch_states`, :func:`culture_states`, :func:`chip_devices`) key on the
     name the store has now. Records *after* the rename are left as written -- a later batch may
@@ -383,13 +385,7 @@ def _follow_renames(transactions: Iterable[Transaction]) -> list[Transaction]:
 
 
 def _under_new_id(tx: Transaction, old: str, new: str) -> Transaction:
-    if tx.batch_id != old and tx.exp_id != old:
-        return tx
-    return replace(
-        tx,
-        batch_id=new if tx.batch_id == old else tx.batch_id,
-        exp_id=new if tx.exp_id == old else tx.exp_id,
-    )
+    return replace(tx, batch_id=new) if tx.batch_id == old else tx
 
 
 def _iter_raw(config) -> Iterator[Transaction]:
@@ -406,12 +402,13 @@ def _iter_raw(config) -> Iterator[Transaction]:
                 obj = json.loads(raw)
                 if not isinstance(obj, dict) or obj.get("op") not in OPS:
                     continue
+                batch_id, experiment = _line_identity(obj)
                 yield Transaction(
                     time=str(obj["time"]),
                     op=str(obj["op"]),
-                    batch_id=str(obj.get("batch_id") or ""),
+                    batch_id=batch_id,
                     plate_date=_int_or_none(obj.get("plate_date"), "plate_date"),
-                    exp_id=str(obj.get("exp_id") or ""),
+                    experiment=experiment,
                     chip=None if obj.get("chip") is None else str(obj["chip"]),
                     well=_int_or_none(obj.get("well"), "well"),
                     div=_int_or_none(obj.get("div"), "div"),
@@ -421,6 +418,23 @@ def _iter_raw(config) -> Iterator[Transaction]:
                 )
             except (ValueError, KeyError, TypeError, AttributeError):
                 continue
+
+
+def _line_identity(obj: dict) -> tuple[str, str]:
+    """``(batch_id, experiment)`` of one log line, folding in a legacy ``exp_id``.
+
+    A line written before ``batch_id`` was the identity may carry ``exp_id`` alone -- the batch id,
+    for anything MXtreme scanned -- or both, where an ``exp_id`` differing from the batch named an
+    ingested experiment.
+    """
+    batch_id = str(obj.get("batch_id") or "")
+    experiment = str(obj.get("experiment") or "")
+    legacy = str(obj.get("exp_id") or "")
+    if legacy and not batch_id:
+        batch_id = legacy
+    elif legacy and legacy != batch_id and not experiment:
+        experiment = legacy
+    return batch_id, experiment
 
 
 def read(config) -> list[Transaction]:
@@ -434,14 +448,10 @@ def read(config) -> list[Transaction]:
 def _same_batch(tx: Transaction, batch_id: str, plate_date: int | None) -> bool:
     """Whether a record is about ``batch_id``.
 
-    A record that knows its batch says so; one from an older flow knows only its ``exp_id``, which
-    for anything MXtreme scanned is the batch id. A plate date, when both sides have one, has to
-    agree -- a chip is re-plated across batches and an id could in principle be reused.
+    A plate date, when both sides have one, has to agree -- a chip is re-plated across batches and
+    an id could in principle be reused.
     """
-    if tx.batch_id:
-        if tx.batch_id != batch_id:
-            return False
-    elif tx.exp_id != batch_id:
+    if tx.batch_id != batch_id:
         return False
     return plate_date is None or tx.plate_date is None or int(tx.plate_date) == int(plate_date)
 
@@ -507,6 +517,7 @@ def backfill(config, *, on_progress=print) -> int:
     """
     import pandas as pd
 
+    from mxtreme.io import read_burst_log, read_registry
     from mxtreme.store import find_chip_dir
 
     def _when(value) -> str:
@@ -523,24 +534,24 @@ def backfill(config, *, on_progress=print) -> int:
         except (ValueError, TypeError, OverflowError):
             return _now()
 
-    existing = {(t.op, t.batch_id or t.exp_id, str(t.chip), t.well, t.div) for t in iter_transactions(config)}
+    existing = {(t.op, t.batch_id, str(t.chip), t.well, t.div, t.experiment) for t in iter_transactions(config)}
     added = 0
 
     registry = Path(config.registry_path)
     if registry.is_file():
-        df = pd.read_csv(registry).fillna("")
+        df = read_registry(registry).fillna("")
         for row in df.to_dict("records"):
             op = _KIND_OPS.get(str(row.get("kind") or "preprocessed"))
             if op is None:
                 continue
-            batch_id, exp_id = str(row.get("batch_id") or ""), str(row.get("exp_id") or "")
+            batch_id, experiment = str(row.get("batch_id") or ""), str(row.get("experiment") or "")
             chip, well, div = (
                 str(row.get("chip")),
                 _int_or_none(row.get("well"), "well"),
                 _int_or_none(row.get("div"), "div"),
             )
-            key = (op, batch_id or exp_id, chip, well, div)
-            if key in existing or well is None or div is None:
+            key = (op, batch_id, chip, well, div, experiment)
+            if key in existing or well is None or div is None or not batch_id:
                 continue
             path = ""
             plate_date = _int_or_none(row.get("plate_date") or None, "plate_date")
@@ -549,7 +560,7 @@ def backfill(config, *, on_progress=print) -> int:
                     tail = {
                         "activity_scan.registered": "_activity_scan",
                         "network_scan.registered": "_network_scan",
-                    }.get(op, f"_{exp_id}")
+                    }.get(op, f"_{experiment}")
                     chip_path = find_chip_dir(config, batch_id, plate_date, chip)
                     div_dir = chip_path / f"well_{well}" / f"DIV_{div}" if chip_path else None
                     matches = (
@@ -561,15 +572,16 @@ def backfill(config, *, on_progress=print) -> int:
                 except (ValueError, OSError):
                     path = ""
             elif op == "preprocessed.saved":
-                well_dir = Path(config.preprocessed_dir) / (exp_id or batch_id) / chip / f"well{well}"
-                matches = sorted(well_dir.glob(f"DIV{div}_*exp_data.npz")) if well_dir.is_dir() else []
+                well_dir = Path(config.preprocessed_dir) / batch_id / chip / f"well{well}"
+                tail = f"well{well}_{experiment}_" if experiment else f"well{well}_"
+                matches = sorted(well_dir.glob(f"DIV{div}_*{tail}exp_data.npz")) if well_dir.is_dir() else []
                 path = str(matches[-1]) if matches else ""
             record(
                 config,
                 op,
-                batch_id=batch_id or None,
+                batch_id=batch_id,
                 plate_date=plate_date,
-                exp_id=exp_id,
+                experiment=experiment,
                 chip=chip,
                 well=well,
                 div=div,
@@ -583,20 +595,23 @@ def backfill(config, *, on_progress=print) -> int:
 
     burst_root = Path(config.burst_data_dir)
     for log_path in sorted(burst_root.glob("*_burst_log.csv")) if burst_root.is_dir() else []:
-        df = pd.read_csv(log_path).fillna("")
+        df = read_burst_log(log_path).fillna("")
         for row in df.to_dict("records"):
-            exp_id, chip = str(row.get("exp_id") or ""), str(row.get("chip"))
+            batch_id, chip = str(row.get("batch_id") or ""), str(row.get("chip"))
+            experiment = str(row.get("experiment") or "")
             well, div = _int_or_none(row.get("well"), "well"), _int_or_none(row.get("DIV"), "div")
-            key = ("bursts.saved", exp_id, chip, well, div)
-            if key in existing or well is None or div is None or not exp_id:
+            key = ("bursts.saved", batch_id, chip, well, div, experiment)
+            if key in existing or well is None or div is None or not batch_id:
                 continue
-            well_dir = burst_root / exp_id / chip / f"well{well}"
-            matches = sorted(well_dir.glob(f"DIV{div}_*burst_data.csv")) if well_dir.is_dir() else []
+            well_dir = burst_root / batch_id / chip / f"well{well}"
+            tail = f"well{well}_{experiment}_" if experiment else f"well{well}_"
+            matches = sorted(well_dir.glob(f"DIV{div}_*{tail}burst_data.csv")) if well_dir.is_dir() else []
             n_bursts = _int_or_none(row.get("n_bursts") or None, "n_bursts")
             record(
                 config,
                 "bursts.saved",
-                exp_id=exp_id,
+                batch_id=batch_id,
+                experiment=experiment,
                 plate_date=_int_or_none(row.get("plate_date") or None, "plate_date"),
                 chip=chip,
                 well=well,

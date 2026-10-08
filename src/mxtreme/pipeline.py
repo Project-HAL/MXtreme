@@ -55,8 +55,9 @@ class Pipeline:
     def _apply_steps(self, well_no: int, well: dict) -> dict:
         """Apply every step to one well, logging each step's spike attrition and timing.
 
-        Records a per-step log (step name, spikes before/after, removed, seconds) at INFO level and stashes
-        it in ``well['step_log']``, then logs which step removed the most spikes.
+        Records a per-step log (step name, spikes before/after, removed, seconds) at INFO level and appends
+        it to ``well['step_log']`` -- so a well run through more than one pipeline keeps the history of
+        every pass -- then logs which step removed the most spikes this pass.
 
         :param well_no: Well number (for log context).
         :param well: The well data dict to transform (mutated in place).
@@ -66,11 +67,11 @@ class Pipeline:
         step_log = []
         for step in self.steps:
             name = _step_name(step)
-            n_before = len(well["data"])
+            n_before = len(well["spike_data"])
             t = perf_counter()
             well = step(well)
             seconds = perf_counter() - t
-            n_after = len(well["data"])
+            n_after = len(well["spike_data"])
             pct = (n_after - n_before) / n_before * 100 if n_before else 0.0
             step_log.append(
                 {"step": name, "n_before": n_before, "n_after": n_after,
@@ -79,7 +80,7 @@ class Pipeline:
             logger.info("well %s | %-28s %s -> %s (%+.1f%%) %.2fs",
                         well_no, name, f"{n_before:,}", f"{n_after:,}", pct, seconds)
 
-        well["step_log"] = step_log
+        well["step_log"] = list(well.get("step_log") or []) + step_log
         reducers = [r for r in step_log if r["removed"] > 0]
         if reducers:
             top = max(reducers, key=lambda r: r["removed"])
@@ -131,7 +132,7 @@ class Pipeline:
         saved: list[Path] = []
         for well_no in list(data):
             well = self._apply_steps(well_no, data[well_no])
-            if len(well["data"]) == 0:
+            if len(well["spike_data"]) == 0:
                 logger.info("Well %s has 0 spikes after the pipeline. Skipping...", well_no)
             else:
                 saved.append(io.save_preprocessed(datastore, well, overwrite=overwrite))

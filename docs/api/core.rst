@@ -1,8 +1,7 @@
 Core types
 ==========
 
-The stable, experiment-agnostic objects the rest of the package is built on: what a recording *is*,
-how one is named and located, and the knobs that parameterise a run.
+Objects used to organize and select a set of recordings and perform analyses. 
 
 Recording
 ---------

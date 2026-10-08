@@ -361,8 +361,9 @@ def write_metadata(s: mx.Saving, metadata: dict):
     if not isinstance(metadata["Conditions"], list) or (len(metadata["Well IDs"]) != len(metadata["Conditions"]) and len(metadata["Conditions"])!=0):
         raise ValueError("Conditions must be a list the same length as the number of wells or length 0.")
     
-    if not isinstance(metadata["Exp ID"], str) or not metadata["Exp ID"].strip():
-        raise ValueError("Enter an valid string Experiment ID.")
+    batch_id = metadata.get("Batch ID")
+    if not isinstance(batch_id, str) or not batch_id.strip():
+        raise ValueError("Enter a valid string Batch ID.")
     
     s.write_assay_property("metadata", str(metadata))
 

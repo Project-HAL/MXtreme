@@ -10,7 +10,7 @@ Defaults mirror the historical ``constants.py`` values, so behaviour is unchange
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass(frozen=True)
@@ -55,3 +55,61 @@ class ActivityParams:
     """
 
     isi_threshold_ms: float = 200.0
+
+
+@dataclass(frozen=True)
+class CommunityParams:
+    """Settings for community detection on a functional-connectivity matrix
+    (:func:`mxtreme.analysis.network.communities`).
+
+    :param method: Detection algorithm, by name. ``"louvain"`` is the only one so far; see
+        :func:`~mxtreme.analysis.network.communities` for how more are added.
+    :param resolution: Modularity resolution γ. Above 1 favours more, smaller communities; below 1
+        fewer, larger ones.
+    :param negative: How negative correlations are treated. ``"clip"`` sets them to zero (only
+        positive coupling defines communities); ``"signed"`` keeps them, so anticorrelated electrodes
+        are pushed into different communities (Rubinov & Sporns 2011, asymmetric signed modularity).
+    :param n_runs: Louvain is order-dependent, so it runs this many times, each over a fresh random
+        node order, and keeps the partition with the highest modularity.
+    :param seed: Seed for those node orders, so a result is reproducible.
+    """
+
+    method: str = "louvain"
+    resolution: float = 1.0
+    negative: str = "clip"
+    n_runs: int = 10
+    seed: int = 0
+
+
+@dataclass(frozen=True)
+class NetworkParams:
+    """Settings for the functional-connectivity and PCA analyses in :mod:`mxtreme.analysis.network`.
+
+    The defaults reproduce Sono et al. 2026 (PNAS), whose Fig. 2 correlates and eigendecomposes a
+    double-exponential-filtered spike train rather than the raw binary one.
+
+    :param tau_rise_sec: Rise time constant of the double-exponential filter, in seconds.
+    :param tau_decay_sec: Decay time constant of the double-exponential filter, in seconds.
+    :param sample_bin_sec: Resolution the filtered rate matrix is resampled to before correlation and
+        PCA. Rounded to a whole multiple of the recording's own ``bin_size``. Purely a memory knob:
+        because ``tau_decay_sec`` dominates the signal's bandwidth, coarsening this from 10 ms to
+        250 ms moves every metric below by less than 0.004 on a real recording, while shrinking the
+        rate matrix from 1.5 GB to 59 MB.
+    :param min_var: Electrodes whose filtered rate has variance at or below this are dropped before
+        correlating. A silent electrode has zero variance and would otherwise contribute a whole row
+        and column of NaN.
+    :param chunk_channels: How many electrodes to filter at a time. Bounds peak memory: the filter
+        holds three float32 copies of a chunk at full time resolution.
+    :param var_thresholds: Cumulative-variance fractions to report a component count for, as
+        ``n_pc_<pct>`` columns.
+    :param communities: Community-detection settings behind the ``modularity`` and
+        ``n_communities`` metrics.
+    """
+
+    tau_rise_sec: float = 0.05
+    tau_decay_sec: float = 2.0
+    sample_bin_sec: float = 0.05
+    min_var: float = 0.0
+    chunk_channels: int = 32
+    var_thresholds: tuple[float, ...] = (0.8, 0.9)
+    communities: CommunityParams = field(default_factory=CommunityParams)

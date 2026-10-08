@@ -256,11 +256,10 @@ class NetworkScanParams:
 
         Shaped for :func:`mxtreme.scans.mx_setup.write_metadata`, and therefore for
         :func:`mxtreme.extract.extract`, which reads the same blob back out -- so a network scan
-        extracts and preprocesses like any other recording. A scan has no experiment name, so
-        ``Exp ID`` carries the batch id and the preprocessed tree files the data under its batch.
+        extracts and preprocesses like any other recording. ``Batch ID`` is the scan's identity:
+        the preprocessed tree files its data under its batch.
         """
         return {
-            "Exp ID": self.batch_id,
             "Batch ID": self.batch_id,
             "Chip ID": self.chip,
             "Plate date": self.plate_date,

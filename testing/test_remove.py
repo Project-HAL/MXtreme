@@ -16,12 +16,12 @@ CHIP = "P1"
 
 
 class _Params:
-    exp_id, batch_id, plate_date, chip, div = "", BATCH, PLATE, CHIP, 26
+    batch_id, plate_date, chip, div = BATCH, PLATE, CHIP, 26
     wells, conditions = [0], []
 
 
 class _Recording:
-    exp_id, chip, well, DIV, plate_date = BATCH, CHIP, 0, 26, PLATE
+    batch_id, experiment, chip, well, DIV, plate_date = BATCH, "", CHIP, 0, 26, PLATE
 
 
 class _Bursts:
@@ -54,13 +54,13 @@ def populated(tmp_path):
     pre.mkdir(parents=True)
     npz = pre / f"DIV26_{PLATE}_{CHIP}_{BATCH}_well0_exp_data.npz"
     np.savez(npz, x=np.arange(3))
-    io.register({0: {"exp_id": BATCH, "chip": CHIP, "DIV": 26, "plate_date": PLATE}}, config.registry_path)
+    io.register({0: {"batch_id": BATCH, "chip": CHIP, "DIV": 26, "plate_date": PLATE}}, config.registry_path)
     csv = io.save_burst_data(_Bursts(), config.burst_data_dir, _Recording())
     log = config.burst_data_dir / f"{BATCH}_burst_log.csv"
     pd.DataFrame(
         [
-            {"exp_id": BATCH, "chip": CHIP, "well": 0, "DIV": 26, "n_bursts": 3},
-            {"exp_id": BATCH, "chip": CHIP, "well": 0, "DIV": 19, "n_bursts": 5},
+            {"batch_id": BATCH, "chip": CHIP, "well": 0, "DIV": 26, "n_bursts": 3},
+            {"batch_id": BATCH, "chip": CHIP, "well": 0, "DIV": 19, "n_bursts": 5},
         ]
     ).to_csv(log, index=False)
     return config, activity, network, npz, csv, log
@@ -167,14 +167,14 @@ def test_refuses_files_outside_the_tree(populated, tmp_path):
 def test_unregister_matches_on_the_given_fields_only(tmp_path):
     registry = tmp_path / "registry.csv"
     io.register(
-        {0: {"exp_id": "", "batch_id": BATCH, "chip": CHIP, "DIV": 7, "plate_date": PLATE}},
+        {0: {"batch_id": BATCH, "chip": CHIP, "DIV": 7, "plate_date": PLATE}},
         registry,
         kind="activity_scan",
     )
-    io.register({0: {"exp_id": BATCH, "chip": CHIP, "DIV": 7, "plate_date": PLATE}}, registry)
+    io.register({0: {"batch_id": BATCH, "chip": CHIP, "DIV": 7, "plate_date": PLATE}}, registry)
     assert (
-        io.unregister(registry, chip=CHIP, well=0, div=7, kind="preprocessed", batch_id=BATCH) == 0
-    )  # blank batch_id
-    assert io.unregister(registry, chip=CHIP, well=0, div=7, kind="preprocessed", exp_id=BATCH) == 1
+        io.unregister(registry, chip=CHIP, well=0, div=7, kind="preprocessed", batch_id=BATCH, experiment="x") == 0
+    )  # not that experiment's
+    assert io.unregister(registry, chip=CHIP, well=0, div=7, kind="preprocessed", batch_id=BATCH) == 1
     assert io.unregister(registry, chip=CHIP, well=0, div=7, kind="activity_scan") == 1
     assert io.unregister(registry, chip=CHIP, well=0, div=7, kind="activity_scan") == 0

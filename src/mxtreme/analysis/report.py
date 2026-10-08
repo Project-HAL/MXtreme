@@ -9,7 +9,8 @@ requested analysis sections, and writes them into one PDF via ``matplotlib``'s :
 The report answers two questions in order -- *how is the group developing?* and *what is each culture
 doing?*:
 
-1. a title page naming the selection and the phase being plotted;
+1. a title page naming the phase being plotted, with the selection as a compact table -- one row per
+   culture, DIVs as ranges -- that continues onto further pages for a large selection;
 2. one **group** page per topic (spiking, bursting, and optionally stimulation / performance), each a
    grid of metric-vs-DIV panels showing the across-culture mean +/- SEM over a faint line per culture,
    so an outlier never hides inside the average;
@@ -22,11 +23,12 @@ Sections:
 - ``"cultures"``    -- the two per-culture pages, for every culture in the selection.
 - ``"stimulation"``-- stimulation delivered per DIV. Optional; auto-skips non-stim cultures.
 - ``"performance"``-- learning curve from a pluggable objective. Optional.
-- ``"overview"``   -- currently disabled (see :func:`_section_overview`).
+- ``"overview"``   -- accepted for compatibility; the selection table on the title page replaces it.
 
 Phases: exactly one phase is plotted per report. ``phase=None`` selects the first phase present in
 the data -- ``"full"`` for recordings with no user-supplied phases, otherwise the first of the
-sequence -- and any phase name can be requested explicitly.
+sequence -- and any phase name can be requested explicitly. When every recording is unphased the
+phase is left out of the titles and legends.
 """
 
 from __future__ import annotations
@@ -46,8 +48,8 @@ from mxtreme.recording import Recording
 from mxtreme import visualizations as viz
 
 from mxtreme.analysis import activity, stimulation, performance
-from mxtreme.analysis._paths import stamp_identity
-from mxtreme.analysis._plotting import plot_cdf_grid, plot_metric_grid, sort_phases
+from mxtreme.analysis._paths import recording_label, stamp_identity
+from mxtreme.analysis._plotting import is_unphased, natural_key, phase_tag, plot_cdf_grid, plot_metric_grid, sort_phases
 from mxtreme.analysis._stats import aggregate_by_div_phase
 
 DEFAULT_SECTIONS = ("activity", "bursting", "cultures")
@@ -71,13 +73,12 @@ _BURST_METRICS = [
 # than a tall ribbon; raise it for squatter panels on a shorter page.
 ASDR_PANEL_ASPECT = 1.7
 
-# (distribution key, x label, panel title, log x) -- see `activity.culture_distributions`.
-_CDF_METRICS = [
-    ('fr_hz',    'Firing rate (Hz)',           'Firing Rate',          True),
-    ('isi_ms',   'ISI (ms)',                   'Inter-Spike Interval', True),
-    ('ibi_sec',  'IBI (s)',                    'Inter-Burst Interval', True),
-    ('size_pct', 'Burst size (% electrodes)',  'Burst Size',           False),
-]
+# How a per-culture page names its phase (dropped when the data is unphased).
+_CULTURE_TAG = "  (phase: {phase})"
+
+# (distribution key, x label, panel title, log x) -- see `activity.spike_activity_distributions` and
+# `activity.burst_activity_distributions`.
+_CDF_METRICS = activity.SPIKE_CDF_METRICS + activity.BURST_CDF_METRICS
 
 
 # --- selection helpers --------------------------------------------------------------------------
@@ -87,7 +88,7 @@ def _flatten_cultures(resolved) -> list[CulturePaths]:
     """Return a flat list of ``CulturePaths`` from a ``resolve_paths`` result."""
     if isinstance(resolved, CulturePaths):
         return [resolved]
-    # dict[exp_id, ExperimentPaths]
+    # dict[batch_id, BatchPaths]
     cultures: list[CulturePaths] = []
     for epath in resolved.values():
         cultures.extend(epath.cultures.values())
@@ -108,6 +109,22 @@ def _selection_slug(cultures: list[CulturePaths]) -> str:
     if len(cultures) == 1:
         return str(cultures[0].culture_id)
     return f"group_{len(cultures)}cultures"
+
+
+def _report_path(analysis_dir: Path, cultures, output_path, name) -> Path:
+    """Where the report goes: ``output_path`` as given, else ``<analysis_dir>/reports/`` under
+    ``name`` (or the selection's default slug)."""
+    if output_path is not None and name is not None:
+        raise ValueError("Pass either `name` or `output_path`, not both.")
+    if output_path is not None:
+        return Path(output_path)
+    if name is None:
+        return analysis_dir / "reports" / f"{_selection_slug(cultures)}_report.pdf"
+    name = str(name)
+    if not name or Path(name).name != name or "/" in name or "\\" in name:
+        raise ValueError(f"`name` must be a bare file name, not {name!r}; use `output_path` for a "
+                         "full path.")
+    return analysis_dir / "reports" / (name if name.lower().endswith(".pdf") else f"{name}.pdf")
 
 
 def _resolve_phase(pop_df: pd.DataFrame, phase: str | None) -> str:
@@ -155,13 +172,136 @@ def _for_phase(pop_df: pd.DataFrame, phase: str) -> pd.DataFrame:
 # --- figure builders ----------------------------------------------------------------------------
 
 
-def _text_page(pdf: PdfPages, title: str, lines: list[str]) -> None:
-    """Append a simple text page (title + body lines)."""
-    fig = plt.figure(figsize=(11, 8.5))
-    fig.text(0.5, 0.82, title, ha="center", va="center", fontsize=22, fontweight="bold")
-    fig.text(0.1, 0.70, "\n".join(lines), ha="left", va="top", fontsize=12, family="monospace")
-    pdf.savefig(fig)
-    plt.close(fig)
+def _div_ranges(divs) -> str:
+    """Compact DIV list: consecutive runs collapse to ranges, e.g. ``32–36, 38, 40–43``."""
+    divs = sorted({int(d) for d in divs})
+    runs = []
+    for d in divs:
+        if runs and d == runs[-1][1] + 1:
+            runs[-1][1] = d
+        else:
+            runs.append([d, d])
+    return ", ".join(str(a) if a == b else f"{a}–{b}" for a, b in runs)
+
+
+# Overview table: (header, width as a fraction of the table, wrap width in characters or None).
+_OVERVIEW_COLUMNS = [
+    ("Batch",       0.20, 22),
+    ("Chip",        0.10, None),
+    ("Well",        0.06, None),
+    ("Device",      0.08, None),
+    ("# rec",       0.06, None),
+    ("DIVs",        0.22, 26),
+    ("Experiments", 0.28, 34),
+]
+_OVERVIEW_FONTSIZE = 9
+_OVERVIEW_LEADING = 1.45  # line height as a multiple of the font size
+_PAGE_SIZE = (11, 8.5)
+_TABLE_BOTTOM = 0.05      # figure fraction the table stops at
+_CONTINUED_TOP = 0.91     # figure fraction a continuation page's table starts at
+_FACTS_FONTSIZE = 11
+
+
+def _first_table_top(n_facts: int) -> float:
+    """Figure fraction the first page's table starts at, below the title and ``n_facts`` lines."""
+    return 0.86 - (n_facts + 1) * _FACTS_FONTSIZE * 1.3 / 72 / _PAGE_SIZE[1]
+
+
+def _table_lines(top: float) -> int:
+    """Text lines of table body that fit between ``top`` and the bottom margin (header row excluded)."""
+    band_pt = (top - _TABLE_BOTTOM) * _PAGE_SIZE[1] * 72
+    return int(band_pt // (_OVERVIEW_FONTSIZE * _OVERVIEW_LEADING)) - 2
+
+
+def _overview_rows(cultures) -> list[list[str]]:
+    """One wrapped row per culture, sorted by batch."""
+    import textwrap
+
+    rows = []
+    for c in sorted(cultures, key=lambda c: (str(c.culture_id.batch_id), str(c.culture_id.chip),
+                                             str(c.culture_id.well))):
+        cid = c.culture_id
+        recordings = list(c.recordings)
+        experiments = sorted({r.recording_id.experiment for r in recordings if r.recording_id.experiment},
+                             key=natural_key)
+        values = [
+            str(cid.batch_id),
+            str(cid.chip), str(cid.well), _device_type(cid.chip), str(len(recordings)),
+            _div_ranges(r.recording_id.div for r in recordings),
+            ", ".join(experiments) or "—",
+        ]
+        rows.append([textwrap.fill(v, width) if width else v
+                     for v, (_h, _w, width) in zip(values, _OVERVIEW_COLUMNS)])
+    return rows
+
+
+def _row_lines(row) -> int:
+    return max(cell.count("\n") + 1 for cell in row)
+
+
+def _paginate(rows, first_lines: int, continued_lines: int) -> list[list]:
+    """Split ``rows`` into pages by the number of text lines each page can hold. A row costs one line
+    per line of its tallest wrapped cell, plus one of padding."""
+    pages, page, used, budget = [], [], 0, first_lines
+    for row in rows:
+        if page and used + _row_lines(_blank_repeat(row, page)) + 1 > budget:
+            pages.append(page)
+            page, used, budget = [], 0, continued_lines
+        used += _row_lines(_blank_repeat(row, page)) + 1
+        page.append(row)
+    pages.append(page)
+    return [[_blank_repeat(row, page[:j]) for j, row in enumerate(page)] for page in pages]
+
+
+def _blank_repeat(row, previous):
+    """``row`` with its batch blanked when the row above it on the page (``previous[-1]``) shares it,
+    so a batch is named once per page: on its first row there, even when the page starts mid-batch."""
+    return ["", *row[1:]] if previous and previous[-1][0] == row[0] else row
+
+
+def _draw_overview_table(fig, rows, top: float, bottom: float = _TABLE_BOTTOM) -> None:
+    """Draw ``rows`` as a table filling the band of ``fig`` between ``top`` and ``bottom``."""
+    ax = fig.add_axes([0.05, bottom, 0.90, top - bottom])
+    ax.axis("off")
+    if not rows:
+        return
+    # Row height in axes units: one text line (with leading) per wrapped line, plus padding.
+    line_h = (_OVERVIEW_FONTSIZE * _OVERVIEW_LEADING / 72) / (fig.get_figheight() * (top - bottom))
+    table = ax.table(cellText=rows, colLabels=[h for h, _w, _wrap in _OVERVIEW_COLUMNS],
+                     colWidths=[w for _h, w, _wrap in _OVERVIEW_COLUMNS],
+                     loc="upper center", cellLoc="left", colLoc="left")
+    table.auto_set_font_size(False)
+    table.set_fontsize(_OVERVIEW_FONTSIZE)
+    for (r, _c), cell in table.get_celld().items():
+        n_lines = 1 if r == 0 else _row_lines(rows[r - 1])
+        cell.set_height(line_h * (n_lines + 1))
+        cell.set_edgecolor("#bbbbbb")
+        if r == 0:
+            cell.set_text_props(fontweight="bold")
+            cell.set_facecolor("#eeeeee")
+
+
+def _overview_figures(title: str, facts: list[str], cultures) -> list:
+    """The report's opening pages: title, the key facts, and the selection as a table that continues
+    onto further pages rather than running off the edge of the first."""
+    first_top = _first_table_top(len(facts))
+    pages = _paginate(_overview_rows(cultures), _table_lines(first_top), _table_lines(_CONTINUED_TOP))
+    figures = []
+    for i, page in enumerate(pages):
+        fig = plt.figure(figsize=_PAGE_SIZE)
+        if i == 0:
+            fig.text(0.5, 0.93, title, ha="center", va="center", fontsize=20, fontweight="bold",
+                     wrap=True)
+            fig.text(0.06, 0.86, "\n".join(facts), ha="left", va="top", fontsize=_FACTS_FONTSIZE,
+                     family="monospace")
+            top = first_top
+        else:
+            fig.text(0.06, 0.95, "Selection (continued)", ha="left", va="center", fontsize=14,
+                     fontweight="bold")
+            top = _CONTINUED_TOP
+        _draw_overview_table(fig, page, top)
+        figures.append(fig)
+    return figures
 
 
 def _population_page(pdf, pop_df, metrics, value_cols, suptitle) -> None:
@@ -178,86 +318,39 @@ def _population_page(pdf, pop_df, metrics, value_cols, suptitle) -> None:
 # --- sections -----------------------------------------------------------------------------------
 
 
-def _section_overview(pdf, cultures, single, analysis_dir):
-    """Disabled: the group overview table put too much detail on the report's first page.
-
-    The title page now carries the selection, and the per-DIV ASDR / MEA views a single culture used
-    to get here live in the richer per-culture section (:func:`_section_cultures`). Kept -- commented
-    out -- because the table itself is worth restoring behind a flag later.
-    """
-    return
-
-    # if single:
-    #     cpath = cultures[0]
-    #     cid = cpath.culture_id
-    #     for div in sorted(cpath.recordings):
-    #         rec = Recording(0, io.load_preprocessed(cpath.recordings[div].npz))
-    #         fig, (ax_asdr, ax_mea) = plt.subplots(
-    #             2, 1, figsize=(11, 8.5), gridspec_kw={"height_ratios": [1, 2]}
-    #         )
-    #         viz.plot_asdr(rec.spike_bin, ax=ax_asdr, title=f"ASDR — {cid} DIV{div}")
-    #         viz.MEA(ax_mea, rec.channelmap, rec.stim_elecs, title=f"MEA layout — DIV{div}")
-    #         fig.tight_layout()
-    #         pdf.savefig(fig)
-    #         plt.close(fig)
-    # else:
-    #     # Concise group overview table.
-    #     rows = []
-    #     for cpath in cultures:
-    #         cid = cpath.culture_id
-    #         divs = sorted(cpath.recordings)
-    #         rows.append([
-    #             cid.exp_id, cid.chip, f"well{cid.well}", _device_type(cid.chip),
-    #             len(divs), ", ".join(str(d) for d in divs),
-    #         ])
-    #     fig, ax = plt.subplots(figsize=(11, 8.5))
-    #     ax.axis("off")
-    #     ax.set_title(f"Group overview — {len(cultures)} cultures", fontsize=16, fontweight="bold")
-    #     table = ax.table(
-    #         cellText=rows,
-    #         colLabels=["Experiment", "Chip", "Well", "Device", "# DIVs", "DIVs"],
-    #         loc="center", cellLoc="left",
-    #     )
-    #     table.auto_set_font_size(False)
-    #     table.set_fontsize(9)
-    #     table.scale(1, 1.5)
-    #     pdf.savefig(fig)
-    #     plt.close(fig)
-
-
 def _spiking_summaries(cultures, analysis_dir) -> pd.DataFrame:
     """Pooled per-culture spiking summaries -- also the frame the report's phase is resolved from."""
     return _pool(
-        (cpath, activity.channel_activity_summary(cpath, analysis_dir, show_plot=False, save_plot=False))
+        (cpath, activity._culture_spike_summary(cpath, analysis_dir))
         for cpath in cultures
     )
 
 
-def _section_activity(pdf, cultures, pop_df, phase):
+def _section_activity(pdf, cultures, pop_df, phase, unphased=False):
     _population_page(
         pdf, _for_phase(pop_df, phase), _SPIKING_METRICS,
         value_cols=["mean_fr_hz", "mean_isi_msec", "mean_amp_uv", "pct_active_chan"],
-        suptitle=f"Spiking Activity — {len(cultures)} cultures  |  phase: {phase}",
+        suptitle=f"Spiking Activity — {len(cultures)} cultures{phase_tag(phase, unphased)}",
     )
 
 
-def _section_bursting(pdf, cultures, analysis_dir, phase):
+def _section_bursting(pdf, cultures, analysis_dir, phase, unphased=False):
     pop_df = _pool(
-        (cpath, activity.burst_activity_summary(cpath, analysis_dir, show_plot=False, save_plot=False))
+        (cpath, activity._culture_burst_summary(cpath, analysis_dir))
         for cpath in cultures
     )
     _population_page(
         pdf, _for_phase(pop_df, phase), _BURST_METRICS,
         value_cols=["burst_rate_hz", "median_ibi_sec", "median_size_pct", "median_dur_sec"],
-        suptitle=f"Burst Activity — {len(cultures)} cultures  |  phase: {phase}",
+        suptitle=f"Burst Activity — {len(cultures)} cultures{phase_tag(phase, unphased)}",
     )
 
 
-def _section_stimulation(pdf, cultures, analysis_dir, phase):
+def _section_stimulation(pdf, cultures, analysis_dir, phase, unphased=False):
     pairs = []
     for cpath in cultures:
         try:
-            df = stimulation.stim_summary(cpath, analysis_dir, show_plot=False, save_plot=False)
+            df = stimulation._culture_stim_summary(cpath, analysis_dir)
         except Exception as exc:  # noqa: BLE001 -- stimulation parsing is experiment-specific
             print(f"Skipping stimulation for {cpath.culture_id}: {exc}")
             continue
@@ -271,24 +364,24 @@ def _section_stimulation(pdf, cultures, analysis_dir, phase):
         return
 
     _population_page(
-        pdf, _for_phase(_pool(pairs), phase), stimulation.POP_STIM_METRICS,
+        pdf, _for_phase(_pool(pairs), phase),
+        [(y, f"sem_{y}", label, title) for (y, _e, label, title) in stimulation._SPEC.metrics],
         value_cols=["total_stim_ms", "phase_dur_min"],
-        suptitle=f"Stimulation — {len(pairs)} cultures  |  phase: {phase}",
+        suptitle=f"Stimulation — {len(pairs)} cultures{phase_tag(phase, unphased)}",
     )
 
 
-def _section_performance(pdf, cultures, analysis_dir, phase, objective_fn):
-    kwargs = {} if objective_fn is None else {"objective_fn": objective_fn}
+def _section_performance(pdf, cultures, analysis_dir, phase, objective_fn, unphased=False):
+    objective_fn = objective_fn or performance.default_direction_objective
 
     pop_df = _pool(
-        (cpath, performance.performance_summary(
-            cpath, analysis_dir, show_plot=False, save_plot=False, **kwargs))
+        (cpath, performance._culture_performance_summary(cpath, analysis_dir, objective_fn=objective_fn))
         for cpath in cultures
     )
     _population_page(
         pdf, _for_phase(pop_df, phase), [('score', 'sem_score', 'Score', 'Performance')],
         value_cols=["score"],
-        suptitle=f"Performance — {len(cultures)} cultures  |  phase: {phase}",
+        suptitle=f"Performance — {len(cultures)} cultures{phase_tag(phase, unphased)}",
     )
 
 
@@ -321,18 +414,19 @@ def _origin_density_vmax(recordings, phase):
     return max(peaks) if peaks else None
 
 
-def _culture_recording_page(pdf, cpath, phase):
-    """Page A: the recording itself over DIV -- ASDR on top, burst-origin map below, one column per DIV."""
+def _culture_recording_page(pdf, cpath, phase, unphased=False):
+    """Page A: the recording itself over DIV -- ASDR on top, burst-origin map below, one column per
+    recording (several on a DIV with more than one labelled recording)."""
     cid = cpath.culture_id
-    divs = sorted(cpath.recordings)
-    if not divs:
+    recordings = list(cpath.recordings)
+    if not recordings:
         return
 
-    # One load per DIV, reused by both rows and by the shared vmax pass.
+    # One load per recording, reused by both rows and by the shared vmax pass.
     loaded = []
-    for div in divs:
-        rec = Recording(0, io.load_preprocessed(cpath.recordings[div].npz))
-        loaded.append((rec, pd.read_csv(cpath.recordings[div].burst_stats)))
+    for rp in recordings:
+        rec = Recording(0, io.load_preprocessed(rp.npz))
+        loaded.append((rec, pd.read_csv(rp.require_burst_stats())))
 
     vmax = _origin_density_vmax(loaded, phase)
 
@@ -341,15 +435,15 @@ def _culture_recording_page(pdf, cpath, phase):
     # ribbon down. Both rows get a height derived from the column width -- the ASDR traces a squat
     # rectangle, the origin maps the array's own 3850 x 2100 µm aspect -- so the page ends up wide and
     # short. PdfPages takes each page at whatever size its figure is.
-    page_w = max(11, 2.4 * len(divs))
-    col_w = page_w / len(divs)
+    page_w = max(11, 2.4 * len(recordings))
+    col_w = page_w / len(recordings)
     asdr_h = col_w / ASDR_PANEL_ASPECT
     origin_h = col_w * device.CHIP_HEIGHT / device.CHIP_WIDTH
     # + room for the suptitle, panel titles and axis labels, which don't scale with the panels.
-    fig, axes = plt.subplots(2, len(divs), figsize=(page_w, asdr_h + origin_h + 1.9), squeeze=False,
+    fig, axes = plt.subplots(2, len(recordings), figsize=(page_w, asdr_h + origin_h + 1.9), squeeze=False,
                              gridspec_kw={"height_ratios": [asdr_h, origin_h]})
 
-    for col, (div, (rec, burst_df)) in enumerate(zip(divs, loaded)):
+    for col, (rp, (rec, burst_df)) in enumerate(zip(recordings, loaded)):
         ax_asdr, ax_origin = axes[0][col], axes[1][col]
 
         # Both rows show the selected phase only, like every other page in the report -- and at this
@@ -360,7 +454,8 @@ def _culture_recording_page(pdf, cpath, phase):
             bins_per_frame = 1 / (rec.samp_rate * rec.bin_size)
             zoom = (window.start_frame * bins_per_frame, window.end_frame * bins_per_frame)
 
-        viz.plot_bursts_on_asdr(rec, burst_df, ax=ax_asdr, zoom=zoom, title=f"DIV{div}")
+        title = recording_label(rp.recording_id.div, rp.recording_id.experiment)
+        viz.plot_bursts_on_asdr(rec, burst_df, ax=ax_asdr, zoom=zoom, title=title)
         # `plot_bursts_on_asdr` works in bins; minutes are what a reader wants on the axis.
         bins_per_min = 60 / rec.bin_size
         ax_asdr.xaxis.set_major_formatter(
@@ -390,34 +485,36 @@ def _culture_recording_page(pdf, cpath, phase):
     for ax in axes[0]:
         ax.set_ylim(0, top)
 
-    fig.suptitle(f"{cid}  |  ASDR and burst origins over DIV  (phase: {phase})",
+    fig.suptitle(f"{cid}  |  ASDR and burst origins over DIV{phase_tag(phase, unphased, _CULTURE_TAG)}",
                  fontsize=13, fontweight="bold")
     fig.tight_layout()
     pdf.savefig(fig, dpi=200)  # resolution of the rasterized panels above
     plt.close(fig)
 
 
-def _culture_distribution_page(pdf, cpath, analysis_dir, phase):
-    """Page B: the distributions behind the summary statistics, one CDF line per DIV."""
+def _culture_distribution_page(pdf, cpath, analysis_dir, phase, unphased=False):
+    """Page B: the distributions behind the summary statistics, one CDF line per recording."""
     cid = cpath.culture_id
-    dists = activity.culture_distributions(cpath, analysis_dir, phase=phase, use_existing=True)
+    spikes = activity._spike_distributions(cpath, analysis_dir, phase=phase)
+    bursts = activity._burst_distributions(cpath, analysis_dir, phase=phase)
+    dists = {key: {**spikes.get(key, {}), **bursts.get(key, {})} for key in sorted({*spikes, *bursts})}
     if not dists:
         return
 
     fig = plot_cdf_grid(
         dists, _CDF_METRICS,
-        suptitle=f"{cid}  |  distributions over DIV  (phase: {phase})",
+        suptitle=f"{cid}  |  distributions over DIV{phase_tag(phase, unphased, _CULTURE_TAG)}",
         show_plot=False, save_path=None,
     )
     pdf.savefig(fig)
     plt.close(fig)
 
 
-def _section_cultures(pdf, cultures, analysis_dir, phase):
+def _section_cultures(pdf, cultures, analysis_dir, phase, unphased=False):
     for cpath in cultures:
         print(f"Building culture pages for {cpath.culture_id}")
-        _culture_recording_page(pdf, cpath, phase)
-        _culture_distribution_page(pdf, cpath, analysis_dir, phase)
+        _culture_recording_page(pdf, cpath, phase, unphased)
+        _culture_distribution_page(pdf, cpath, analysis_dir, phase, unphased)
 
 
 # --- entry point --------------------------------------------------------------------------------
@@ -430,13 +527,14 @@ def generate_report(
     sections=DEFAULT_SECTIONS,
     phase: str | None = None,
     output_path: str | Path | None = None,
+    name: str | None = None,
     objective_fn=None,
     title: str | None = None,
 ) -> Path:
     """Generate a multi-section PDF report for ``target`` and return the written path.
 
     :param target: A :class:`~mxtreme.identity.CultureID` (single culture) or
-        :class:`~mxtreme.identity.CultureSelector` (a group, possibly across experiments).
+        :class:`~mxtreme.identity.CultureSelector` (a group, possibly across batches).
     :param config: The :class:`~mxtreme.config.Config` describing the managed store.
     :param sections: Which sections to include (see module docstring). Defaults to activity +
         bursting + per-culture pages; add ``"stimulation"`` / ``"performance"`` as needed.
@@ -445,6 +543,9 @@ def generate_report(
         sequence. Pass a name (e.g. ``"train"``) to report on that window instead.
     :param output_path: Destination PDF. Defaults to
         ``config.analysis_dir/reports/<slug>_report.pdf``.
+    :param name: File name for the report, kept in the default ``config.analysis_dir/reports/``
+        directory (``.pdf`` is added if missing). Use ``output_path`` instead to choose the directory
+        too; passing both is an error.
     :param objective_fn: Optional objective for the performance section (``callable(burst_df)->float``).
     :param title: Optional report title (defaults to a description of the selection).
 
@@ -467,9 +568,7 @@ def generate_report(
     single = len(cultures) == 1
     analysis_dir = config.analysis_dir
 
-    if output_path is None:
-        output_path = analysis_dir / "reports" / f"{_selection_slug(cultures)}_report.pdf"
-    output_path = Path(output_path)
+    output_path = _report_path(analysis_dir, cultures, output_path, name)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     title = title or (f"MXtreme Report — {cultures[0].culture_id}" if single
@@ -480,33 +579,29 @@ def generate_report(
     spiking_df = _spiking_summaries(cultures, analysis_dir)
     phase = _resolve_phase(spiking_df, phase)
 
-    with PdfPages(output_path) as pdf:
-        # Title page.
-        info = [
-            f"Generated: {_dt.date.today().isoformat()}",
-            f"Phase:     {phase}",
-            f"Cultures:  {len(cultures)}",
-            "",
-            "Selection:",
-        ] + [f"  - {c.culture_id}  (DIVs {', '.join(str(d) for d in sorted(c.recordings))})"
-             for c in cultures] + [
-            "",
-            f"Sections:  {', '.join(sections)}",
-        ]
-        _text_page(pdf, title, info)
+    # Recordings with no user-supplied phases are all "full": naming it everywhere says nothing.
+    unphased = is_unphased(spiking_df["phase"].dropna().unique())
 
-        if "overview" in sections:
-            _section_overview(pdf, cultures, single, analysis_dir)
+    with PdfPages(output_path) as pdf:
+        facts = [f"Generated: {_dt.date.today().isoformat()}"]
+        if not unphased:
+            facts.append(f"Phase:     {phase}")
+        facts += [f"Cultures:  {len(cultures)}",
+                  f"Sections:  {', '.join(s for s in sections if s != 'overview')}"]
+        for fig in _overview_figures(title, facts, cultures):
+            pdf.savefig(fig)
+            plt.close(fig)
+
         if "activity" in sections:
-            _section_activity(pdf, cultures, spiking_df, phase)
+            _section_activity(pdf, cultures, spiking_df, phase, unphased)
         if "bursting" in sections:
-            _section_bursting(pdf, cultures, analysis_dir, phase)
+            _section_bursting(pdf, cultures, analysis_dir, phase, unphased)
         if "stimulation" in sections:
-            _section_stimulation(pdf, cultures, analysis_dir, phase)
+            _section_stimulation(pdf, cultures, analysis_dir, phase, unphased)
         if "performance" in sections:
-            _section_performance(pdf, cultures, analysis_dir, phase, objective_fn)
+            _section_performance(pdf, cultures, analysis_dir, phase, objective_fn, unphased)
         if "cultures" in sections:
-            _section_cultures(pdf, cultures, analysis_dir, phase)
+            _section_cultures(pdf, cultures, analysis_dir, phase, unphased)
 
     print(f"Report written to: {output_path}")
 
@@ -516,12 +611,13 @@ def generate_report(
         transactions.record(
             config,
             "report.written",
-            exp_id=c.culture_id.exp_id,
+            batch_id=c.culture_id.batch_id,
             chip=c.culture_id.chip,
             well=c.culture_id.well,
             data={
                 "path": str(output_path),
-                "divs": sorted(int(d) for d in c.recordings),
+                "divs": c.divs,
+                "recordings": [str(r.recording_id) for r in c.recordings],
                 "sections": list(sections),
             },
         )

@@ -17,13 +17,13 @@ later stage reads back from there. The structure is as follows:
 │                   ├── plating_…_chip_<chip>_well_<N>_DIV_<d>_activity_scan.raw.h5
 │                   ├── plating_…_chip_<chip>_well_<N>_DIV_<d>_network_scan.raw.h5
 │                   ├── plating_…_chip_<chip>_well_<N>_DIV_<d>_network_scan_<i>.raw.h5   (several on one DIV: numbered from 0)
-│                   └── plating_…_chip_<chip>_well_<N>_DIV_<d>_<exp_id>.raw.h5
+│                   └── plating_…_chip_<chip>_well_<N>_DIV_<d>_<experiment>.raw.h5
 ├── preprocessed/                  cleaned .npz, one per well per recording
-│   └── <exp_id>/<chip>/well<N>/DIV<d>_<plate_date>_<chip>_<exp_id>_well<N>_exp_data.npz
-├── burst_data/                    per-recording burst CSVs + per-experiment burst logs
-│   └── <exp_id>/<chip>/well<N>/DIV<d>_<plate_date>_<chip>_<exp_id>_well<N>_burst_data.csv
+│   └── <batch_id>/<chip>/well<N>/DIV<d>_<plate_date>_<chip>_<batch_id>_well<N>[_<experiment>]_exp_data.npz
+├── burst_data/                    per-recording burst CSVs + per-batch burst logs
+│   └── <batch_id>/<chip>/well<N>/DIV<d>_<plate_date>_<chip>_<batch_id>_well<N>[_<experiment>]_burst_data.csv
 ├── analysis/                      per-culture summary CSVs, plots, PDF reports
-│   ├── <category>/<exp_id>/<chip>/well<N>/<culture_id>_<name>.csv
+│   ├── <category>/<batch_id>/<chip>/well<N>/<culture_id>_<name>.csv
 │   └── reports/<slug>_report.pdf
 ├── incoming/                      a front end's staging area for files on their way in (not registered)
 ├── trash/                         what remove_recording took out, at its store-relative path
@@ -37,8 +37,13 @@ recording (a MaxTwo) is recorded into a single `.h5` and split per well on the w
 ({func}`mxtreme.store.split_by_well`).
 
 A scan MXtreme ran itself lands there automatically. A raw `.h5` acquired **outside** MXtreme joins
-the same tree through {func}`mxtreme.store.ingest_recording`, which files and registers it under an
-`exp_id` you supply — the free-string tail of its file name.
+the same tree through {func}`mxtreme.store.ingest_recording`, which files and registers it under the
+batch you name, with an `experiment` name you supply as the free-string tail of its file name.
+
+The batch id is the identity everything downstream is keyed by: the preprocessed and burst trees,
+the registry, the burst logs, the analysis outputs. An ingested experiment's name is carried beside
+it, as `experiment`, only to tell its recordings apart from a scan of the same culture on the same
+DIV.
 
 ## Batches
 
@@ -106,18 +111,21 @@ These are what you hand to the functions that write.
 Three small frozen dataclasses in {mod}`mxtreme.identity` name things without touching the
 filesystem:
 
-- {class}`~mxtreme.identity.CultureID` — `exp_id`, `chip`, `well`. One culture across all its DIVs.
-- {class}`~mxtreme.identity.RecordingID` — a `CultureID` plus a `div`. One recording. Its `.culture`
-  property drops back to the culture.
-- {class}`~mxtreme.identity.CultureSelector` — a *query*: whole experiments by `exp_ids`, an explicit
-  `cultures` list (which takes precedence), and an optional `divs` filter (`None` means all).
+- {class}`~mxtreme.identity.CultureID` — `batch_id`, `chip`, `well`. One culture across all its DIVs.
+- {class}`~mxtreme.identity.RecordingID` — a `CultureID` plus a `div`, and optionally an
+  `experiment` label (`None`, the default, takes whichever label that DIV's recording has). One
+  recording. Its `.culture` property drops back to the culture.
+- {class}`~mxtreme.identity.CultureSelector` — a *query*: whole batches by `batch_ids`, an explicit
+  `cultures` list (which takes precedence), an optional `divs` filter (`None` means all), and an
+  `experiment` label filter (`None`, the default, matches any label; `""` matches unlabelled
+  recordings only).
 
 ```python
 from mxtreme.identity import CultureID, RecordingID, CultureSelector
 
-one_rec  = RecordingID("May2025_Wave", "M07459", "0", div=14)
+one_rec  = RecordingID("fall2026_batch1_DRG", "M07459", "0", div=14)
 culture  = one_rec.culture
-group    = CultureSelector(exp_ids=["May2025_Wave"], divs=[7, 14, 21])
+group    = CultureSelector(batch_ids=["fall2026_batch1_DRG"], divs=[7, 14, 21])
 ```
 
 ## Turning names into files
@@ -126,22 +134,22 @@ group    = CultureSelector(exp_ids=["May2025_Wave"], divs=[7, 14, 21])
 callers actually need:
 
 **{func}`~mxtreme.paths.resolve_paths` mirrors the selection's own structure** — what reporting and
-per-experiment grouping want:
+per-batch grouping want:
 
 | Input | Output |
 |---|---|
 | `RecordingID` | `RecordingPaths` |
-| `CultureID` | `CulturePaths` (all available DIVs) |
-| `CultureSelector` | `dict[exp_id, ExperimentPaths]` |
+| `CultureID` | `CulturePaths` (every recording, by DIV then `experiment` label) |
+| `CultureSelector` | `dict[batch_id, BatchPaths]` |
 
-**{func}`~mxtreme.paths.resolve_recordings` flattens** any of those into a
+**{func}`~mxtreme.paths.resolve_paths_flat` flattens** any of those into a
 {class}`~mxtreme.paths.RecordingSet` — an ordered, iterable list with `.npz` and `.burst_stats`
 accessors, for the common "just give me the files to loop over" case:
 
 ```python
-from mxtreme.paths import resolve_recordings
+from mxtreme.paths import resolve_paths_flat
 
-recs = resolve_recordings(group, config)
+recs = resolve_paths_flat(group, config)
 for rp in recs:
     ...
 print(recs.npz)          # list[Path] of the cleaned .npz files
@@ -157,14 +165,14 @@ machine. Move the store, edit one line of TOML, and every path follows.
 {func}`mxtreme.io.register` (called from {func}`~mxtreme.io.save_preprocessed`), on every scan by
 {func}`mxtreme.io.register_scan`, and on every ingest by {func}`mxtreme.store.ingest_recording`.
 
-Rows are keyed by `(exp_id, batch_id, chip, well, div, kind)`:
+Rows are keyed by `(batch_id, chip, well, div, kind, experiment)`:
 
 | Column | |
 |---|---|
-| `exp_id` | the experiment's name — blank for scans, which have none |
-| `batch_id`, `plate_date` | which plating batch — blank for rows from before the recordings tree |
+| `batch_id`, `plate_date` | which plating batch: the identity of every row |
 | `chip`, `well`, `div` | which culture, on which day |
 | `kind` | `preprocessed`, `activity_scan`, `network_scan`, or `experiment` (an ingested raw file with its own name; an ingested *scan* registers as the scan kind) |
+| `experiment` | an ingested experiment's name, on its raw and preprocessed rows — blank for scans |
 | `conditions` | the well's experimental condition, when it has one |
 | `timestamp` | when the row was written |
 
@@ -176,7 +184,9 @@ A scan is registered once per well it recorded, so "what do I have for this cult
 query over a single table. Path resolution ({mod}`mxtreme.paths`) reads only the `preprocessed` rows —
 a raw `.h5` has no cleaned `.npz` behind it, so counting those rows would resolve to files that do
 not exist. An older registry (no `kind`, or no `batch_id`/`plate_date`) is migrated on read and gains
-the columns on its next write.
+the columns on its next write. So is one with an `exp_id` column, from before the batch id was the
+identity: a row's `exp_id` becomes its `batch_id` where that was blank (what preprocessing used to
+write), and its `experiment` where the row had both and they differ.
 
 If the registry is deleted or drifts out of sync with the files on disk,
 {func}`mxtreme.io.rebuild_registry` reconstructs it by walking the store — the preprocessed `.npz`
@@ -205,8 +215,8 @@ at the bench that no recording captures -- `treatment.applied`, one line per wel
 it went on (`applied_at`, distinct from when it was written down), what and how much (`name`,
 `dose`, `units`) and the DIV that day. The full vocabulary is {data}`mxtreme.transactions.OPS`.
 
-Every record carries as much identity as the writer had — `batch_id`, `plate_date`, `exp_id`,
-`chip`, `well`, `div` — plus `actor` (the OS user, for MXtreme's own entries), a `note` and
+Every record carries as much identity as the writer had — `batch_id`, `plate_date`, `chip`,
+`well`, `div`, and `experiment` for an ingested experiment's recordings — plus `actor` (the OS user, for MXtreme's own entries), a `note` and
 op-specific `data` (paths written, counts). One culture's history is
 {func}`mxtreme.transactions.for_culture`; the alive/dead state of the decision records is a fold,
 {func}`~mxtreme.transactions.batch_states` / {func}`~mxtreme.transactions.culture_states` /

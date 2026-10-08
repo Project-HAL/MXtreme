@@ -30,7 +30,10 @@ def extract(filepath: str, metadata: dict | None = None, wells: list | int | Non
         missing from the embedded blob are filled from ``metadata``. Older files that lack an
         embedded blob rely on ``metadata`` entirely. Typically shaped as::
 
-            {'Exp ID': exp_id, 'Chip ID': chip_id, 'Plate date': plate_date, 'DIV': div}
+            {'Batch ID': batch_id, 'Chip ID': chip_id, 'Plate date': plate_date, 'DIV': div}
+
+        An ingested experiment's blob also carries ``'Experiment'``, its name. Files written before
+        ``'Batch ID'`` existed carry the batch as ``'Exp ID'``, which is read in its place.
 
         An optional ``'Conditions'`` key (a list with one ``[left, right]`` entry per well) supplies
         the per-well experimental condition; it is entirely optional and its absence is not an error.
@@ -78,7 +81,7 @@ def extract(filepath: str, metadata: dict | None = None, wells: list | int | Non
         if embedded is None and metadata is None:
             raise ValueError(
                 "No metadata in h5 file. Metadata must be supplied in the format\n"
-                "metadata = {'Exp ID': exp_id, 'Chip ID': chip_id, 'Plate date': plate_date, 'DIV': DIV}."
+                "metadata = {'Batch ID': batch_id, 'Chip ID': chip_id, 'Plate date': plate_date, 'DIV': DIV}."
             )
 
         h5_metadata = {**(embedded or {}), **(metadata or {})}
@@ -90,8 +93,9 @@ def extract(filepath: str, metadata: dict | None = None, wells: list | int | Non
         else:
             meta_source = "caller-supplied"
 
+        batch_id, experiment = _identity(h5_metadata)
         conditions = h5_metadata.get("Conditions")
-        
+
         # Optional phase spec (experiment-level: applies to every well). Same shape as accepted by
         # ``mxtreme.phases.phases_from_spec`` -- {name: {"start": boundary, "end": boundary}}.
         phase_spec = h5_metadata.get("Phases")
@@ -117,9 +121,10 @@ def extract(filepath: str, metadata: dict | None = None, wells: list | int | Non
             data[well] = well_data
             h5_metadata["wells"].append(well)
 
-            # Experiment identity
+            # Culture identity
             well_data["well"] = well
-            well_data["exp_id"] = h5_metadata["Exp ID"]
+            well_data["batch_id"] = batch_id
+            well_data["experiment"] = experiment
             well_data["chip"] = h5_metadata["Chip ID"]
             well_data["plate_date"] = h5_metadata["Plate date"]
             well_data["DIV"] = h5_metadata["DIV"]
@@ -130,7 +135,7 @@ def extract(filepath: str, metadata: dict | None = None, wells: list | int | Non
             # flush; burst feature windows are found by binary search, so order is restored at the
             # source. Every cleaning step downstream is order-preserving, so this holds to the .npz.
             spikes = f[f"/recordings/rec0000/well00{well}/spikes"][:]  # [frameno, channel, amplitude]
-            well_data["data"] = sort_spike_data(spikes)
+            well_data["spike_data"] = sort_spike_data(spikes)
 
             samp_rate = np.array([f[f"/recordings/rec0000/well00{well}/settings/sampling"][:][0]])
             if isinstance(samp_rate, (list, np.ndarray)):
@@ -149,13 +154,13 @@ def extract(filepath: str, metadata: dict | None = None, wells: list | int | Non
             h5_object = f["wells"]["well{0:0>3}".format(well)]["rec{0:0>4}".format(0)]
             groups = h5_object["groups"]
             if not groups.keys():
-                if len(well_data["data"]) == 0:
+                if len(well_data["spike_data"]) == 0:
                     raise ValueError(
                         f"{filepath} holds no data for well {well}: no raw frames and no spikes. "
                         "An empty or aborted recording cannot be extracted."
                     )
                 print(f"Warning: No raw data for {filepath} for well no {well}")
-                well_data["raw_start"] = np.min(well_data["data"]["frameno"])
+                well_data["raw_start"] = np.min(well_data["spike_data"]["frameno"])
             else:
                 group0 = groups[next(iter(groups))]
                 if group0["frame_nos"].shape[0] == 0:
@@ -192,16 +197,34 @@ def extract(filepath: str, metadata: dict | None = None, wells: list | int | Non
                     well_condition = conditions[idx]
                 except (ValueError, IndexError, TypeError, KeyError):
                     well_condition = None
-            well_data["experimental_condition"] = well_condition
+            well_data["exp_condition"] = well_condition
 
             # Phase spec travels with every well so it is embedded in each preprocessed ``.npz`` and
             # picked up automatically by ``Recording`` at detection/analysis time. Optional (``None``).
             well_data["phase_spec"] = phase_spec
 
-            print(f"  well {well} | {len(well_data['data']):>9,} spikes | condition {well_condition}")
+            print(f"  well {well} | {len(well_data['spike_data']):>9,} spikes | condition {well_condition}")
 
     print("-" * 60)
     print(f"Done: extracted {len(data)} well(s) from {os.path.basename(filepath)}")
     print("=" * 60)
 
     return data
+
+
+def _identity(metadata: dict) -> tuple[str, str]:
+    """``(batch_id, experiment)`` from a metadata blob, whichever generation wrote it.
+
+    The current blob names the batch as ``Batch ID`` and an ingested experiment as ``Experiment``.
+    Older ones also carry ``Exp ID``: the batch id again for a scan, the experiment's name for an
+    ingested recording -- so where it differs from ``Batch ID`` it is the experiment. A blob with
+    ``Exp ID`` alone predates batch identity, and that id is the one its files are kept under.
+    """
+    legacy = str(metadata.get("Exp ID") or "")
+    batch_id = str(metadata.get("Batch ID") or "")
+    if not batch_id and not legacy:
+        raise ValueError("Metadata names no batch: it needs a 'Batch ID'.")
+    experiment = str(metadata.get("Experiment") or "")
+    if not experiment and batch_id and legacy and legacy != batch_id:
+        experiment = legacy
+    return batch_id or legacy, experiment

@@ -4,6 +4,10 @@ Views of the cleaned/binned data:
 - :func:`MEA` -- spatial map of the electrodes on the array.
 - :func:`plot_asdr` -- array-wide spike detection rate (ASDR) time series.
 - :func:`raster` -- raster of the binned spikes.
+- :func:`plot_timeseries_heatmap` -- a (rows x time) matrix as a heat map, e.g. instantaneous firing rate.
+
+Helpers:
+- :func:`finish_figure` -- the save / show / close tail shared by figure-building functions.
 
 Burst overlays (consume a burst DataFrame from :meth:`BurstSet.to_dataframe
 <mxtreme.bursting.detection.BurstSet.to_dataframe>`):
@@ -27,7 +31,7 @@ from scipy.spatial.distance import cdist
 from mxtreme import device
 
 
-def MEA(ax, channelmap, stim_elecs, title="MEA Channel Layout", marker_size=36, stim_fontsize=16):
+def MEA(channelmap, ax=None, stim_elecs=None, title="MEA Channel Layout", marker_size=36, stim_fontsize=16):
     """Plot the electrode layout of the MEA, marking stimulation electrodes.
 
     :param ax: Matplotlib axes to draw on.
@@ -38,6 +42,10 @@ def MEA(ax, channelmap, stim_elecs, title="MEA Channel Layout", marker_size=36, 
         drawing the array into a small panel, where ~1k default-sized markers merge into a blob.
     :param stim_fontsize: Size of the ⚡ marking stimulation electrodes; scale it with ``marker_size``.
     """
+    owns_fig = ax is None
+    if owns_fig:
+        _, ax = plt.subplots(1, 1, figsize=(12, 6))
+
     mid_point = (device.CHIP_WIDTH / 2) * device.ELEC_SIZE  # x midpoint of the array
     chip_ht_um = device.CHIP_HEIGHT * device.ELEC_SIZE
 
@@ -118,6 +126,106 @@ def raster(spike_bin, zoom=None, ax=None, title=None):
     if owns_fig:
         plt.show()
     return ax
+
+
+def plot_timeseries_heatmap(matrix, time=None, rows=None, ax=None, cmap="magma", vmin=None, vmax=None,
+                            log=False, colorbar=True, cbar_label=None, title=None,
+                            xlabel="Time (s)", ylabel="Channel"):
+    """Heat map of a (rows x time) matrix, e.g. per-channel firing rate over time.
+
+    Built for the output of :func:`mxtreme.analysis.activity.instantaneous_firing_rate`, whose
+    ``rate`` / ``time_sec`` / ``channels`` map straight onto ``matrix`` / ``time`` / ``rows``::
+
+        ifr = activity.instantaneous_firing_rate(rec, save=False)
+        viz.plot_timeseries_heatmap(ifr["rate"], ifr["time_sec"], cbar_label="Firing rate (Hz)")
+
+    :param matrix: ``(n_rows, n_times)`` array.
+    :param time: Optional length-``n_times`` array of bin start times, used for the x extent. Bins
+        are assumed evenly spaced. ``None`` labels the x axis in bin indices.
+    :param rows: Optional row labels (e.g. channel ids). Only the row count is used; with ~1k channels,
+        per-row tick labels would be unreadable, so the y axis shows row positions.
+    :param ax: Axes to draw on. If ``None``, a new figure is created and shown.
+    :param cmap: Colormap.
+    :param vmin: Lower colour limit; defaults to the data minimum.
+    :param vmax: Upper colour limit. Defaults to the 99th percentile, so a few saturated
+        bins don't flatten the rest of the map.
+    :param log: Use a logarithmic colour scale (non-positive values are drawn as the lowest colour).
+    :param colorbar: Attach a colour bar.
+    :param cbar_label: Colour bar label.
+    :param title: Axes title.
+    :param xlabel: X-axis label.
+    :param ylabel: Y-axis label.
+    :returns: The ``AxesImage``.
+    """
+    from matplotlib.colors import LogNorm
+
+    matrix = np.asarray(matrix, dtype=float)
+    n_rows, n_times = matrix.shape
+
+    owns_fig = ax is None
+    if owns_fig:
+        _, ax = plt.subplots(1, 1, figsize=(12, 4))
+
+    if time is not None and len(time) > 0:
+        time = np.asarray(time, dtype=float)
+        step = time[1] - time[0] if len(time) > 1 else 1.0
+        extent = (time[0], time[-1] + step, n_rows, 0)
+    else:
+        extent = (0, n_times, n_rows, 0)
+        if xlabel == "Time (s)":
+            xlabel = "Time (bins)"
+
+    finite = matrix[np.isfinite(matrix)]
+    if vmax is None:
+        vmax = float(np.percentile(finite, 99)) if finite.size else None
+    if log:
+        positive = finite[finite > 0]
+        lo = vmin if vmin is not None else (float(positive.min()) if positive.size else 1e-3)
+        norm = LogNorm(vmin=lo, vmax=max(vmax or lo * 10, lo * 10))
+        image = ax.imshow(np.where(matrix > 0, matrix, lo), cmap=cmap, norm=norm, aspect="auto",
+                          interpolation="nearest", extent=extent)
+    else:
+        image = ax.imshow(matrix, cmap=cmap, vmin=vmin, vmax=vmax, aspect="auto",
+                          interpolation="nearest", extent=extent)
+    # ~1k rows x thousands of bins is millions of vector quads in a PDF and looks identical as a raster.
+    image.set_rasterized(True)
+
+    ax.set_xlabel(xlabel, fontsize=10)
+    ax.set_ylabel(ylabel if rows is None else f"{ylabel} ({len(rows)})", fontsize=10)
+    if title:
+        ax.set_title(title, fontsize=12)
+    if colorbar:
+        ax.figure.colorbar(image, ax=ax, fraction=0.03, pad=0.01, label=cbar_label)
+
+    if owns_fig:
+        plt.show()
+    return image
+
+
+def finish_figure(fig, save_path=None, show_plot=True, dpi=150):
+    """Save ``fig`` (creating parent directories) and/or show it; close it when not shown.
+
+    The tail every figure-building function ends with, in one place.
+
+    :param fig: The matplotlib Figure.
+    :param save_path: Full path (including filename) to save to, or ``None`` to skip saving.
+    :param show_plot: Call ``plt.show()``; otherwise the figure is closed to free its memory.
+    :param dpi: Resolution for the saved file.
+    :returns: ``fig``.
+    """
+    if save_path:
+        from pathlib import Path
+
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(save_path, dpi=dpi, bbox_inches="tight")
+        print(f"Saved plot → {save_path}")
+
+    if show_plot:
+        plt.show()
+    else:
+        plt.close(fig)
+    return fig
 
 
 # --- burst overlays -----------------------------------------------------------------------------
@@ -329,7 +437,7 @@ def plot_origin_heatmap(recording, burst_df, ax=None, phase=None, kind="network"
     x_origin = bursts["origin_x"].to_numpy()
     y_origin = bursts["origin_y"].to_numpy()
 
-    MEA(ax, channelmap, recording.stim_elecs, title="", marker_size=elec_marker_size,
+    MEA(channelmap, ax=ax, stim_elecs=recording.stim_elecs, title="", marker_size=elec_marker_size,
         stim_fontsize=max(6, 16 * elec_marker_size / 36))
     # Semi-transparent: with a few hundred bursts these markers otherwise merge into a solid blob and
     # hide both the density layer and their own concentration.
@@ -362,7 +470,7 @@ def plot_burst_vectors(recording, burst_df, ax=None, phase=None, kind="network",
     chip_ht_um = device.CHIP_HEIGHT * device.ELEC_SIZE
     df = _select(burst_df, kind, phase)
 
-    MEA(ax, recording.channelmap, recording.stim_elecs, title="")
+    MEA(recording.channelmap, ax=ax, stim_elecs=recording.stim_elecs, title="")
 
     x_origin = df["origin_x"].to_numpy()
     y_origin = chip_ht_um - df["origin_y"].to_numpy()

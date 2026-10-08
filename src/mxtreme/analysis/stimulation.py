@@ -1,157 +1,148 @@
-import os
-import pandas as pd
+"""Stimulation delivered to a culture.
+
+Recording level: :func:`stim_events` lists a recording's stimulation pulses, and :func:`stim_delivered`
+totals them per phase.
+
+Group level: :func:`summarize_stimulation` / :func:`plot_stimulation_summary` take a ``RecordingID``,
+``CultureID``, ``CultureSelector`` or several selectors, as in :mod:`~mxtreme.analysis.activity`.
+
+.. note:: A stimulation event is one whose message carries both a ``start_stimulation`` and a
+   ``phase_us`` key -- maxlab closed-loop-stimulation names.
+"""
+
+from __future__ import annotations
+
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
+
 from mxtreme import io
+from mxtreme.config import Config
 from mxtreme.recording import Recording
-from mxtreme.analysis._paths import _summary_paths, load_population_summaries
-from mxtreme.analysis._plotting import plot_metric_grid
-from mxtreme.analysis._stats import aggregate_by_div_phase
+from mxtreme.analysis._group import SummarySpec, culture_summary, fill_docs, plot_summary, summarize
+
+__all__ = ["stim_events", "stim_delivered", "summarize_stimulation", "plot_stimulation_summary"]
 
 
-def _get_stim_info(rec: Recording):
-    """Return the recording's stimulation events, with the pulse phase in a ``stim_phase`` column.
+def _recording_output(rec, analysis_dir, suffix: str) -> Path:
+    out_dir = Path(analysis_dir) / "stimulation" / str(rec.batch_id) / str(rec.chip) / f"well{rec.well}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return out_dir / io.recording_file_name(rec.DIV, rec.plate_date, rec.chip, rec.batch_id, rec.well,
+                                            suffix, rec.experiment or "")
 
-    Event messages are dicts (see :attr:`Recording.event_df <mxtreme.recording.Recording.event_df>`);
-    a stimulation event is one carrying both a ``start_stimulation`` and a ``phase_us`` key. Messages
-    that aren't dicts (older stores hold plain strings) are skipped rather than raising.
 
-    .. note:: The ``start_stimulation`` / ``phase_us`` key names are maxlab closed-loop-stim specific.
+# --- recording level ------------------------------------------------------------------------------
+
+
+def stim_events(rec: Recording, analysis_dir=None, *, save: bool = True) -> pd.DataFrame:
+    """Every stimulation pulse in one recording.
+
+    Messages that aren't dicts (older stores hold plain strings) are skipped rather than raising.
+
+    :param rec: The recording.
+    :param analysis_dir: Analysis output root; saved there as ``..._stim_events.csv`` when ``save`` is on.
+    :param save: Write the result (needs ``analysis_dir``).
+    :returns: One row per pulse: ``frame``, ``time_sec``, ``pulse_phase_us`` (maxlab's ``phase_us``),
+        and ``phase`` -- the recording phase it falls in (``None`` in a gap between phases).
     """
-    is_stim = rec.event_df['eventmessage'].map(
-        lambda d: isinstance(d, dict) and ('phase_us' in d) and ('start_stimulation' in d)
+    events = rec.event_df
+    is_stim = events["eventmessage"].map(
+        lambda d: isinstance(d, dict) and "phase_us" in d and "start_stimulation" in d
     )
-    stim_rows = rec.event_df[is_stim].copy()
-    stim_rows['stim_phase'] = stim_rows['eventmessage'].map(
-        lambda d: d.get('phase_us', float('nan'))
-    ).astype(float)
+    stim = events[is_stim]
+    frames = stim["eventtime"].to_numpy(dtype=np.int64)
+    df = pd.DataFrame({
+        "frame": frames,
+        "time_sec": frames / rec.samp_rate,
+        "pulse_phase_us": stim["eventmessage"].map(lambda d: d.get("phase_us", np.nan)).astype(float).to_numpy(),
+        "phase": [rec.phases.label_for(f) for f in frames],
+    })
 
-    return stim_rows
+    if save and analysis_dir is not None:
+        path = _recording_output(rec, analysis_dir, "stim_events.csv")
+        df.to_csv(path, index=False)
+        print(f"Saved stimulation events to {path}")
+    return df
 
 
-def stim_summary(cpath, analysis_dir: Path, use_existing=True, show_plot=True, save_plot=False):
-    """Summarise stimulation delivered to one culture, one row per DIV and phase.
+def stim_delivered(rec: Recording, analysis_dir=None, *, save: bool = True) -> pd.DataFrame:
+    """Stimulation delivered in each phase of one recording.
 
-    For each (DIV, phase): ``total_stim_ms`` is the summed pulse phase of the stimulation events that
-    fall inside that phase's window (maxlab reports these in **microseconds** as ``phase_us``, so they
-    are divided by 1000 to give milliseconds), and ``phase_dur_min`` is the span of the window itself.
-
-    Phases come from the recording (see :mod:`mxtreme.phases`), exactly as in the activity summaries,
-    so a recording with no user-supplied phases yields a single ``"full"`` row covering it.
-
-    :param cpath: The culture's :class:`~mxtreme.paths.CulturePaths`.
-    :param analysis_dir: Analysis output root (typically ``config.analysis_dir``).
-    :param use_existing: Reuse the cached summary CSV when one already exists.
-    :param show_plot: Show the per-culture summary figure.
-    :param save_plot: Save that figure next to the summary CSV.
-    :returns: One row per DIV/phase with columns ``div``, ``phase``, ``total_stim_ms``,
-        ``phase_dur_min``, ``culture_id``.
-    :rtype: pandas.DataFrame
+    :param rec: The recording.
+    :param analysis_dir: Analysis output root; saved there as ``..._stim_delivered.csv`` when ``save``
+        is on.
+    :param save: Write the result (needs ``analysis_dir``).
+    :returns: One row per phase: ``phase``, ``n_pulses``, ``total_stim_ms`` (summed pulse phase,
+        µs -> ms), and ``phase_dur_min`` (the phase's duration).
     """
-    cid = cpath.culture_id
-    columns = ['div', 'phase', 'total_stim_ms', 'phase_dur_min', 'culture_id']
+    events = stim_events(rec, save=False)
+    rows = []
+    for p in rec.phases:
+        in_phase = events["frame"].between(p.start_frame, p.end_frame, inclusive="both")
+        rows.append({
+            "phase": p.name,
+            "n_pulses": int(in_phase.sum()),
+            "total_stim_ms": events.loc[in_phase, "pulse_phase_us"].sum() / 1000,
+            "phase_dur_min": p.n_frames / rec.samp_rate / 60,
+        })
+    df = pd.DataFrame(rows, columns=["phase", "n_pulses", "total_stim_ms", "phase_dur_min"])
 
-    save_path, csv_path = _summary_paths(cpath, analysis_dir, "stimulation", "stim_summary")
-
-    # A cache without `phase` predates per-phase attribution: its stim totals cover whole recordings
-    # and can't be filtered to a phase. Recompute rather than load it back.
-    cached = pd.read_csv(csv_path) if use_existing and csv_path.exists() else None
-    if cached is not None and 'phase' not in cached.columns:
-        print(f"Ignoring pre-phase summary at {csv_path} (no phase column); recomputing.")
-        cached = None
-
-    if cached is not None:
-        print(f"Loading existing summary from {csv_path}")
-        summary_df = cached
-    else:
-        rows = []
-        for div in cpath.recordings:
-
-            npz = cpath.recordings[div].npz
-
-            rec = Recording(0, io.load_preprocessed(npz))
-
-            stim_df = _get_stim_info(rec)
-
-            for phase in rec.phases:
-                in_phase = stim_df['eventtime'].between(
-                    phase.start_frame, phase.end_frame, inclusive='both'
-                )
-                rows.append({
-                    'div':            div,
-                    'phase':          phase.name,
-                    # phase_us (µs) -> ms
-                    'total_stim_ms':  stim_df.loc[in_phase, 'stim_phase'].sum() / 1000,
-                    'phase_dur_min':  phase.n_frames / rec.samp_rate / 60,
-                    'culture_id':     str(cid),
-                })
-
-        summary_df = pd.DataFrame(rows, columns=columns)
-
-        os.makedirs(save_path, exist_ok=True)
-
-        summary_df.to_csv(csv_path, index=False)
-        print(f"Saved summary to {save_path}")
-
-    if show_plot or save_plot:
-        _plot_stim_summary(summary_df, cid=cpath.culture_id, analysis_dir=save_path, show_plot=show_plot, save_plot=save_plot)
-
-    return summary_df
+    if save and analysis_dir is not None:
+        path = _recording_output(rec, analysis_dir, "stim_delivered.csv")
+        df.to_csv(path, index=False)
+        print(f"Saved stimulation delivered to {path}")
+    return df
 
 
-STIM_METRICS = [
-    # (y_col,           err_col, y_label,                       panel_title)
-    ('total_stim_ms',   None,    'Total stim time (ms)',        'Stimulation Delivered'),
-    ('phase_dur_min',   None,    'Window duration (min)',       'Recorded Window'),
-]
+# --- group level ----------------------------------------------------------------------------------
 
-# Population variants of STIM_METRICS -- same panels, but with the across-culture SEM.
-POP_STIM_METRICS = [(y, f'sem_{y}', label, title) for (y, _e, label, title) in STIM_METRICS]
-
-
-def _plot_stim_summary(df: pd.DataFrame, cid, analysis_dir, show_plot, save_plot, title_suffix: str = ''):
-    """Two-panel figure (stim delivered, window duration) vs DIV, one series per phase."""
-
-    save_path = (Path(analysis_dir) / f"{cid}_stim_summary.png") if save_plot else None
-    suffix = f' — {title_suffix}' if title_suffix else ''
-
-    plot_metric_grid(
-        df, STIM_METRICS,
-        suptitle=f'Stimulation Summary — {cid}{suffix}',
-        save_path=save_path,
-        show_plot=show_plot,
-        figsize=(11, 4.5),
-        dpi=150,
-    )
+_SPEC = SummarySpec(
+    title="Stimulation",
+    metrics=[
+        ("total_stim_ms", None, "Total stim time (ms)",  "Stimulation Delivered"),
+        ("phase_dur_min", None, "Window duration (min)", "Recorded Window"),
+    ],
+    grid={"figsize": (11, 4.5)},
+)
 
 
-def plot_population_stim_summary(sel_paths, analysis_dir: Path, phase: str = None, savename=None):
-    """Stimulation vs DIV pooled across cultures: mean ± SEM, with a faint line per culture.
+def _stim_rows(rp) -> list[dict]:
+    rec = Recording(0, io.load_preprocessed(rp.npz))
+    return [{"div": rp.recording_id.div, "experiment": rp.recording_id.experiment or "", **row}
+            for row in stim_delivered(rec, save=False).to_dict("records")]
 
-    :param sel_paths: ``{exp_id: ExperimentPaths}`` from :func:`mxtreme.paths.resolve_paths`.
-    :param analysis_dir: Analysis output root (typically ``config.analysis_dir``).
-    :param phase: If given, restrict to this phase only; ``None`` plots all phases as separate lines.
-    :param savename: Filename for the saved figure, written into ``<analysis_dir>/stimulation/``.
+
+def _culture_stim_summary(cpath, analysis_dir: Path, use_existing: bool = True) -> pd.DataFrame:
+    """Per-culture stimulation delivered (one row per recording x phase), cached."""
+    return culture_summary(cpath, analysis_dir, "stimulation", "stim_summary", _stim_rows, use_existing)
+
+
+def summarize_stimulation(target, config: Config, *, phase: str | None = None,
+                          use_existing: bool = True) -> pd.DataFrame:
+    """Table of stimulation delivered: one row per recording and phase (columns as in
+    :func:`stim_delivered`).
+
+    Identity columns lead: ``batch_id, culture_id, chip, well, div, experiment, phase``, plus ``group``
+    when several selectors are given.
+
+    {target}
+    :param phase: Keep only this phase; ``None`` keeps every phase.
+    :param use_existing: Reuse cached per-culture summaries; ``False`` recomputes the target's
+        recordings.
+    :returns: The summary table.
     """
+    return summarize(target, config, _culture_stim_summary, phase=phase, use_existing=use_existing)[0]
 
-    # TODO: update if sel_paths has more than one exp_id, decide whether to combine them or plot them separately
 
-    pop_df = load_population_summaries(sel_paths, data_dir=analysis_dir/"stimulation", suffix='stim_summary')
+def plot_stimulation_summary(target, config: Config, *, split_by: str = "phase", phase: str | None = None,
+                             error: str = "sem", show_plot: bool = True, save_path=None):
+    """Two-panel stimulation summary: stimulation delivered and window duration, vs DIV.
 
-    if phase is not None:
-        pop_df = pop_df[pop_df['phase'] == phase]
+    {plot_doc}
+    """
+    return plot_summary(target, config, _culture_stim_summary, _SPEC, split_by=split_by, phase=phase,
+                        error=error, show_plot=show_plot, save_path=save_path)
 
-    stats = aggregate_by_div_phase(pop_df, value_cols=['total_stim_ms', 'phase_dur_min'])
 
-    n_cultures = pop_df['culture_id'].nunique()
-    save_path = (Path(analysis_dir) / "stimulation" / savename) if savename else None
-
-    plot_metric_grid(
-        stats, POP_STIM_METRICS,
-        overlay_df=pop_df,
-        suptitle=f'Population Stimulation\nmean ± SEM, n = {n_cultures} cultures',
-        save_path=save_path,
-        show_plot=True,
-        figsize=(11, 4.5),
-        dpi=300,
-    )
+fill_docs(summarize_fns=(summarize_stimulation,), plot_fns=((plot_stimulation_summary, None),))

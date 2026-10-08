@@ -1,237 +1,199 @@
-"""Performance / learning-curve analysis.
+"""Performance: a learning curve from a user-chosen score of each recording's network bursts.
 
-A *performance* summary tracks a single user-chosen scalar per recording (per DIV, per phase) so it
-can be plotted as a learning curve over development. The scalar is produced by a pluggable
-``objective_fn(burst_df) -> float``. Users studying a different task supply their own objective.
+The score comes from a pluggable ``objective_fn(burst_df) -> float``, so users studying a different
+task supply their own. The shipped default, :func:`default_direction_objective`, scores burst
+propagation toward the side each culture was trained to burst from (read from the recording's
+``exp_condition``).
 
-The shipped default scores burst propagation *toward the side the culture was trained to burst from*,
-read from each recording's ``exp_condition`` (see :func:`trained_side`). Scoring both directions on the
-same "fraction toward the target" scale is what makes scores comparable across cultures -- pooling a
-left-trained and a right-trained culture under a single fixed direction would average two opposing
-conventions and pin the population mean near 0.5. When the condition is unknown the default falls back
-to a paradigm-free left-to-right propagation fraction.
+Recording level: :func:`performance_score` scores one recording's bursts, per phase.
+
+Group level: :func:`summarize_performance` / :func:`plot_performance_summary` take a ``RecordingID``,
+``CultureID``, ``CultureSelector`` or several selectors, as in :mod:`~mxtreme.analysis.activity`.
 """
 
-import os
-import numpy as np
-import pandas as pd
+from __future__ import annotations
+
+import re
 from pathlib import Path
 
-from mxtreme.analysis._paths import _summary_paths, load_population_summaries
-from mxtreme.analysis._plotting import plot_metric_grid
-from mxtreme.analysis._stats import aggregate_by_div_phase
+import numpy as np
+import pandas as pd
+
+from mxtreme import io
+from mxtreme.config import Config
+from mxtreme.recording import Recording
+from mxtreme.analysis.activity import _bursts_by_phase
+from mxtreme.analysis._group import SummarySpec, culture_summary, fill_docs, plot_summary, summarize
+
+__all__ = [
+    "performance_score", "default_direction_objective",
+    "summarize_performance", "plot_performance_summary",
+]
 
 
-def trained_side(condition) -> str | None:
+def _trained_side(condition) -> str | None:
     """The side a culture was trained to burst from, as ``'left'`` / ``'right'`` / ``None``.
 
-    An experimental condition is a ``[left, right]`` pair (``Recording.exp_condition``, stored in each
-    preprocessed ``.npz``). The *lower* of the two numbers marks the trained side, so ``[0, 2]`` and
-    ``[2, 1]`` are left-trained while ``[2, 0]`` and ``[1, 0]`` are right-trained. Equal values carry no
-    lower number and therefore no target (e.g. an untrained ``[0, 0]`` control).
+    An experimental condition is a ``[left, right]`` pair (``Recording.exp_condition``). The *lower*
+    number marks the trained side, so ``[0, 2]`` and ``[2, 1]`` are left-trained while ``[2, 0]`` and
+    ``[1, 0]`` are right-trained. Equal values carry no target (e.g. an untrained ``[0, 0]`` control).
 
-    :param condition: A condition pair, or ``None`` for a recording that has none.
-    :returns: ``'left'``, ``'right'``, or ``None`` when there is no trained side to score against.
+    Experiment-specific: to be replaced by a user-defined mapping.
     """
     if condition is None:
         return None
-
     pair = np.asarray(condition).ravel()
     if pair.size != 2:  # unset, or a legacy dict-shaped condition
         return None
-
     left, right = pair.tolist()
     if left == right:
         return None
-    return 'left' if left < right else 'right'
+    return "left" if left < right else "right"
 
 
 def default_direction_objective(burst_df: pd.DataFrame) -> float:
-    """Default performance objective: burst propagation toward the trained side.
+    """Default performance objective: the fraction of bursts propagating toward the trained side.
 
-    Returns the fraction of bursts propagating toward the side named by the group's ``trained_side``
-    column -- ``origin_x < peak_x`` for ``'left'``, ``origin_x > peak_x`` for ``'right'``. Both are on
-    the same "fraction toward the target" scale, so left- and right-trained cultures can be compared
-    and pooled directly. :func:`performance_summary` attaches that column from each recording's
-    ``exp_condition``.
+    Uses the ``trained_side`` column that :func:`performance_score` attaches -- ``origin_x < peak_x``
+    counts for ``'left'``, ``origin_x > peak_x`` for ``'right'`` -- so left- and right-trained cultures
+    score on the same "fraction toward the target" scale and can be pooled.
 
-    Two distinct ways the target can be missing:
+    - Column **absent** (the condition is unknown, e.g. called on a burst CSV directly): the
+      paradigm-free left-to-right fraction.
+    - Column present and ``None`` (the culture has no trained side): ``nan``.
 
-    - the column is **absent** -- the condition is *unknown* (e.g. called directly on a burst CSV), so
-      this falls back to the paradigm-free left-to-right fraction it has always returned;
-    - the column is present and ``None`` -- the culture is *known* to have no trained side, so there is
-      no direction to score and the result is ``nan``.
-
-    :param burst_df: Bursts for one (DIV, phase) group. Must contain ``origin_x`` and ``peak_x``.
-    :returns: Fraction in ``[0, 1]``, or ``nan`` for an empty group or one with no trained side.
+    :param burst_df: Bursts for one phase. Must contain ``origin_x`` and ``peak_x``.
+    :returns: A fraction in ``[0, 1]``, or ``nan`` for no bursts or no trained side.
     """
-
     if len(burst_df) == 0:
         return np.nan
+    if "trained_side" not in burst_df.columns:
+        return float((burst_df["origin_x"] < burst_df["peak_x"]).mean())
 
-    if 'trained_side' not in burst_df.columns:
-        return float((burst_df['origin_x'] < burst_df['peak_x']).mean())
-
-    side = burst_df['trained_side'].iloc[0]
-    if side == 'left':
-        return float((burst_df['origin_x'] < burst_df['peak_x']).mean())
-    if side == 'right':
-        return float((burst_df['origin_x'] > burst_df['peak_x']).mean())
+    side = burst_df["trained_side"].iloc[0]
+    if side == "left":
+        return float((burst_df["origin_x"] < burst_df["peak_x"]).mean())
+    if side == "right":
+        return float((burst_df["origin_x"] > burst_df["peak_x"]).mean())
     return np.nan
 
 
-def performance_summary(
-    cpath,
-    analysis_dir: Path,
-    *,
-    objective_fn=default_direction_objective,
-    use_existing=True,
-    show_plot=True,
-    save_plot=False,
-    score_label: str = 'Score',
-):
-    """Per-DIV, per-phase performance score for a culture, using a pluggable objective.
+# --- recording level ------------------------------------------------------------------------------
 
-    For each recording the network bursts are grouped by phase and scored with ``objective_fn``; the
-    tidy result (``chip, well, div, phase, condition, trained_side, score``) is cached as a CSV and
-    plotted as a learning curve.
 
-    Each group is handed to ``objective_fn`` carrying a ``trained_side`` column, derived from the
-    recording's ``exp_condition`` via :func:`trained_side`, so the default objective can score toward
-    the culture's own target. Objectives that ignore the column are unaffected.
+def _objective_name(objective_fn) -> str:
+    name = getattr(objective_fn, "__name__", type(objective_fn).__name__)
+    return re.sub(r"[^A-Za-z0-9_]+", "", name) or "objective"
 
-    :param cpath: A :class:`~mxtreme.paths.CulturePaths`.
-    :param analysis_dir: Analysis output root (typically ``config.analysis_dir``).
-    :param objective_fn: ``callable(burst_df) -> float`` scoring one (DIV, phase) group of bursts.
-    :param score_label: Y-axis label for the learning-curve plot.
-    :returns: The per-DIV/phase summary DataFrame.
+
+def performance_score(rec: Recording, burst_df: pd.DataFrame, analysis_dir=None, *,
+                      objective_fn=default_direction_objective, save: bool = True) -> pd.DataFrame:
+    """Score one recording's network bursts, per phase, with ``objective_fn``.
+
+    Each phase's bursts are handed to ``objective_fn`` with a ``trained_side`` column derived from the
+    recording's ``exp_condition``, so the default objective can score toward the culture's own target;
+    objectives that ignore the column are unaffected. A phase with no network bursts scores ``nan``
+    without calling the objective.
+
+    :param rec: The recording.
+    :param burst_df: Its bursts (only ``kind == "network"`` rows are scored).
+    :param analysis_dir: Analysis output root; saved there as ``..._performance_<objective>.csv`` when
+        ``save`` is on.
+    :param objective_fn: ``callable(burst_df) -> float``; defaults to
+        :func:`default_direction_objective`.
+    :param save: Write the result (needs ``analysis_dir``).
+    :returns: One row per phase: ``phase, n_bursts, condition, trained_side, score``.
     """
-    cid = cpath.culture_id
-    columns = ['chip', 'well', 'div', 'phase', 'condition', 'trained_side', 'score']
+    side = _trained_side(rec.exp_condition)
+    condition = None if rec.exp_condition is None else str(np.asarray(rec.exp_condition).ravel().tolist())
+    rows = []
+    for phase, bursts in _bursts_by_phase(rec, burst_df).items():
+        rows.append({
+            "phase": phase,
+            "n_bursts": len(bursts),
+            "condition": condition,
+            "trained_side": side,
+            # assign() scores a copy -- the group is a slice, so writing to it would warn.
+            "score": float(objective_fn(bursts.assign(trained_side=side))) if len(bursts) else np.nan,
+        })
+    df = pd.DataFrame(rows, columns=["phase", "n_bursts", "condition", "trained_side", "score"])
 
-    save_path, csv_path = _summary_paths(cpath, analysis_dir, "performance", "performance_summary")
-
-    # A cache without `trained_side` predates condition-aware scoring, so its right-trained scores carry
-    # the wrong sign. Recompute rather than load it back.
-    cached = pd.read_csv(csv_path) if use_existing and csv_path.exists() else None
-    if cached is not None and 'trained_side' not in cached.columns:
-        print(f"Ignoring pre-condition summary at {csv_path} (no trained_side column); recomputing.")
-        cached = None
-
-    if cached is not None:
-        print(f"Loading existing summary from {csv_path}")
-        summary_df = cached
-    else:
-        rows = []
-        for div in cpath.recordings:
-            burst_stats = cpath.recordings[div].burst_stats
-            burst_data = pd.read_csv(burst_stats)
-
-            # np.load is lazy, so reading this one key never decompresses the recording's spike arrays.
-            with np.load(cpath.recordings[div].npz, allow_pickle=True) as npz:
-                condition = npz['exp_condition'] if 'exp_condition' in npz else None
-            side = trained_side(condition)
-            condition = None if condition is None else np.asarray(condition).ravel().tolist()
-            if side is None:
-                print(f"No trained side for condition {condition} (DIV {div}); scoring as nan.")
-
-            # Score network bursts only (the analogue of the old "HAL_like" class).
-            burst_data = burst_data[burst_data['kind'] == 'network']
-
-            phases = [p for p in burst_data['phase'].dropna().unique()]
-            if not phases:
-                continue
-
-            for phase in phases:
-                phase_bursts = burst_data[burst_data['phase'] == phase]
-                if len(phase_bursts) == 0:
-                    print(f"No bursts detected in phase {phase!r} (DIV {div}).")
-                    continue
-                rows.append({
-                    'chip':         cid.chip,
-                    'well':         cid.well,
-                    'div':          div,
-                    'phase':        phase,
-                    'condition':    condition,
-                    'trained_side': side,
-                    # assign() scores a copy -- the group is a slice, so writing to it would warn.
-                    'score':        objective_fn(phase_bursts.assign(trained_side=side)),
-                })
-
-        summary_df = pd.DataFrame(rows, columns=columns)
-
-        os.makedirs(save_path, exist_ok=True)
-        summary_df.to_csv(csv_path, index=False)
-        print(f"Saved summary to {save_path}")
-
-    if show_plot or save_plot:
-        _plot_performance_summary(
-            summary_df, cid=cid, analysis_dir=save_path,
-            show_plot=show_plot, save_plot=save_plot, score_label=score_label,
-        )
-
-    return summary_df
+    if save and analysis_dir is not None:
+        out_dir = Path(analysis_dir) / "performance" / str(rec.batch_id) / str(rec.chip) / f"well{rec.well}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        suffix = f"performance_{_objective_name(objective_fn)}.csv"
+        path = out_dir / io.recording_file_name(rec.DIV, rec.plate_date, rec.chip, rec.batch_id, rec.well,
+                                                suffix, rec.experiment or "")
+        df.to_csv(path, index=False)
+        print(f"Saved performance scores to {path}")
+    return df
 
 
-def _plot_performance_summary(df, cid, analysis_dir, show_plot, save_plot, score_label='Score'):
-    """Line plot of score vs DIV, one series per phase.
+# --- group level ----------------------------------------------------------------------------------
 
-    The y-axis is left to the data rather than pinned to ``[0, 1]``: the objective is pluggable, so
-    only the shipped default happens to be a fraction.
+
+def _spec(score_label: str) -> SummarySpec:
+    return SummarySpec(title="Performance", metrics=[("score", None, score_label, "Performance")],
+                       grid={"ncols": 1, "figsize": (8, 5)})
+
+
+def _culture_performance_summary(cpath, analysis_dir: Path, use_existing: bool = True,
+                                 objective_fn=default_direction_objective) -> pd.DataFrame:
+    """Per-culture performance scores (one row per recording x phase), cached per objective.
+
+    The cache is named after ``objective_fn``, so scores under different objectives never mix. Two
+    different functions sharing a name (e.g. two lambdas) do share a cache: pass
+    ``use_existing=False`` after changing one.
     """
-    if df.empty:
-        print(f"No performance data for {cid}")
-        return
+    def rows(rp):
+        rec = Recording(0, io.load_preprocessed(rp.npz))
+        bursts = pd.read_csv(rp.require_burst_stats())
+        df = performance_score(rec, bursts, objective_fn=objective_fn, save=False)
+        return [{"div": rp.recording_id.div, "experiment": rp.recording_id.experiment or "", **row}
+                for row in df.to_dict("records")]
 
-    save_path = (Path(analysis_dir) / f"{cid}_performance_summary.png") if save_plot else None
-
-    plot_metric_grid(
-        df, [('score', None, score_label, 'Performance')],
-        suptitle=f'Performance Summary — {cid}',
-        save_path=save_path,
-        show_plot=show_plot,
-        ncols=1,
-        figsize=(7, 5),
-        dpi=150,
-    )
+    name = f"performance_{_objective_name(objective_fn)}"
+    return culture_summary(cpath, analysis_dir, "performance", name, rows, use_existing)
 
 
-def plot_population_performance_summary(sel_paths,
-                                        analysis_dir: Path,
-                                        phase: str = None,
-                                        savename=None,
-                                        score_label: str = 'Score'):
-    """Learning curve pooled across cultures: score vs DIV (mean ± SEM), with faint per-culture lines.
+def summarize_performance(target, config: Config, *, objective_fn=default_direction_objective,
+                          phase: str | None = None, use_existing: bool = True) -> pd.DataFrame:
+    """Table of performance scores: one row per recording and phase (columns as in
+    :func:`performance_score`).
 
-    :param sel_paths: ``dict[exp_id, ExperimentPaths]`` from :func:`~mxtreme.paths.resolve_paths`.
-    :param analysis_dir: Analysis output root (typically ``config.analysis_dir``).
-    :param phase: If given, restrict to this phase; otherwise pool all phases.
-    :param savename: Filename for the saved figure, written into ``<analysis_dir>/performance/``.
+    Identity columns lead: ``batch_id, culture_id, chip, well, div, experiment, phase``, plus ``group``
+    when several selectors are given. Needs burst detection to have been run on every recording.
+
+    {target}
+    :param objective_fn: ``callable(burst_df) -> float``; defaults to
+        :func:`default_direction_objective`.
+    :param phase: Keep only this phase; ``None`` keeps every phase.
+    :param use_existing: Reuse cached per-culture scores; ``False`` recomputes the target's recordings.
+    :returns: The summary table.
+    """
+    def summary(cpath, analysis_dir, use):
+        return _culture_performance_summary(cpath, analysis_dir, use, objective_fn)
+    return summarize(target, config, summary, phase=phase, use_existing=use_existing)[0]
+
+
+def plot_performance_summary(target, config: Config, *, objective_fn=default_direction_objective,
+                             score_label: str = "Score", split_by: str = "phase",
+                             phase: str | None = None, error: str = "sem",
+                             show_plot: bool = True, save_path=None):
+    """Learning curve: the performance score vs DIV.
+
+    The y-axis follows the data rather than being pinned to ``[0, 1]``: the objective is pluggable,
+    and only the default happens to be a fraction.
+
+    {plot_doc}
+    :param objective_fn: ``callable(burst_df) -> float``; defaults to
+        :func:`default_direction_objective`.
     :param score_label: Y-axis label (should match the objective's units).
     """
-    pop_df = load_population_summaries(
-        sel_paths, data_dir=analysis_dir / "performance", suffix='performance_summary'
-    )
+    def summary(cpath, analysis_dir, use):
+        return _culture_performance_summary(cpath, analysis_dir, use, objective_fn)
+    return plot_summary(target, config, summary, _spec(score_label), split_by=split_by, phase=phase,
+                        error=error, show_plot=show_plot, save_path=save_path)
 
-    if phase is not None:
-        pop_df = pop_df[pop_df['phase'] == phase]
 
-    if pop_df.empty:
-        print(f"No performance data for phase={phase!r}")
-        return
-
-    stats = aggregate_by_div_phase(pop_df, value_cols=['score'])
-
-    n_cultures = pop_df['culture_id'].nunique()
-    save_path = (Path(analysis_dir) / "performance" / savename) if savename else None
-
-    return plot_metric_grid(
-        stats, [('score', 'sem_score', score_label, 'Performance')],
-        overlay_df=pop_df,
-        suptitle=f'Population Performance\nmean ± SEM, n = {n_cultures} cultures',
-        save_path=save_path,
-        show_plot=True,
-        ncols=1,
-        figsize=(8, 5),
-        dpi=300,
-    )
+fill_docs(summarize_fns=(summarize_performance,), plot_fns=((plot_performance_summary, None),))
