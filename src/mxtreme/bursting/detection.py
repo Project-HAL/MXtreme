@@ -12,7 +12,9 @@ Two stages, kept as separate, composable pieces:
   an auto threshold taken from the valley of the ``log10(ISI_N)`` distribution. Returns spike
   intervals.
 - **Rate thresholding** (:meth:`BurstDetector._rate_threshold_groups`) -- within each group's ASDR
-  segment, pick peaks and classify them ``"network"`` / ``"mini"`` by height.
+  segment, pick peaks and classify them ``"network"`` / ``"mini"`` by height. Minis whose window
+  overlaps any network burst's window, starts within ``network_gap_sec`` after one, or ends within
+  ``network_lead_sec`` before one, are dropped, so mini and network periods never overlap.
 
 Methods: ``"isi_n"`` runs the grouping stage alone (one burst per group); ``"isi_rate"`` composes both.
 """
@@ -30,7 +32,7 @@ import scipy.signal
 from scipy.stats import gaussian_kde
 
 from mxtreme import utils
-from mxtreme.bursting.burst import Burst, _COLUMNS
+from mxtreme.bursting.burst import Burst, _COLUMNS, _anchor_bins, _local_noise_floor
 from mxtreme.params import BurstDetectParams
 from mxtreme.phases import Phases
 
@@ -305,12 +307,22 @@ class BurstDetector:
         """Pick and classify rate peaks within each ISI-N group.
 
         Peaks at/above ``burst_thresh`` are ``"network"``; peaks between ``noise_thresh`` and
-        ``burst_thresh`` are ``"mini"``.
+        ``burst_thresh`` are ``"mini"``. Network bursts take priority: a mini whose window overlaps any
+        network burst's window -- in any group -- starts less than ``network_gap_sec`` after one ends,
+        or ends less than ``network_lead_sec`` before one begins is discarded (see
+        :meth:`_overlaps_network`).
+
+        A burst's window runs from the nearest quiet bin before its peak to the nearest after it, quiet
+        meaning at/under its group's noise floor. These are the anchors
+        :meth:`Burst._compute_onset_offset` uses, so a burst's onset/offset always fall inside its
+        window and non-overlapping windows guarantee non-overlapping burst periods.
         """
         p = self.params
-        bursts: list[Burst] = []
-        next_id = 1
-        for group_start, group_stop, n_spikes in groups:
+        n_bins = len(asdr)
+        # (kind, peak_frame, height, group, window_lo_bin, window_hi_bin), in output order.
+        candidates = []
+        for group in groups:
+            group_start, group_stop, _ = group
             start_bin = utils.frame_to_bin(group_start, samp_rate, bin_size)
             stop_bin = utils.frame_to_bin(group_stop, samp_rate, bin_size)
             segment = asdr[start_bin:stop_bin + 1]
@@ -321,22 +333,57 @@ class BurstDetector:
             mini_peaks, mini_props = scipy.signal.find_peaks(
                 segment, height=(p.noise_thresh, p.burst_thresh), distance=p.min_dist_bins
             )
+            if not len(network_peaks) and not len(mini_peaks):
+                continue
 
+            quiet_bins = np.flatnonzero(asdr <= _local_noise_floor(asdr, start_bin, stop_bin))
             for kind, pk, heights in (
                 ("network", network_peaks, network_props["peak_heights"]),
                 ("mini", mini_peaks, mini_props["peak_heights"]),
             ):
                 for offset, height in zip(pk, heights):
                     peak_frame = utils.bin_to_frame(offset + start_bin, samp_rate, bin_size)
-                    bursts.append(
-                        Burst(
-                            id=next_id, peak_frame=peak_frame, peak_amp=float(height), kind=kind,
-                            group_start_frame=group_start, group_stop_frame=group_stop,
-                            n_spikes=n_spikes, phase=phases.label_for(peak_frame),
-                        )
-                    )
-                    next_id += 1
+                    # Same peak bin derivation as Burst._compute_onset_offset, so anchors match exactly.
+                    pre, post = _anchor_bins(quiet_bins, utils.frame_to_bin(peak_frame, samp_rate, bin_size))
+                    lo = -1 if pre is None else pre  # no anchor -> window runs off the recording edge
+                    hi = n_bins if post is None else post
+                    candidates.append((kind, peak_frame, float(height), group, lo, hi))
+
+        network_windows = np.array([(c[4], c[5]) for c in candidates if c[0] == "network"]).reshape(-1, 2)
+        gap_bins = int(round(p.network_gap_sec / bin_size))
+        lead_bins = int(round(p.network_lead_sec / bin_size))
+        bursts: list[Burst] = []
+        n_dropped = 0
+        for kind, peak_frame, height, (group_start, group_stop, n_spikes), lo, hi in candidates:
+            if kind == "mini" and self._overlaps_network(lo, hi, network_windows, gap_bins, lead_bins):
+                n_dropped += 1
+                continue
+            bursts.append(
+                Burst(
+                    id=len(bursts) + 1, peak_frame=peak_frame, peak_amp=height, kind=kind,
+                    group_start_frame=group_start, group_stop_frame=group_stop,
+                    n_spikes=n_spikes, phase=phases.label_for(peak_frame),
+                )
+            )
+        if n_dropped:
+            print(f"Discarded {n_dropped} mini burst(s) overlapping or near a network burst")
         return bursts
+
+    @staticmethod
+    def _overlaps_network(lo, hi, network_windows, gap_bins=0, lead_bins=0) -> bool:
+        """Whether the bin window ``[lo, hi]`` overlaps or crowds any network window.
+
+        Closed on both ends: windows that share only an anchor bin count as overlapping, since the two
+        bursts' periods could then meet at that bin's frame. On top of that, a mini must start at least
+        ``gap_bins`` after a network window ends and end at least ``lead_bins`` before one begins.
+        Windows bound burst periods, so these margins also hold between the bursts' onsets/offsets.
+        """
+        if not len(network_windows):
+            return False
+        net_lo, net_hi = network_windows[:, 0], network_windows[:, 1]
+        too_soon_after = lo - net_hi < max(gap_bins, 1)
+        too_close_before = net_lo - hi < max(lead_bins, 1)
+        return bool(np.any(too_soon_after & too_close_before))
 
     @staticmethod
     def _group_spikes(spike_frames, N, isi_thresh_frames):

@@ -3,6 +3,7 @@
 import numpy as np
 import pandas as pd
 import pytest
+import scipy.signal
 
 from mxtreme import io, utils
 from mxtreme.recording import Recording
@@ -297,6 +298,113 @@ def test_isi_rate_peaks_within_group_intervals(make_recording_data):
     rec = Recording(0, make_recording_data())
     bursts = BurstDetector(DETECT).detect(rec)
     assert all(_peak_in_group(b, rec) for b in bursts)
+
+
+def _triangle(asdr, center, half_width, height):
+    idx = np.arange(center - half_width, center + half_width + 1)
+    asdr[idx] = np.maximum(asdr[idx], height * (1 - np.abs(idx - center) / (half_width + 1)))
+
+
+def test_minis_inside_network_window_are_discarded():
+    # samp_rate = bin_size = 1 so frames == bins. Silent baseline -> noise floor 0.
+    asdr = np.zeros(200)
+    _triangle(asdr, 40, 15, 0.40)   # network burst, bins 25..55
+    _triangle(asdr, 58, 6, 0.10)    # shoulder on its falling edge: mini-height, but same window
+    _triangle(asdr, 120, 5, 0.10)   # isolated mini, separated by silence
+    params = BurstDetectParams(n=50, noise_thresh=0.05, burst_thresh=0.15, min_dist_bins=5)
+
+    # Sanity: the shoulder really is a separate mini-height local peak.
+    raw_minis, _ = scipy.signal.find_peaks(asdr, height=(0.05, 0.15), distance=5)
+    assert 58 in raw_minis
+    assert (asdr[25:65] > 0).all()  # joined to the network burst above the (zero) noise floor
+
+    bursts = BurstDetector(params)._rate_threshold_groups(
+        asdr, [(0, 199, 500)], Phases.full(0, 199), samp_rate=1.0, bin_size=1.0
+    )
+    by_kind = {k: [b.peak_frame for b in bursts if b.kind == k] for k in ("network", "mini")}
+    assert by_kind == {"network": [40], "mini": [120]}
+
+
+def test_minis_kept_when_group_has_no_network_burst():
+    asdr = np.zeros(100)
+    _triangle(asdr, 30, 5, 0.10)
+    _triangle(asdr, 70, 5, 0.10)
+    params = BurstDetectParams(n=50, noise_thresh=0.05, burst_thresh=0.15, min_dist_bins=5)
+    bursts = BurstDetector(params)._rate_threshold_groups(
+        asdr, [(0, 99, 200)], Phases.full(0, 99), samp_rate=1.0, bin_size=1.0
+    )
+    assert sorted(b.peak_frame for b in bursts if b.kind == "mini") == [30, 70]
+
+
+def test_minis_in_other_group_overlapping_network_are_discarded():
+    # ISI-N can split a network burst's tail into its own group; the tail must still lose to it.
+    asdr = np.zeros(200)
+    _triangle(asdr, 40, 15, 0.40)   # network burst, bins 25..55, group A
+    _triangle(asdr, 58, 6, 0.10)    # its tail, joined above the floor but in group B
+    _triangle(asdr, 120, 5, 0.10)   # isolated mini, group B
+    params = BurstDetectParams(n=50, noise_thresh=0.05, burst_thresh=0.15, min_dist_bins=5)
+    groups = [(0, 47, 300), (48, 199, 300)]
+    bursts = BurstDetector(params)._rate_threshold_groups(
+        asdr, groups, Phases.full(0, 199), samp_rate=1.0, bin_size=1.0
+    )
+    by_kind = {k: [b.peak_frame for b in bursts if b.kind == k] for k in ("network", "mini")}
+    assert by_kind == {"network": [40], "mini": [120]}
+
+
+@pytest.mark.parametrize("mini_center, kept", [(61, False), (62, True)])
+def test_mini_sharing_network_anchor_bin_is_discarded(mini_center, kept):
+    # Network burst occupies bins 25..55. A mini at 61 (bins 57..65) leaves a single quiet bin (56)
+    # shared as both bursts' anchor -> overlap. At 62 (bins 58..66) there are two quiet bins -> kept.
+    asdr = np.zeros(120)
+    _triangle(asdr, 40, 15, 0.40)
+    _triangle(asdr, mini_center, 4, 0.10)
+    params = BurstDetectParams(n=50, noise_thresh=0.05, burst_thresh=0.15, min_dist_bins=5)
+    bursts = BurstDetector(params)._rate_threshold_groups(
+        asdr, [(0, 119, 300)], Phases.full(0, 119), samp_rate=1.0, bin_size=1.0
+    )
+    assert any(b.kind == "mini" for b in bursts) is kept
+
+
+@pytest.mark.parametrize("mini_center, kept", [(70, False), (71, True)])
+def test_minis_within_network_gap_are_discarded(mini_center, kept):
+    # bin_size = 1 s, so network_gap_sec=10 is 10 bins. Network window ends at quiet bin 56; a mini of
+    # half-width 4 has its window start at center-5, so it needs center-5-56 >= 10 -> center >= 71.
+    asdr = np.zeros(150)
+    _triangle(asdr, 40, 15, 0.40)
+    _triangle(asdr, mini_center, 4, 0.10)
+    params = BurstDetectParams(n=50, noise_thresh=0.05, burst_thresh=0.15, min_dist_bins=5,
+                               network_gap_sec=10.0)
+    bursts = BurstDetector(params)._rate_threshold_groups(
+        asdr, [(0, 149, 300)], Phases.full(0, 149), samp_rate=1.0, bin_size=1.0
+    )
+    assert any(b.kind == "mini" for b in bursts) is kept
+
+
+@pytest.mark.parametrize("lead_sec, kept", [(4.0, True), (5.0, False)])
+def test_minis_within_network_lead_are_discarded(lead_sec, kept):
+    # bin_size = 1 s. The mini's window ends at quiet bin 25; the network's begins at quiet bin 29, so
+    # they are 4 bins apart: kept with a 4 s lead, dropped with 5 s. The 10 s post-burst gap must not
+    # matter for a mini that comes before the network burst.
+    asdr = np.zeros(150)
+    _triangle(asdr, 20, 4, 0.10)    # mini, bins 16..24
+    _triangle(asdr, 45, 15, 0.40)   # network, bins 30..60
+    params = BurstDetectParams(n=50, noise_thresh=0.05, burst_thresh=0.15, min_dist_bins=5,
+                               network_gap_sec=10.0, network_lead_sec=lead_sec)
+    bursts = BurstDetector(params)._rate_threshold_groups(
+        asdr, [(0, 149, 300)], Phases.full(0, 149), samp_rate=1.0, bin_size=1.0
+    )
+    assert any(b.kind == "mini" for b in bursts) is kept
+
+
+def test_mini_and_network_periods_never_overlap(make_recording_data):
+    rec = Recording(0, make_recording_data())
+    bursts = BurstDetector(DETECT).detect(rec)
+    bursts.extract_features(rec, BurstFeatureParams())
+    df = bursts.to_dataframe()
+    df = df[~df["ignore"]]
+    net, mini = df[df["kind"] == "network"], df[df["kind"] == "mini"]
+    for _, m in mini.iterrows():
+        assert not ((net["onset_frame"] <= m["offset_frame"]) & (net["offset_frame"] >= m["onset_frame"])).any()
 
 
 # --- feature extraction ---------------------------------------------------------------------------

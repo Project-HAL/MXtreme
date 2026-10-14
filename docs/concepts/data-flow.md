@@ -196,7 +196,13 @@ added without changing the interface. Two composable stages ship today:
   burst when that span falls below a threshold taken automatically from the valley of the
   `log10(ISI_N)` distribution.
 - **Rate thresholding** — within each group's ASDR segment, pick peaks and classify them
-  `"network"` or `"mini"` by height.
+  `"network"` or `"mini"` by height. Network bursts take priority: each peak's window runs between
+  the nearest quiet bins (at/under its group's local noise floor) on either side, the same bounds
+  that later contain its onset and offset. A mini whose window overlaps any network burst's window,
+  in any group, is discarded, so mini and network burst periods never overlap. So is a mini that
+  starts less than `network_gap_sec` (default 0.2 s) after a network burst's window ends, which
+  removes the short tail blips that follow most network bursts, or ends less than
+  `network_lead_sec` (default 0.1 s) before one begins, which removes pre-burst run-up.
 
 `method="isi_n"` runs grouping alone (one burst per group); the default `"isi_rate"` composes both.
 
