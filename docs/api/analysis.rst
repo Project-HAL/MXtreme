@@ -60,6 +60,8 @@ Recording level: one :class:`~mxtreme.recording.Recording` in, the data out.
 .. autofunction:: mxtreme.analysis.network.network_metrics
 .. autofunction:: mxtreme.analysis.network.plot_pc_trajectory
 .. autofunction:: mxtreme.analysis.network.animate_pc_trajectory
+.. autofunction:: mxtreme.analysis.network.plot_pc_trajectory_by_label
+.. autofunction:: mxtreme.analysis.network.animate_pc_trajectory_by_label
 
 Community structure of a connectivity matrix (the output of :func:`~mxtreme.analysis.network.connectivity`).
 

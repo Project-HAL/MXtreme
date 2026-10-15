@@ -1,6 +1,8 @@
 """Tests for the analysis module: path resolution against a Config store, per-culture summaries,
 the pluggable performance objective, and PDF report generation."""
 
+import re
+
 import matplotlib
 matplotlib.use("Agg")  # headless
 
@@ -1304,6 +1306,218 @@ def test_animate_pc_trajectory_writes_a_gif(store, tmp_path):
     with pytest.raises(ValueError, match=".gif or .mp4"):
         network.animate_pc_trajectory(rec, tmp_path / "anim.avi")
     assert not (tmp_path / "long.gif").exists()
+
+
+# --- network: PC trajectories coloured by a burst label -------------------------------------------
+
+
+def _labelled_bursts(burst_df):
+    """The fixture's bursts with a two-valued label column to colour by.
+
+    Split by time, not by row: the fixture's two dense epochs each produce several bursts sharing
+    the same ISI-N bounds, so labelling alternate *rows* would let one label completely occlude the
+    other (later labels win where bursts overlap) and paint nothing.
+    """
+    df = burst_df.copy()
+    df["grp"] = np.where(df["peak_frame"] < df["peak_frame"].median(), "a", "b")
+    return df
+
+
+def test_pc_indices_accepts_three_components_only_when_asked():
+    assert network._pc_indices((1, 2), 3) == (0, 1)
+    assert network._pc_indices((1, 2, 3), 3, allow_3d=True) == (0, 1, 2)
+    with pytest.raises(ValueError, match="must be two"):
+        network._pc_indices((1, 2, 3), 3)
+    with pytest.raises(ValueError, match="only 2 available"):
+        network._pc_indices((1, 2, 3), 2, allow_3d=True)
+
+
+def test_segments_builds_two_and_three_dimensional_pairs():
+    xs = np.arange(5.0)
+    assert network._segments(xs, xs).shape == (4, 2, 2)
+    segs = network._segments(xs, xs, xs)
+    assert segs.shape == (4, 2, 3)
+    # Consecutive segments share a vertex: it is one polyline, not disjoint sticks.
+    assert np.array_equal(segs[0, 1], segs[1, 0])
+
+
+def test_plot_pc_trajectory_by_label_draws_one_collection_per_label(store):
+    config, cid_a, _ = store
+    rec, burst_df = _fixture_recording(config, cid_a)
+
+    fig = network.plot_pc_trajectory_by_label(rec, _labelled_bursts(burst_df), "grp",
+                                              show_plot=False)
+    ax = fig.axes[0]
+    assert len(ax.collections) == 3  # the grey base plus one per label
+    texts = [t.get_text() for t in ax.get_legend().get_texts()]
+    assert any(t.startswith("a (n=") for t in texts)
+    assert any(t.startswith("b (n=") for t in texts)
+    assert "no burst" in texts
+    assert ax.get_xlabel().startswith("PC1 (")
+    plt.close(fig)
+
+
+def test_plot_pc_trajectory_by_label_partitions_every_segment(store):
+    """Every sample is painted exactly once: none dropped, none drawn twice."""
+    config, cid_a, _ = store
+    rec, burst_df = _fixture_recording(config, cid_a)
+
+    fig = network.plot_pc_trajectory_by_label(rec, _labelled_bursts(burst_df), "grp",
+                                              show_plot=False)
+    ax = fig.axes[0]
+    n_samples = network.pca(rec, n_components=2, save=False)["time_sec"].size
+    assert sum(len(c.get_segments()) for c in ax.collections) == n_samples - 1
+    plt.close(fig)
+
+
+def test_plot_pc_trajectory_by_label_span_changes_what_is_painted(store):
+    config, cid_a, _ = store
+    rec, burst_df = _fixture_recording(config, cid_a)
+    df = _labelled_bursts(burst_df)
+
+    def painted(span):
+        fig = network.plot_pc_trajectory_by_label(rec, df, "grp", span=span, show_plot=False)
+        # zorder 1 is the grey no-burst base; everything above it is a labelled burst.
+        total = sum(len(c.get_segments()) for c in fig.axes[0].collections if c.get_zorder() > 1)
+        plt.close(fig)
+        return total
+
+    # The feature bounds sit inside the ISI-N group bounds, so they can only paint less.
+    assert painted("features") <= painted("isi_n")
+
+
+def test_plot_pc_trajectory_by_label_titles_the_isi_n_fallback(store):
+    """A fallback span is wider than the feature span it stands in for, so the figure must say so."""
+    config, cid_a, _ = store
+    rec, burst_df = _fixture_recording(config, cid_a)
+    df = _labelled_bursts(burst_df)
+
+    fig = network.plot_pc_trajectory_by_label(rec, df, "grp", span="features", show_plot=False)
+    assert "ISI-N" not in fig.axes[0].get_title()
+    plt.close(fig)
+
+    df.loc[df.index[0], ["onset_frame", "offset_frame"]] = -1
+    fig = network.plot_pc_trajectory_by_label(rec, df, "grp", span="features", show_plot=False)
+    assert re.search(r"1/\d+ bursts use ISI-N bounds", fig.axes[0].get_title())
+    plt.close(fig)
+
+
+def test_plot_pc_trajectory_by_label_draws_in_3d(store):
+    config, cid_a, _ = store
+    rec, burst_df = _fixture_recording(config, cid_a)
+
+    fig = network.plot_pc_trajectory_by_label(rec, _labelled_bursts(burst_df), "grp", pcs=(1, 2, 3),
+                                              elev=20, azim=-70, show_plot=False)
+    ax = fig.axes[0]
+    assert ax.name == "3d"
+    assert ax.get_zlabel().startswith("PC3 (")
+    assert (ax.elev, ax.azim) == (20, -70)
+    # 3-D axes don't autoscale from collections; without explicit limits these stay at (0, 1).
+    assert ax.get_zlim() != (0.0, 1.0)
+    assert ax.get_zlim()[1] > ax.get_zlim()[0]
+    plt.close(fig)
+
+
+def test_plot_pc_trajectory_by_label_on_a_caller_axes(store):
+    config, cid_a, _ = store
+    rec, burst_df = _fixture_recording(config, cid_a)
+    df = _labelled_bursts(burst_df)
+
+    fig, ax = plt.subplots()
+    assert network.plot_pc_trajectory_by_label(rec, df, "grp", ax=ax) is fig
+    assert len(plt.get_fignums()) == 1  # drew into the caller's figure, made no other
+    with pytest.raises(ValueError, match="3-D"):
+        network.plot_pc_trajectory_by_label(rec, df, "grp", pcs=(1, 2, 3), ax=ax)
+    plt.close(fig)
+
+
+def test_plot_pc_trajectory_by_label_rejects_an_unknown_column(store):
+    config, cid_a, _ = store
+    rec, burst_df = _fixture_recording(config, cid_a)
+    with pytest.raises(ValueError, match="has no column"):
+        network.plot_pc_trajectory_by_label(rec, burst_df, "nope", show_plot=False)
+
+
+def test_animate_pc_trajectory_by_label_spins_a_3d_view(store, tmp_path):
+    from PIL import Image
+
+    config, cid_a, _ = store
+    rec, burst_df = _fixture_recording(config, cid_a)
+    df = _labelled_bursts(burst_df)
+
+    out = network.animate_pc_trajectory_by_label(rec, df, tmp_path / "spin.gif", "grp",
+                                                 mode="spin", pcs=(1, 2, 3), n_frames=4, dpi=40)
+    with Image.open(out) as gif:
+        assert gif.n_frames == 4
+
+    with pytest.raises(ValueError, match="three components"):
+        network.animate_pc_trajectory_by_label(rec, df, tmp_path / "flat.gif", "grp", mode="spin")
+    with pytest.raises(ValueError, match="max_frames"):
+        network.animate_pc_trajectory_by_label(rec, df, tmp_path / "long.gif", "grp", mode="spin",
+                                               pcs=(1, 2, 3), n_frames=10, max_frames=5, dpi=40)
+    assert not (tmp_path / "long.gif").exists()
+    assert not plt.get_fignums()  # the refused renders didn't leak their figures
+
+
+def test_animate_pc_trajectory_by_label_replays_over_time(store, tmp_path):
+    from PIL import Image
+
+    config, cid_a, _ = store
+    rec, burst_df = _fixture_recording(config, cid_a)
+    df = _labelled_bursts(burst_df)
+
+    out = network.animate_pc_trajectory_by_label(rec, df, tmp_path / "time.gif", "grp",
+                                                 mode="time", duration_sec=1.0, step_sec=0.25,
+                                                 raster_window_sec=2.0, dpi=40)
+    with Image.open(out) as gif:
+        assert gif.n_frames == 4
+
+    with pytest.raises(ValueError, match="'time' or 'spin'"):
+        network.animate_pc_trajectory_by_label(rec, df, tmp_path / "x.gif", "grp", mode="nope")
+    with pytest.raises(ValueError, match=".gif or .mp4"):
+        network.animate_pc_trajectory_by_label(rec, df, tmp_path / "x.avi", "grp")
+
+
+def test_pca_result_passthrough_skips_recomputation(store, tmp_path, monkeypatch):
+    """A precomputed result must be used as given, so several figures share one PCA."""
+    config, cid_a, _ = store
+    rec, burst_df = _fixture_recording(config, cid_a)
+    df = _labelled_bursts(burst_df)
+    result = network.pca(rec, n_components=3, save=False)
+
+    def explode(*args, **kwargs):
+        raise AssertionError("pca() was recomputed despite result= being passed")
+
+    monkeypatch.setattr(network, "pca", explode)
+    plt.close(network.plot_pc_trajectory(rec, result=result, show_plot=False))
+    plt.close(network.plot_pc_trajectory_by_label(rec, df, "grp", result=result, show_plot=False))
+    network.animate_pc_trajectory(rec, tmp_path / "a.gif", result=result, duration_sec=1.0,
+                                  step_sec=0.5, raster_window_sec=2.0, dpi=40)
+    network.animate_pc_trajectory_by_label(rec, df, tmp_path / "b.gif", "grp", mode="spin",
+                                           pcs=(1, 2, 3), result=result, n_frames=2, dpi=40)
+
+    with pytest.raises(ValueError, match="computed for phase"):
+        network.plot_pc_trajectory(rec, result=result, phase="nope", show_plot=False)
+    with pytest.raises(ValueError, match="missing"):
+        network.plot_pc_trajectory(rec, result={"scores": result["scores"]}, show_plot=False)
+    with pytest.raises(ValueError, match="only 3 available"):
+        network.plot_pc_trajectory(rec, result=result, pcs=(1, 5), show_plot=False)
+
+
+def test_pca_result_passthrough_matches_a_fresh_computation(store):
+    """The passthrough is an optimisation, not a different code path."""
+    config, cid_a, _ = store
+    rec, _ = _fixture_recording(config, cid_a)
+    result = network.pca(rec, n_components=2, save=False)
+
+    fresh = network.plot_pc_trajectory(rec, show_plot=False)
+    cached = network.plot_pc_trajectory(rec, result=result, show_plot=False)
+    for attr in ("get_xlabel", "get_ylabel", "get_title"):
+        assert getattr(fresh.axes[0], attr)() == getattr(cached.axes[0], attr)()
+    assert (len(fresh.axes[0].collections[0].get_segments())
+            == len(cached.axes[0].collections[0].get_segments()))
+    plt.close(fresh)
+    plt.close(cached)
 
 
 # --- spatial -------------------------------------------------------------------------------------
