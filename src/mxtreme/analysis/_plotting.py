@@ -26,6 +26,34 @@ PHASE_STYLE = {
 
 _PHASE_ORDER = ['full', 'pre', 'train', 'post']
 
+# Okabe-Ito: eight hues that stay distinguishable under the common forms of colour-vision
+# deficiency. For plots needing one colour per category, where sampling a continuous colormap (as
+# :func:`~mxtreme.utils.get_n_colors` does) would land between a qualitative map's entries.
+CATEGORICAL_COLORS = ['#0072B2', '#E69F00', '#009E73', '#CC79A7',
+                      '#D55E00', '#56B4E9', '#F0E442', '#000000']
+
+
+def categorical_colors(values, colors=None) -> dict:
+    """One colour per value in ``values``, cycling :data:`CATEGORICAL_COLORS`.
+
+    :param values: The category values, in the order they should take palette entries.
+    :param colors: Optional ``{value: colour}`` pinning chosen values. The rest take the next
+        *unused* palette entry, so pinning one series doesn't shift the others' colours.
+    :returns: ``{value: colour}`` covering every value.
+    """
+    pinned = dict(colors or {})
+    unused = [c for c in CATEGORICAL_COLORS if c not in pinned.values()]
+    cycle = iter(unused or CATEGORICAL_COLORS)
+    resolved = {}
+    for i, value in enumerate(values):
+        if value in pinned:
+            resolved[value] = pinned[value]
+            continue
+        # Fall back to the full palette once the unused ones run out: repeating a colour beats
+        # raising on a label column with more values than the palette has entries.
+        resolved[value] = next(cycle, CATEGORICAL_COLORS[i % len(CATEGORICAL_COLORS)])
+    return resolved
+
 
 def sort_phases(phases):
     """Order pre/train/post/full first (in that priority); unknown phases after, alphabetically."""

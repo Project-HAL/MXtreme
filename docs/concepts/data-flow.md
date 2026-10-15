@@ -196,7 +196,13 @@ added without changing the interface. Two composable stages ship today:
   burst when that span falls below a threshold taken automatically from the valley of the
   `log10(ISI_N)` distribution.
 - **Rate thresholding** — within each group's ASDR segment, pick peaks and classify them
-  `"network"` or `"mini"` by height.
+  `"network"` or `"mini"` by height. Network bursts take priority: each peak's window runs between
+  the nearest quiet bins (at/under its group's local noise floor) on either side, the same bounds
+  that later contain its onset and offset. A mini whose window overlaps any network burst's window,
+  in any group, is discarded, so mini and network burst periods never overlap. So is a mini that
+  starts less than `network_gap_sec` (default 0.2 s) after a network burst's window ends, which
+  removes the short tail blips that follow most network bursts, or ends less than
+  `network_lead_sec` (default 0.1 s) before one begins, which removes pre-burst run-up.
 
 `method="isi_n"` runs grouping alone (one burst per group); the default `"isi_rate"` composes both.
 
@@ -228,7 +234,7 @@ Every topic module in {mod}`mxtreme.analysis` works at three levels:
 | Module | Recording level | Group level | Culture level |
 |---|---|---|---|
 | {mod}`~mxtreme.analysis.activity` | `firing_rate`, `instantaneous_firing_rate`, `smoothed_firing_rate`, `isi`, `burst_rate`, `ibi` | `summarize_spike_activity`, `plot_spike_activity_summary`, and the `burst` pair | `plot_spike_activity_distributions`, `plot_burst_activity_distributions` |
-| {mod}`~mxtreme.analysis.network` | `connectivity`, `communities`, `pca`, `network_metrics`, `plot_connectivity`, `plot_pc_trajectory`, `animate_pc_trajectory` | `summarize_network_metrics`, `plot_network_summary` | `plot_connectivity_grid`, `plot_pc_variance_explained`, `plot_pc_trajectory_grid` |
+| {mod}`~mxtreme.analysis.network` | `connectivity`, `communities`, `pca`, `network_metrics`, `plot_connectivity`, `plot_pc_trajectory`, `animate_pc_trajectory`, `plot_pc_trajectory_by_label`, `animate_pc_trajectory_by_label` | `summarize_network_metrics`, `plot_network_summary` | `plot_connectivity_grid`, `plot_pc_variance_explained`, `plot_pc_trajectory_grid` |
 | {mod}`~mxtreme.analysis.spatial` | `spatial_metrics` | `summarize_spatial`, `plot_spatial_summary` | `plot_mea_layouts` |
 | {mod}`~mxtreme.analysis.stimulation` | `stim_events`, `stim_delivered` | `summarize_stimulation`, `plot_stimulation_summary` | |
 | {mod}`~mxtreme.analysis.performance` | `performance_score` | `summarize_performance`, `plot_performance_summary` | |

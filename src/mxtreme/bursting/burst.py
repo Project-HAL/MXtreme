@@ -64,6 +64,28 @@ def _window(frameno, lo, hi) -> tuple[int, int]:
     return i0, i1
 
 
+def _local_noise_floor(asdr, group_start_bin, group_stop_bin) -> float:
+    """Local noise floor of the rate over a spike group: its MAD, scaled to a std estimate.
+
+    Bins at/under this floor anchor a burst's extent. Shared by detection (to bound network bursts)
+    and feature extraction (onset/offset) so both agree on where a burst begins and ends.
+    """
+    return float(median_abs_deviation(asdr[group_start_bin:group_stop_bin]) * 1.4826)
+
+
+def _anchor_bins(quiet_bins, peak_bin) -> tuple[Optional[int], Optional[int]]:
+    """Nearest quiet bins strictly before and after ``peak_bin`` (``None`` where there is none).
+
+    ``quiet_bins`` is the ascending array of bins at/under the noise floor. The two anchors bound a
+    burst: its onset/offset always fall between them.
+    """
+    i = int(np.searchsorted(quiet_bins, peak_bin, side="left"))
+    j = int(np.searchsorted(quiet_bins, peak_bin, side="right"))
+    pre = int(quiet_bins[i - 1]) if i > 0 else None
+    post = int(quiet_bins[j]) if j < len(quiet_bins) else None
+    return pre, post
+
+
 @dataclass
 class Burst:
     """One detected burst.
@@ -186,22 +208,18 @@ class Burst:
         group_start_bin = utils.frame_to_bin(self.group_start_frame, samp_rate, bin_size)
         group_stop_bin = utils.frame_to_bin(self.group_stop_frame, samp_rate, bin_size)
 
-        # Local noise floor: MAD of the rate over the spike group, scaled to a std estimate.
-        mad_value = median_abs_deviation(asdr[group_start_bin:group_stop_bin])
-        noise_std = mad_value * 1.4826
+        noise_std = _local_noise_floor(asdr, group_start_bin, group_stop_bin)
 
         # Bins whose rate sits at/under the local noise floor act as anchors around the burst.
-        zero_points = np.where(asdr <= noise_std)[0]
-        pre = zero_points[zero_points < peak_bin]
-        post = zero_points[zero_points > peak_bin]
+        pre, post = _anchor_bins(np.flatnonzero(asdr <= noise_std), peak_bin)
 
-        if len(pre) == 0:
+        if pre is None:
             raise IndexError("Burst too close to start of recording to compute onset.")
-        if len(post) == 0:
+        if post is None:
             raise IndexError("Burst too close to end of recording to compute offset.")
 
-        onset_zero_frame = utils.bin_to_frame(pre[-1], samp_rate, bin_size)
-        offset_zero_frame = utils.bin_to_frame(post[0], samp_rate, bin_size)
+        onset_zero_frame = utils.bin_to_frame(pre, samp_rate, bin_size)
+        offset_zero_frame = utils.bin_to_frame(post, samp_rate, bin_size)
         peak_frame_start = utils.bin_to_frame(peak_bin, samp_rate, bin_size)
         peak_frame_end = peak_frame_start - frames_per_bin  # lower bound for the offset slice
 

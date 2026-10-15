@@ -12,6 +12,7 @@ Helpers:
 Burst overlays (consume a burst DataFrame from :meth:`BurstSet.to_dataframe
 <mxtreme.bursting.detection.BurstSet.to_dataframe>`):
 - :func:`plot_bursts_on_asdr` -- ASDR with burst peaks marked.
+- :func:`plot_burst_panels` -- raster and rate around each of a sample of bursts, burst span shaded.
 - :func:`plot_origin_heatmap` -- burst-origin density over the MEA (``method="hist"``/``"kde"``).
 - :func:`plot_burst_vectors` -- origin->peak arrows over the MEA.
 
@@ -128,6 +129,17 @@ def raster(spike_bin, zoom=None, ax=None, title=None):
     return ax
 
 
+def _display_raster(spike_bin, rows, bin_size: float, display_bin_sec: float, first_bin: int,
+                    last_bin: int):
+    """Spike counts of ``rows`` summed into ``display_bin_sec`` bins over ``[first_bin, last_bin)``: a
+    raster small enough to redraw every frame. Returns ``(counts, bins_per_display_bin)``."""
+    factor = max(round(display_bin_sec / bin_size), 1)
+    last_bin = first_bin + (last_bin - first_bin) // factor * factor
+    # Slice time before rows: the time slice is a view, so only the clip is ever copied.
+    block = np.asarray(spike_bin[:, first_bin:last_bin][rows], dtype=np.float32)
+    return block.reshape(block.shape[0], -1, factor).sum(axis=2), factor
+
+
 def plot_timeseries_heatmap(matrix, time=None, rows=None, ax=None, cmap="magma", vmin=None, vmax=None,
                             log=False, colorbar=True, cbar_label=None, title=None,
                             xlabel="Time (s)", ylabel="Channel"):
@@ -239,6 +251,54 @@ def _as_dict(value):
         return dict(ast.literal_eval(value))
     except (ValueError, SyntaxError, TypeError):
         return {}
+
+
+_SPAN_COLUMNS = {"isi_n": ("group_start_frame", "group_stop_frame"),
+                 "features": ("onset_frame", "offset_frame")}
+
+
+def _burst_spans_frames(burst_df, span="isi_n"):
+    """Start and stop frame of each burst under the chosen boundary definition.
+
+    The detector writes two of them. ``"isi_n"`` takes the ISI-N group bounds -- the first and last
+    spike of the group -- which exist for every burst the detector found. ``"features"`` takes the
+    onset and offset computed by :meth:`BurstSet.extract_features
+    <mxtreme.bursting.detection.BurstSet.extract_features>`, which are tighter but are left at ``-1``
+    for any burst whose feature extraction failed.
+
+    Those ``-1`` rows fall back to their ISI-N bounds rather than erroring, so one bad burst doesn't
+    make ``span="features"`` unusable on a whole recording. **The fallback bounds are wider than the
+    feature bounds a reader will assume they are looking at**, so every caller must mark them in the
+    figure -- hence the third return value.
+
+    :param burst_df: Burst DataFrame from :meth:`BurstSet.to_dataframe
+        <mxtreme.bursting.detection.BurstSet.to_dataframe>`.
+    :param span: ``"isi_n"`` or ``"features"``.
+    :returns: ``(start_frames, stop_frames, fell_back)`` -- two int arrays and the boolean mask of
+        rows that asked for ``"features"`` and got their ISI-N bounds instead.
+    """
+    if span not in _SPAN_COLUMNS:
+        raise ValueError(f"span must be one of {sorted(_SPAN_COLUMNS)}, not {span!r}")
+    group_start = burst_df["group_start_frame"].to_numpy()
+    group_stop = burst_df["group_stop_frame"].to_numpy()
+    if span == "isi_n":
+        return group_start, group_stop, np.zeros(len(burst_df), dtype=bool)
+
+    start_col, stop_col = _SPAN_COLUMNS["features"]
+    if start_col not in burst_df.columns or stop_col not in burst_df.columns:
+        raise ValueError(f"burst_df has no {start_col}/{stop_col} columns; run "
+                         "BurstSet.extract_features(rec, ...) first, or pass span='isi_n'.")
+    onset = burst_df[start_col].to_numpy()
+    offset = burst_df[stop_col].to_numpy()
+    fell_back = (onset < 0) | (offset < 0)
+    if fell_back.all():
+        raise ValueError("No burst in burst_df has an extracted onset/offset (all -1); run "
+                         "BurstSet.extract_features(rec, ...) first, or pass span='isi_n'.")
+    if fell_back.any():
+        print(f"span='features': {fell_back.sum()} of {len(burst_df)} bursts have no extracted "
+              "onset/offset; using their ISI-N bounds (marked in the figure).")
+    return (np.where(fell_back, group_start, onset), np.where(fell_back, group_stop, offset),
+            fell_back)
 
 
 def _select(burst_df, kind, phase):
@@ -486,3 +546,137 @@ def plot_burst_vectors(recording, burst_df, ax=None, phase=None, kind="network",
     if owns_fig:
         plt.show()
     return ax
+
+
+def _recording_label(rec) -> str:
+    """``"DIV27"``, or ``"DIV27 · NS_ATP1hr"`` when the recording is labelled.
+
+    Duplicates :func:`~mxtreme.analysis._paths.recording_label`: this module sits *below*
+    ``mxtreme.analysis`` in the import graph and can't import from it.
+    """
+    experiment = getattr(rec, "experiment", None)
+    return f"DIV{int(rec.DIV)} · {experiment}" if experiment else f"DIV{int(rec.DIV)}"
+
+
+def _select_bursts(burst_df, n, burst_ids, seed):
+    """The rows :func:`plot_burst_panels` will draw, in the order it will draw them."""
+    if len(burst_df) == 0:
+        raise ValueError("burst_df is empty; nothing to plot.")
+    if n is not None and burst_ids is not None:
+        raise ValueError("Pass either n or burst_ids, not both.")
+
+    if burst_ids is not None:
+        missing = set(burst_ids) - set(burst_df["id"])
+        if missing:
+            raise ValueError(f"burst id(s) {sorted(missing)} are not in burst_df.")
+        # The caller chose this order, so keep it rather than re-sorting by time.
+        indexed = burst_df.set_index("id", drop=False)
+        return indexed.loc[list(burst_ids)].reset_index(drop=True)
+
+    sample = burst_df.sample(min(6 if n is None else int(n), len(burst_df)), random_state=seed)
+    return sample.sort_values("peak_frame").reset_index(drop=True)
+
+
+def plot_burst_panels(rec, burst_df, *, n=None, burst_ids=None, span="isi_n", pad_sec=0.5,
+                      display_bin_sec=0.01, seed=0, ncols=3, rows=None, color="#CC79A7",
+                      title=None, show_plot=True, save_path=None, dpi=150):
+    """Raster and population rate around each of a sample of bursts, with the burst span shaded.
+
+    One panel per burst: the spike raster over a window covering the burst plus ``pad_sec`` either
+    side, and under it the population firing rate over the same window. The burst's span is shaded
+    and its ASDR peak marked, so you can see at a glance whether the detector's boundaries line up
+    with where the array actually fires -- the quickest check that a detection run is sane.
+
+    This function does **no** filtering of its own: it draws whatever rows are in ``burst_df``, so
+    filter by ``kind``, ``phase`` or anything else before calling it, e.g.
+    ``plot_burst_panels(rec, burst_df[burst_df["kind"] == "mini"])``.
+
+    .. note::
+       The lower panel is spikes per second computed from the same display-binned counts as the
+       raster above it -- **not** ``Recording.asdr``, which is the fraction of channels active per
+       bin. The two differ in both units and resolution.
+
+    :param rec: The recording.
+    :param burst_df: Burst DataFrame from :meth:`BurstSet.to_dataframe
+        <mxtreme.bursting.detection.BurstSet.to_dataframe>`, pre-filtered to the bursts of interest.
+    :param n: How many bursts to draw, sampled at random (reproducibly, see ``seed``) and ordered by
+        time. Defaults to 6; mutually exclusive with ``burst_ids``.
+    :param burst_ids: Explicit burst ``id`` values to draw, in the order given.
+    :param span: Which burst boundaries to shade -- ``"isi_n"`` for the ISI-N group bounds, or
+        ``"features"`` for the extracted onset/offset. A burst with no extracted onset/offset falls
+        back to its ISI-N bounds; those panels are drawn with a **hatched, unfilled** span and say
+        so in their title, because the fallback bounds are wider than the feature bounds they stand
+        in for (see :func:`_burst_spans_frames`).
+    :param pad_sec: Padding either side of the burst in the window.
+    :param display_bin_sec: Bin width the raster is summed into for display. Raise it for long
+        bursts: each panel holds a ``(len(rows), window / display_bin_sec)`` array at once.
+    :param seed: Random seed for the ``n`` sample.
+    :param ncols: Panels per row.
+    :param rows: Electrode row indices to show, in order; defaults to every channel.
+    :param color: Colour of the span shading and peak marker.
+    :param title: Figure title; a default naming the recording, burst count and ``span`` when ``None``.
+    :param show_plot: Show the figure.
+    :param save_path: Full path (including filename) to save the figure to.
+    :param dpi: Resolution for the saved figure and the rasterized rasters.
+    :returns: The matplotlib Figure.
+    """
+    panels = _select_bursts(burst_df, n, burst_ids, seed)
+    start_frames, stop_frames, fell_back = _burst_spans_frames(panels, span)
+    onsets = start_frames / rec.samp_rate
+    offsets = stop_frames / rec.samp_rate
+    peaks = panels["peak_frame"].to_numpy() / rec.samp_rate
+    rows = np.arange(rec.spike_bin.shape[0]) if rows is None else np.asarray(rows)
+    kinds = panels["kind"] if "kind" in panels.columns else [None] * len(panels)
+
+    nrows = -(-len(panels) // ncols)
+    fig = plt.figure(figsize=(4 * ncols, 3.6 * nrows), constrained_layout=True)
+    outer = fig.add_gridspec(nrows, ncols)
+    for k, (bid, kind, on, peak, off, patched) in enumerate(
+            zip(panels["id"], kinds, onsets, peaks, offsets, fell_back)):
+        sub = outer[k // ncols, k % ncols].subgridspec(2, 1, height_ratios=[3, 1], hspace=0.05)
+        ax_r = fig.add_subplot(sub[0])
+        ax_a = fig.add_subplot(sub[1], sharex=ax_r)
+
+        first_bin = max(int((on - pad_sec) / rec.bin_size), 0)
+        last_bin = min(int(np.ceil((off + pad_sec) / rec.bin_size)), rec.spike_bin.shape[1])
+        counts, factor = _display_raster(rec.spike_bin, rows, rec.bin_size, display_bin_sec,
+                                         first_bin, last_bin)
+        t0, dt = first_bin * rec.bin_size, factor * rec.bin_size
+        t1 = t0 + counts.shape[1] * dt
+
+        # Saturate early, as elsewhere: a raster should show a lone spike, not only the densest bins.
+        vmax = max(float(np.percentile(counts[counts > 0], 90)) if np.any(counts) else 1.0, 1.0)
+        image = ax_r.imshow(counts, aspect="auto", interpolation="nearest", cmap="Greys", vmin=0,
+                            vmax=vmax, extent=(t0, t1, counts.shape[0] - 0.5, -0.5))
+        # A dozen panels of a 1,000-electrode raster is a million vector quads in a PDF.
+        image.set_rasterized(True)
+
+        for ax in (ax_r, ax_a):
+            if patched:
+                # Not the boundaries the caller asked for: draw them unfilled and hatched so they
+                # can never be misread as a feature-computed onset/offset.
+                ax.axvspan(on, off, fill=False, edgecolor=color, hatch="//", linestyle="--",
+                           linewidth=0.8)
+            else:
+                ax.axvspan(on, off, color=color, alpha=0.25, linewidth=0)
+            ax.axvline(peak, color=color, linewidth=0.8)
+        ax_a.plot(t0 + (np.arange(counts.shape[1]) + 0.5) * dt, counts.sum(axis=0) / dt,
+                  color="black", linewidth=0.7)
+
+        label = f"burst {bid}" + (f" · {kind}" if kind is not None else "")
+        ax_r.set_title(f"{label}  ({on:.2f}-{off:.2f} s)"
+                       + (" — ISI-N bounds (no features)" if patched else ""), fontsize=9)
+        ax_r.tick_params(labelbottom=False, labelsize=7)
+        ax_a.tick_params(labelsize=7)
+        ax_a.spines[["top", "right"]].set_visible(False)
+        if k % ncols == 0:
+            ax_r.set_ylabel("Electrode", fontsize=8)
+            ax_a.set_ylabel("Spikes/s", fontsize=8)
+        ax_a.set_xlabel("Time (s)", fontsize=8)
+
+    if title is None:
+        title = f"{len(panels)} bursts — {_recording_label(rec)}  ({span} bounds)"
+        if fell_back.any():
+            title += f"\n{fell_back.sum()} of {len(panels)} use ISI-N bounds (no features)"
+    fig.suptitle(title, fontsize=11, fontweight="bold")
+    return finish_figure(fig, save_path=save_path, show_plot=show_plot, dpi=dpi)

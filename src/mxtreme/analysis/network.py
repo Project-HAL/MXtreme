@@ -18,7 +18,11 @@ Two separate analyses run on the same signal, the double-exponential smoothed fi
   spectrum (their Eq. 17-18) -- a continuous stand-in for "how many components it takes" that tracks
   over DIV better than the integer counts -- and the recording's path through PC space over time
   (:func:`plot_pc_trajectory`, :func:`plot_pc_trajectory_grid`, and :func:`animate_pc_trajectory`,
-  which plays it alongside the spike raster).
+  which plays it alongside the spike raster). :func:`plot_pc_trajectory_by_label` colours that same
+  path by a column of the burst table instead of by time, which is what shows whether different
+  kinds of burst trace *different* excursions; :func:`animate_pc_trajectory_by_label` replays it or
+  rotates a 3-D view of it. Every trajectory function takes an optional precomputed :func:`pca`
+  ``result``, so several figures of one recording can share a single eigendecomposition.
 
 :func:`network_metrics` reduces both to per-phase scalars, and the group-level
 :func:`summarize_network_metrics` / :func:`plot_network_summary` take a ``RecordingID``,
@@ -42,6 +46,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from matplotlib.collections import LineCollection
+from matplotlib.colors import to_rgb, to_rgba
+from matplotlib.lines import Line2D
 
 from mxtreme import io
 from mxtreme.config import Config
@@ -50,18 +56,19 @@ from mxtreme.params import CommunityParams, NetworkParams
 from mxtreme.paths import CulturePaths, resolve_paths
 from mxtreme.recording import Recording
 from mxtreme.utils import get_n_colors
-from mxtreme.visualizations import finish_figure
+from mxtreme.visualizations import _burst_spans_frames, _display_raster, finish_figure
 from mxtreme.analysis import _communities
 from mxtreme.analysis.activity import _double_exponential, _decimation
 from mxtreme.analysis._group import SummarySpec, culture_summary, fill_docs, plot_summary, summarize
 from mxtreme.analysis._paths import _summary_paths, recording_key, recording_label, unflatten_recording_arrays
-from mxtreme.analysis._plotting import is_unphased, phase_tag, sort_phases
+from mxtreme.analysis._plotting import categorical_colors, is_unphased, natural_key, phase_tag, sort_phases
 
 __all__ = [
     "connectivity", "communities", "community_table", "pca", "network_metrics",
     "summarize_network_metrics", "plot_network_summary",
     "plot_connectivity", "plot_pc_trajectory", "animate_pc_trajectory",
     "plot_connectivity_grid", "plot_pc_variance_explained", "plot_pc_trajectory_grid",
+    "plot_pc_trajectory_by_label", "animate_pc_trajectory_by_label",
 ]
 
 # PCs kept in the per-culture cache behind the trajectory grid: enough for any pair of the first three.
@@ -715,19 +722,45 @@ def plot_pc_variance_explained(culture, config: Config, *, phase: str | None = N
 _TIME_UNITS = {"s": 1.0, "min": 60.0}
 
 
-def _pc_indices(pcs, n_available: int) -> tuple[int, int]:
-    """0-based rows of ``scores`` for the 1-based component numbers ``pcs``, checked."""
-    if len(pcs) != 2 or min(pcs) < 1:
-        raise ValueError(f"pcs must be two 1-based component numbers, e.g. (1, 2); got {pcs!r}")
+def _pc_indices(pcs, n_available: int, *, allow_3d: bool = False) -> tuple[int, ...]:
+    """0-based rows of ``scores`` for the 1-based component numbers ``pcs``, checked.
+
+    Two components, unless ``allow_3d`` also permits three (for the 3-D trajectory plots).
+    """
+    allowed = (2, 3) if allow_3d else (2,)
+    if len(pcs) not in allowed or min(pcs) < 1:
+        wanted = "two or three" if allow_3d else "two"
+        raise ValueError(f"pcs must be {wanted} 1-based component numbers, e.g. (1, 2); got {pcs!r}")
     if max(pcs) > n_available:
         raise ValueError(f"PC{max(pcs)} requested but only {n_available} available.")
-    return pcs[0] - 1, pcs[1] - 1
+    return tuple(p - 1 for p in pcs)
 
 
-def _segments(x, y) -> np.ndarray:
-    """Consecutive point pairs of a polyline, the shape :class:`LineCollection` takes."""
-    points = np.column_stack([x, y]).reshape(-1, 1, 2)
+def _segments(*coords) -> np.ndarray:
+    """Consecutive point pairs of a polyline, the shape :class:`LineCollection` takes.
+
+    Two coordinate arrays give ``(n - 1, 2, 2)`` segments; three give ``(n - 1, 2, 3)``, which is
+    what :class:`~mpl_toolkits.mplot3d.art3d.Line3DCollection` takes.
+    """
+    points = np.column_stack(coords).reshape(-1, 1, len(coords))
     return np.concatenate([points[:-1], points[1:]], axis=1)
+
+
+def _pca_result(rec, result, *, phase, params, n_components):
+    """The caller's precomputed :func:`pca` result, or a fresh one.
+
+    Lets a caller run :func:`pca` once and feed the same result to several trajectory figures rather
+    than paying for the eigendecomposition per figure.
+    """
+    if result is None:
+        return pca(rec, phase=phase, params=params, n_components=n_components, save=False)
+    missing = {"scores", "time_sec", "var_frac", "phase"} - set(result)
+    if missing:
+        raise ValueError(f"result is missing {sorted(missing)}; pass a dict from network.pca().")
+    if phase is not None and result["phase"] != phase:
+        raise ValueError(f"result was computed for phase {result['phase']!r}, but phase={phase!r} "
+                         "was requested; pass one or the other.")
+    return result
 
 
 def _draw_trajectory(ax, scores, time_sec, var_frac, pcs, cmap, time_unit, norm=None,
@@ -750,8 +783,9 @@ def _draw_trajectory(ax, scores, time_sec, var_frac, pcs, cmap, time_unit, norm=
 
 
 def plot_pc_trajectory(rec: Recording, *, phase: str | None = None, params: NetworkParams | None = None,
-                       pcs=(1, 2), cmap: str = "viridis", time_unit: str = "min", ax=None,
-                       colorbar: bool = True, show_plot: bool = True, save_path=None, dpi: int = 150):
+                       pcs=(1, 2), cmap: str = "viridis", time_unit: str = "min",
+                       result: dict | None = None, ax=None, colorbar: bool = True,
+                       show_plot: bool = True, save_path=None, dpi: int = 150):
     """The recording's path through PC space: one PC against another, coloured by time.
 
     Each point is the whole array's smoothed firing rate at one moment, projected onto two principal
@@ -764,6 +798,9 @@ def plot_pc_trajectory(rec: Recording, *, phase: str | None = None, params: Netw
     :param pcs: The two components to plot, 1-based (``(1, 3)`` plots PC1 against PC3).
     :param cmap: Colormap for time.
     :param time_unit: ``"min"`` or ``"s"``, for the colour bar.
+    :param result: A precomputed :func:`pca` result to plot, so several figures of the same
+        recording can share one eigendecomposition; ``None`` computes it (and ``params`` is then
+        unused). Must cover ``max(pcs)`` components, and its phase must match ``phase`` if given.
     :param ax: Axes to draw on; a new figure when ``None``.
     :param colorbar: Draw a time colour bar.
     :param show_plot: Show the figure (only when this function created it).
@@ -773,7 +810,7 @@ def plot_pc_trajectory(rec: Recording, *, phase: str | None = None, params: Netw
     """
     if time_unit not in _TIME_UNITS:
         raise ValueError(f"time_unit must be one of {sorted(_TIME_UNITS)}, not {time_unit!r}")
-    result = pca(rec, phase=phase, params=params, n_components=max(pcs), save=False)
+    result = _pca_result(rec, result, phase=phase, params=params, n_components=max(pcs))
 
     owns_fig = ax is None
     if owns_fig:
@@ -850,15 +887,197 @@ def plot_pc_trajectory_grid(culture, config: Config, *, phase: str | None = None
     return finish_figure(fig, save_path=save_path, show_plot=show_plot, dpi=dpi)
 
 
-def _display_raster(spike_bin, rows, bin_size: float, display_bin_sec: float, first_bin: int,
-                    last_bin: int):
-    """Spike counts of ``rows`` summed into ``display_bin_sec`` bins over ``[first_bin, last_bin)``: a
-    raster small enough to redraw every frame. Returns ``(counts, bins_per_display_bin)``."""
-    factor = max(round(display_bin_sec / bin_size), 1)
-    last_bin = first_bin + (last_bin - first_bin) // factor * factor
-    # Slice time before rows: the time slice is a view, so only the clip is ever copied.
-    block = np.asarray(spike_bin[:, first_bin:last_bin][rows], dtype=np.float32)
-    return block.reshape(block.shape[0], -1, factor).sum(axis=2), factor
+# --- PC trajectories coloured by a burst label ----------------------------------------------------
+
+_NO_BURST = -1
+
+
+def _label_codes(t, burst_df, label_col, labels, span, samp_rate):
+    """Which label covers each sample of ``t``.
+
+    :returns: ``(codes, counts, n_fell_back)`` -- an index into ``labels`` per sample (``-1`` where
+        no burst covers it), the number of bursts per label, and how many of those bursts fell back
+        to ISI-N bounds (see :func:`~mxtreme.visualizations._burst_spans_frames`).
+    """
+    start_frames, stop_frames, fell_back = _burst_spans_frames(burst_df, span)
+    codes = np.full(np.shape(t), _NO_BURST, dtype=int)
+    counts = {}
+    for code, label in enumerate(labels):
+        selected = (burst_df[label_col] == label).to_numpy()
+        # Later labels win where two bursts overlap -- the same precedence the legend order shows.
+        for on, off in zip(start_frames[selected] / samp_rate, stop_frames[selected] / samp_rate):
+            # `t` is strictly increasing (pca builds it as (start + arange(n)) * step), so a binary
+            # search beats a boolean mask over every sample, per burst.
+            codes[np.searchsorted(t, on, "left"):np.searchsorted(t, off, "right")] = code
+        counts[label] = int(selected.sum())
+    return codes, counts, int(fell_back.sum())
+
+
+def _padded(values, frac: float = 0.05):
+    """``(lo, hi)`` spanning ``values`` with a margin -- 3-D axes don't autoscale from collections."""
+    lo, hi = float(np.min(values)), float(np.max(values))
+    margin = (hi - lo) * frac or max(abs(hi), 1.0) * frac  # a flat component still gets a visible axis
+    return lo - margin, hi + margin
+
+
+def _labelled_trajectory_figure(rec, burst_df, label_col, *, phase, params, pcs, span, labels,
+                                colors, result, start_sec, stop_sec, base_color, linewidth, elev,
+                                azim, legend, ax):
+    """Draw the PC path split by burst label; shared by the static and animated versions.
+
+    :returns: ``(fig, ax, result, coords, t, codes, labels, colours, note)`` -- ``note`` is the
+        ISI-N-fallback warning for the title, or ``""``.
+    """
+    if label_col not in burst_df.columns:
+        raise ValueError(f"burst_df has no column {label_col!r}; available: {sorted(burst_df.columns)}")
+    result = _pca_result(rec, result, phase=phase, params=params, n_components=max(pcs))
+    idx = _pc_indices(pcs, result["scores"].shape[0], allow_3d=True)
+    t = np.asarray(result["time_sec"])
+
+    keep = np.ones(t.shape, bool)
+    if start_sec is not None:
+        keep &= t >= start_sec
+    if stop_sec is not None:
+        keep &= t <= stop_sec
+    t = t[keep]
+    coords = [result["scores"][k][keep] for k in idx]
+
+    if labels is None:
+        # Sorted, not first-seen: colour assignment must not depend on the row order of burst_df.
+        labels = sorted(burst_df[label_col].dropna().unique(), key=natural_key)
+    else:
+        labels = list(labels)
+    colours = categorical_colors(labels, colors)
+    codes, counts, n_fell_back = _label_codes(t, burst_df, label_col, labels, span, rec.samp_rate)
+
+    is_3d = len(pcs) == 3
+    owns_fig = ax is None
+    if owns_fig:
+        fig = plt.figure(figsize=(7.5, 6.0) if is_3d else (7, 5.5), constrained_layout=True)
+        ax = fig.add_subplot(projection="3d") if is_3d else fig.add_subplot()
+    else:
+        fig = ax.figure
+        if is_3d and getattr(ax, "name", "") != "3d":
+            raise ValueError("pcs names three components but ax is not a 3-D axes; create it with "
+                             "fig.add_subplot(projection='3d').")
+
+    if is_3d:
+        from mpl_toolkits.mplot3d.art3d import Line3DCollection  # keeps the 2-D path mplot3d-free
+
+    segments = _segments(*coords)
+    seg_codes = codes[:-1]
+    for code, colour, width, zorder in [(_NO_BURST, base_color, 0.6, 1)] + [
+            (c, colours[label], linewidth, 2 + c) for c, label in enumerate(labels)]:
+        selected = seg_codes == code
+        if not selected.any():
+            continue
+        if is_3d:
+            lines = Line3DCollection(segments[selected], colors=colour, linewidth=width,
+                                     zorder=zorder)
+            # autolim=True would read col._segments3d and raise on an empty collection; limits are
+            # set below from the whole trajectory, not from whichever labels happen to be present.
+            ax.add_collection3d(lines, autolim=False)
+        else:
+            lines = LineCollection(segments[selected], colors=colour, linewidth=width, zorder=zorder)
+            ax.add_collection(lines)
+        # An hour at 50 ms is ~72k segments: as vectors that bloats a PDF for no visible difference.
+        lines.set_rasterized(True)
+
+    ax.set_xlabel(f"PC{pcs[0]} ({result['var_frac'][idx[0]]:.1%})", fontsize=9)
+    ax.set_ylabel(f"PC{pcs[1]} ({result['var_frac'][idx[1]]:.1%})", fontsize=9)
+    if is_3d:
+        ax.set_zlabel(f"PC{pcs[2]} ({result['var_frac'][idx[2]]:.1%})", fontsize=9)
+        ax.set_xlim(*_padded(coords[0]))
+        ax.set_ylim(*_padded(coords[1]))
+        ax.set_zlim(*_padded(coords[2]))
+        ax.set_box_aspect((1, 1, 1))  # don't let one PC's larger scale distort the shape
+        ax.view_init(elev=elev, azim=azim)
+    else:
+        ax.autoscale_view()
+        ax.spines[["top", "right"]].set_visible(False)
+
+    if legend:
+        # The counts expose the commonest mistake: burst_df from a different phase than the PCA
+        # paints nothing, which otherwise looks like a plain grey trajectory with no error.
+        handles = [Line2D([], [], color=colours[label], lw=2, label=f"{label} (n={counts[label]})")
+                   for label in labels]
+        handles.append(Line2D([], [], color=base_color, lw=2, label="no burst"))
+        ax.legend(handles=handles, fontsize=8, frameon=False)
+
+    note = (f" · {n_fell_back}/{len(burst_df)} bursts use ISI-N bounds (no features)"
+            if n_fell_back else "")
+    return fig, ax, result, coords, t, codes, labels, colours, note
+
+
+def plot_pc_trajectory_by_label(rec: Recording, burst_df, label_col: str, *,
+                                phase: str | None = None, params: NetworkParams | None = None,
+                                pcs=(1, 2), span: str = "isi_n", labels=None, colors=None,
+                                result: dict | None = None, start_sec: float | None = None,
+                                stop_sec: float | None = None, base_color: str = "0.85",
+                                linewidth: float = 1.3, elev: float = 22.0, azim: float = -60.0,
+                                legend: bool = True, ax=None, show_plot: bool = True,
+                                save_path=None, dpi: int = 150):
+    """The recording's path through PC space, coloured by which kind of burst is happening.
+
+    Where :func:`plot_pc_trajectory` colours the path by time, this colours it by a column of the
+    burst table: every sample inside a burst takes that burst's label colour, everything else stays
+    grey. That answers whether different bursts trace *different* excursions -- whether, say, mini
+    bursts stay near the origin while network bursts swing out along PC1, or whether two
+    communities leave along separate arms.
+
+    Any column works as the label: ``"kind"``, a community assignment, a cluster id you added
+    yourself. Bursts are taken exactly as given -- filter ``burst_df`` before calling.
+
+    Pass three components (``pcs=(1, 2, 3)``) for a 3-D plot, with ``elev`` / ``azim`` setting the
+    viewing angle; :func:`animate_pc_trajectory_by_label` with ``mode="spin"`` turns the same
+    figure into a rotating animation.
+
+    :param rec: The recording.
+    :param burst_df: Burst DataFrame from :meth:`BurstSet.to_dataframe
+        <mxtreme.bursting.detection.BurstSet.to_dataframe>`, pre-filtered to the bursts of interest.
+    :param label_col: Column of ``burst_df`` to colour by. Rows whose label is missing are ignored.
+    :param phase: Phase to use; ``None`` selects the recording's first phase. The bursts are *not*
+        filtered by it -- if the legend shows ``n=0`` for every label, ``burst_df`` covers a
+        different phase than the PCA.
+    :param params: Filter settings; defaults to :class:`~mxtreme.params.NetworkParams`.
+    :param pcs: Two components for a 2-D plot, or three for a 3-D one; 1-based.
+    :param span: Which burst boundaries to paint -- ``"isi_n"`` for the ISI-N group bounds, or
+        ``"features"`` for the extracted onset/offset. Bursts with no extracted onset/offset fall
+        back to their ISI-N bounds, and the title then says how many did.
+    :param labels: Label values to draw, in order (later ones win where bursts overlap); ``None``
+        takes every value in the column, naturally sorted.
+    :param colors: Optional ``{label: colour}`` overrides; the rest come from
+        :data:`~mxtreme.analysis._plotting.CATEGORICAL_COLORS`.
+    :param result: A precomputed :func:`pca` result to plot, so several figures of the same
+        recording can share one eigendecomposition; ``None`` computes it. Must cover ``max(pcs)``
+        components, and its phase must match ``phase`` if given.
+    :param start_sec: Plot only from this time; ``None`` starts at the phase start.
+    :param stop_sec: Plot only up to this time; ``None`` runs to the phase end.
+    :param base_color: Colour of the path outside any burst.
+    :param linewidth: Width of the in-burst lines.
+    :param elev: 3-D elevation angle in degrees (ignored in 2-D).
+    :param azim: 3-D azimuth angle in degrees (ignored in 2-D).
+    :param legend: Draw the per-label legend, with each label's burst count.
+    :param ax: Axes to draw on; a new figure when ``None``. Must be a 3-D axes for three ``pcs``.
+    :param show_plot: Show the figure (only when this function created it).
+    :param save_path: Full path (including filename) to save the figure to.
+    :param dpi: Resolution for the saved figure and the rasterized lines.
+    :returns: The matplotlib Figure.
+    """
+    owns_fig = ax is None
+    fig, ax, result, _, t, _, _, _, note = _labelled_trajectory_figure(
+        rec, burst_df, label_col, phase=phase, params=params, pcs=pcs, span=span, labels=labels,
+        colors=colors, result=result, start_sec=start_sec, stop_sec=stop_sec,
+        base_color=base_color, linewidth=linewidth, elev=elev, azim=azim, legend=legend, ax=ax)
+
+    if owns_fig:
+        unphased = is_unphased([result["phase"]])
+        span_text = f"{t[0]:.0f}-{t[-1]:.0f} s" if t.size else "empty"
+        ax.set_title(f"PC trajectory by {label_col} — {recording_label(rec.DIV, rec.experiment)}"
+                     f"{phase_tag(result['phase'], unphased, '  (phase: {phase})')}"
+                     f"  ({span_text}){note}", fontsize=11, fontweight="bold")
+        return finish_figure(fig, save_path=save_path, show_plot=show_plot, dpi=dpi)
+    return fig
 
 
 def animate_pc_trajectory(rec: Recording, save_path, *, phase: str | None = None,
@@ -868,7 +1087,7 @@ def animate_pc_trajectory(rec: Recording, save_path, *, phase: str | None = None
                           display_bin_sec: float = 0.1, order: str = "index",
                           community_params: CommunityParams | None = None, show_asdr: bool = True,
                           fps: int = 20, dpi: int = 90, cmap: str = "viridis",
-                          max_frames: int | None = 3000) -> Path:
+                          result: dict | None = None, max_frames: int | None = 3000) -> Path:
     """Animate the PC trajectory being drawn next to the spike raster of the same moment.
 
     Left, the recording's path through PC space (see :func:`plot_pc_trajectory`): the whole phase in
@@ -902,6 +1121,10 @@ def animate_pc_trajectory(rec: Recording, save_path, *, phase: str | None = None
     :param fps: Frames per second of the output.
     :param dpi: Resolution of the output frames.
     :param cmap: Colormap for time along the trajectory.
+    :param result: A precomputed :func:`pca` result to animate, so several figures of the same
+        recording can share one eigendecomposition; ``None`` computes it. Must cover ``max(pcs)``
+        components, and its phase must match ``phase`` if given. ``params`` is still used for
+        ``order="communities"``.
     :param max_frames: Refuse to render more frames than this (``None``: no limit) -- a whole hour at
         the default step is 14,400 frames.
     :returns: The path written.
@@ -922,7 +1145,7 @@ def animate_pc_trajectory(rec: Recording, save_path, *, phase: str | None = None
         raise ValueError(f"save_path must end in .gif or .mp4, not {save_path.suffix!r}")
 
     params = params or NetworkParams()
-    result = pca(rec, phase=phase, params=params, n_components=max(pcs), save=False)
+    result = _pca_result(rec, result, phase=phase, params=params, n_components=max(pcs))
     i, j = _pc_indices(pcs, result["scores"].shape[0])
     x, y, t = result["scores"][i], result["scores"][j], result["time_sec"]
     if t.size < 2:
@@ -1023,3 +1246,242 @@ def animate_pc_trajectory(rec: Recording, save_path, *, phase: str | None = None
         plt.close(fig)
     print(f"Saved animation to {save_path}")
     return save_path
+
+
+def _animation_writer(save_path, fps: int):
+    """The writer for ``save_path``'s suffix, as :func:`animate_pc_trajectory` picks it."""
+    from matplotlib import animation
+
+    suffix = Path(save_path).suffix.lower()
+    if suffix == ".gif":
+        return animation.PillowWriter(fps=fps)
+    if suffix == ".mp4":
+        if not animation.writers.is_available("ffmpeg"):
+            raise RuntimeError("Writing .mp4 needs ffmpeg on the PATH; save as .gif instead.")
+        return animation.FFMpegWriter(fps=fps)
+    raise ValueError(f"save_path must end in .gif or .mp4, not {Path(save_path).suffix!r}")
+
+
+def _write_animation(anim, fig, save_path, writer, dpi: int):
+    """Render ``anim`` to ``save_path``, always closing ``fig``."""
+    save_path = Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        anim.save(save_path, writer=writer, dpi=dpi)
+    finally:
+        plt.close(fig)
+    print(f"Saved animation to {save_path}")
+    return save_path
+
+
+def _segment_colours(codes, labels, colours, base_color):
+    """RGBA per segment of the polyline, from the per-sample label codes."""
+    lookup = [to_rgba(base_color)] + [to_rgba(colours[label]) for label in labels]
+    return np.array([lookup[c + 1] for c in codes[:-1]])
+
+
+def animate_pc_trajectory_by_label(rec: Recording, burst_df, save_path, label_col: str, *,
+                                   mode: str = "time", phase: str | None = None,
+                                   params: NetworkParams | None = None, pcs=(1, 2),
+                                   span: str = "isi_n", labels=None, colors=None,
+                                   result: dict | None = None, base_color: str = "0.85",
+                                   linewidth: float = 1.3, elev: float = 22.0, azim: float = -60.0,
+                                   fps: int = 20, dpi: int = 100, max_frames: int | None = 3000,
+                                   start_sec: float | None = None, stop_sec: float | None = None,
+                                   duration_sec: float = 120.0, step_sec: float = 0.25,
+                                   raster_window_sec: float = 30.0, display_bin_sec: float = 0.1,
+                                   show_asdr: bool = True, n_frames: int = 72) -> Path:
+    """Animate the burst-labelled PC trajectory, either over time or by rotating a 3-D view.
+
+    Two animations of the figure :func:`plot_pc_trajectory_by_label` draws:
+
+    - ``mode="time"`` replays the recording. Left, the path through PC space drawn in as it
+      happens, coloured by which burst is running; right, the raster for a window around that
+      moment, tinted by the same labels, over the population rate with the bursts shaded. A burst
+      then reads as a column of colour in the raster and, at the same moment, an excursion of the
+      dot in PC space.
+    - ``mode="spin"`` holds the finished 3-D trajectory still and sweeps the camera a full turn
+      around it, which is how you see depth that a single 2-D projection hides. Needs three ``pcs``.
+
+    :param rec: The recording.
+    :param burst_df: Burst DataFrame, pre-filtered to the bursts of interest.
+    :param save_path: Where to write: ``.gif`` (Pillow, always available) or ``.mp4`` (needs ffmpeg).
+    :param label_col: Column of ``burst_df`` to colour by.
+    :param mode: ``"time"`` (replay) or ``"spin"`` (rotate a 3-D view).
+    :param phase: Phase whose PC basis is used; ``None`` selects the recording's first phase.
+    :param params: Filter settings; defaults to :class:`~mxtreme.params.NetworkParams`.
+    :param pcs: Two or three components, 1-based. ``"spin"`` requires three.
+    :param span: ``"isi_n"`` or ``"features"`` burst boundaries, as in
+        :func:`plot_pc_trajectory_by_label`.
+    :param labels: Label values to draw, in order; ``None`` takes every value in the column.
+    :param colors: Optional ``{label: colour}`` overrides.
+    :param result: A precomputed :func:`pca` result, so several figures of the same recording can
+        share one eigendecomposition; ``None`` computes it.
+    :param base_color: Colour of the path outside any burst.
+    :param linewidth: Width of the in-burst lines.
+    :param elev: 3-D elevation angle in degrees.
+    :param azim: 3-D azimuth angle; for ``"spin"``, where the turn starts.
+    :param fps: Frames per second of the output.
+    :param dpi: Resolution of the output frames.
+    :param max_frames: Refuse to render more frames than this (``None``: no limit).
+    :param start_sec: ``"time"``: clip start, in seconds of the recording; ``None`` starts at the
+        phase start. ``"spin"``: plot only from this time.
+    :param stop_sec: ``"time"``: clip end, overriding ``duration_sec`` when earlier. ``"spin"``:
+        plot only up to this time.
+    :param duration_sec: ``"time"`` only: clip length in seconds of recording.
+    :param step_sec: ``"time"`` only: recording time advanced per frame.
+    :param raster_window_sec: ``"time"`` only: width of the raster window.
+    :param display_bin_sec: ``"time"`` only: bin width the raster is summed into for display.
+    :param show_asdr: ``"time"`` only: draw the population-rate strip under the raster.
+    :param n_frames: ``"spin"`` only: frames in one full turn (72 is 5 degrees per frame).
+    :returns: The path written.
+    """
+    from matplotlib import animation
+
+    if mode not in ("time", "spin"):
+        raise ValueError(f"mode must be 'time' or 'spin', not {mode!r}")
+    if mode == "spin" and len(pcs) != 3:
+        raise ValueError("mode='spin' rotates a 3-D plot; pcs must name three components, "
+                         f"e.g. (1, 2, 3); got {pcs!r}")
+    writer = _animation_writer(save_path, fps)
+    params = params or NetworkParams()
+    is_3d = len(pcs) == 3
+
+    if mode == "spin":
+        fig, ax, _result, _coords, _t, _codes, _labels, _colours, note = _labelled_trajectory_figure(
+            rec, burst_df, label_col, phase=phase, params=params, pcs=pcs, span=span, labels=labels,
+            colors=colors, result=result, start_sec=start_sec, stop_sec=stop_sec,
+            base_color=base_color, linewidth=linewidth, elev=elev, azim=azim, legend=True, ax=None)
+        ax.set_title(f"PC trajectory by {label_col} — "
+                     f"{recording_label(rec.DIV, rec.experiment)}{note}", fontsize=11,
+                     fontweight="bold")
+        # endpoint=False: one full turn with no repeated frame, so the GIF loops seamlessly.
+        azims = azim + np.linspace(0.0, 360.0, int(n_frames), endpoint=False)
+        print(f"Animating {azims.size} frames (one full turn) -> {save_path}")
+        if max_frames is not None and azims.size > max_frames:
+            plt.close(fig)
+            raise ValueError(f"{azims.size} frames exceeds max_frames={max_frames}; lower "
+                             "n_frames, or pass max_frames=None.")
+
+        def spin(now_azim):
+            ax.view_init(elev=elev, azim=now_azim)
+            return []
+
+        # Freeze the layout: constrained_layout re-solves every frame, and a rotating 3-D
+        # projection changes the bounding box, which makes the output jitter.
+        fig.canvas.draw()
+        fig.set_layout_engine("none")
+        anim = animation.FuncAnimation(fig, spin, frames=azims, blit=False)
+        return _write_animation(anim, fig, save_path, writer, dpi)
+
+    # --- mode="time" ---
+    fig = plt.figure(figsize=(12, 5.2), constrained_layout=True)
+    grid = fig.add_gridspec(2 if show_asdr else 1, 2, width_ratios=[1, 1.5],
+                            height_ratios=[4, 1] if show_asdr else [1])
+    ax_pc = fig.add_subplot(grid[:, 0], projection="3d") if is_3d else fig.add_subplot(grid[:, 0])
+    ax_raster = fig.add_subplot(grid[0, 1])
+    ax_asdr = fig.add_subplot(grid[1, 1], sharex=ax_raster) if show_asdr else None
+
+    # The whole phase is the backdrop, so the clip is drawn against where it will go.
+    fig, ax_pc, result, coords, t, codes, labels, colours, note = _labelled_trajectory_figure(
+        rec, burst_df, label_col, phase=phase, params=params, pcs=pcs, span=span, labels=labels,
+        colors=colors, result=result, start_sec=None, stop_sec=None, base_color=base_color,
+        linewidth=linewidth, elev=elev, azim=azim, legend=True, ax=ax_pc)
+    for collection in ax_pc.collections:
+        collection.set_alpha(0.25)
+    if t.size < 2:
+        plt.close(fig)
+        raise ValueError("The phase is too short, or has too few active electrodes, to animate.")
+
+    phase_start, phase_end = float(t[0]), float(t[-1])
+    clip_start = phase_start if start_sec is None else float(start_sec)
+    clip_end = min(clip_start + float(duration_sec), phase_end)
+    if stop_sec is not None:
+        clip_end = min(clip_end, float(stop_sec))
+    if not phase_start <= clip_start < phase_end:
+        raise ValueError(f"start_sec={clip_start:g} is outside the phase "
+                         f"({phase_start:g}-{phase_end:g} s).")
+    frame_times = np.arange(clip_start, clip_end, float(step_sec))
+    print(f"Animating {frame_times.size} frames ({clip_start:.1f}-{clip_end:.1f} s) -> {save_path}")
+    if max_frames is not None and frame_times.size > max_frames:
+        plt.close(fig)
+        raise ValueError(f"{frame_times.size} frames exceeds max_frames={max_frames}; shorten "
+                         "duration_sec, raise step_sec, or pass max_frames=None.")
+
+    seg_colours = _segment_colours(codes, labels, colours, base_color)
+    if is_3d:
+        from mpl_toolkits.mplot3d.art3d import Line3DCollection
+
+        drawn = Line3DCollection([], linewidth=linewidth * 1.4, zorder=10)
+        ax_pc.add_collection3d(drawn, autolim=False)
+        (dot,) = ax_pc.plot([], [], [], "o", color="crimson", markersize=6, zorder=11)
+    else:
+        drawn = LineCollection([], linewidth=linewidth * 1.4, zorder=10)
+        ax_pc.add_collection(drawn)
+        (dot,) = ax_pc.plot([], [], "o", color="crimson", markersize=6, zorder=11)
+
+    half = raster_window_sec / 2
+    rows = np.arange(rec.spike_bin.shape[0])
+    first_bin = max(int((clip_start - half) / rec.bin_size), 0)
+    last_bin = min(int(np.ceil((clip_end + half) / rec.bin_size)), rec.spike_bin.shape[1])
+    counts, factor = _display_raster(rec.spike_bin, rows, rec.bin_size, display_bin_sec, first_bin,
+                                     last_bin)
+    raster_t0, raster_dt = first_bin * rec.bin_size, factor * rec.bin_size
+    raster_t1 = raster_t0 + counts.shape[1] * raster_dt
+    centers = raster_t0 + (np.arange(counts.shape[1]) + 0.5) * raster_dt
+
+    # Tint each raster column by the label running at that moment: white where the array is quiet,
+    # saturating to the label's colour where it fires. Greyscale would hide the labelling entirely.
+    col_codes, _, _ = _label_codes(centers, burst_df, label_col, labels, span, rec.samp_rate)
+    col_rgb = np.array([to_rgb(colours[labels[c]]) if c >= 0 else to_rgb("black")
+                        for c in col_codes])
+    vmax = max(float(np.percentile(counts[counts > 0], 75)) if np.any(counts) else 1.0, 1.0)
+    intensity = np.clip(counts / vmax, 0, 1)[..., None]
+    ax_raster.imshow(1.0 - intensity * (1.0 - col_rgb[None, :, :]), aspect="auto",
+                     interpolation="nearest", extent=(raster_t0, raster_t1, counts.shape[0] - 0.5,
+                                                      -0.5))
+    ax_raster.set_ylabel("Electrode", fontsize=9)
+    ax_raster.tick_params(labelsize=7)
+    cursors = [ax_raster.axvline(clip_start, color="crimson", linewidth=1.0)]
+
+    if ax_asdr is not None:
+        start_frames, stop_frames, _ = _burst_spans_frames(burst_df, span)
+        label_of = {label: i for i, label in enumerate(labels)}
+        for on, off, label in zip(start_frames / rec.samp_rate, stop_frames / rec.samp_rate,
+                                  burst_df[label_col]):
+            if label in label_of and off >= raster_t0 and on <= raster_t1:
+                ax_asdr.axvspan(on, off, color=colours[label], alpha=0.25, linewidth=0)
+        ax_asdr.plot(centers, counts.sum(axis=0) / raster_dt, color="black", linewidth=0.7)
+        ax_asdr.set_ylabel("Spikes/s", fontsize=8)
+        ax_asdr.set_xlabel("Time (s)", fontsize=9)
+        ax_asdr.tick_params(labelsize=7)
+        ax_asdr.spines[["top", "right"]].set_visible(False)
+        cursors.append(ax_asdr.axvline(clip_start, color="crimson", linewidth=1.0))
+        ax_raster.tick_params(labelbottom=False)
+    else:
+        ax_raster.set_xlabel("Time (s)", fontsize=9)
+
+    unphased = is_unphased([result["phase"]])
+    title = fig.suptitle("", fontsize=11, fontweight="bold")
+    label_text = (f"{recording_label(rec.DIV, rec.experiment)} by {label_col}"
+                  f"{phase_tag(result['phase'], unphased, '  (phase: {phase})')}{note}")
+    start_idx = int(np.searchsorted(t, clip_start))
+
+    def replay(now):
+        k = int(np.searchsorted(t, now, side="right"))  # samples up to and including `now`
+        if k - start_idx >= 2:
+            drawn.set_segments(_segments(*[c[start_idx:k] for c in coords]))
+            drawn.set_color(seg_colours[start_idx:k - 1])
+        if k:
+            if is_3d:
+                dot.set_data_3d([coords[0][k - 1]], [coords[1][k - 1]], [coords[2][k - 1]])
+            else:
+                dot.set_data([coords[0][k - 1]], [coords[1][k - 1]])
+        ax_raster.set_xlim(now - half, now + half)
+        for cursor in cursors:
+            cursor.set_xdata([now, now])
+        title.set_text(f"{label_text}   t = {now:6.1f} s")
+        return [drawn, dot, *cursors, title]
+
+    anim = animation.FuncAnimation(fig, replay, frames=frame_times, blit=False)
+    return _write_animation(anim, fig, save_path, writer, dpi)

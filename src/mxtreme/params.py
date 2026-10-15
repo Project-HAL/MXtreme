@@ -19,18 +19,27 @@ class BurstDetectParams:
 
     The method first groups spikes into candidate bursts with an ISI-N threshold, then picks peaks
     within each group by array-wide rate. Peaks at or above ``burst_thresh`` are ``"network"`` bursts;
-    peaks between ``noise_thresh`` and ``burst_thresh`` are ``"mini"`` bursts.
+    peaks between ``noise_thresh`` and ``burst_thresh`` are ``"mini"`` bursts, unless their window
+    overlaps a network burst's window, in which case they are discarded (network bursts take
+    priority, so mini and network burst periods never overlap), starts within ``network_gap_sec``
+    after a network burst's window ends, or ends within ``network_lead_sec`` before one begins.
 
     :param n: Number of spikes ``N`` in the ISI-N window (minimum spikes comprising a burst).
     :param noise_thresh: Lower rate bound (fraction of channels active) below which peaks are ignored.
     :param burst_thresh: Rate (fraction of channels active) separating ``mini`` from ``network`` peaks.
     :param min_dist_bins: Minimum separation between detected peaks, in bins.
+    :param network_gap_sec: Quiet time required after a network burst before a mini can start, in
+        seconds. Discards post-burst tail activity; ``0`` only forbids overlap.
+    :param network_lead_sec: Quiet time required between a mini's end and the next network burst, in
+        seconds. Discards pre-burst run-up activity; ``0`` only forbids overlap.
     """
 
     n: int = 300
     noise_thresh: float = 0.05
     burst_thresh: float = 0.15
     min_dist_bins: int = 30
+    network_gap_sec: float = 0.2
+    network_lead_sec: float = 0.1
 
 
 @dataclass(frozen=True)

@@ -161,6 +161,14 @@ plt.tight_layout()
 plt.show()
 ```
 
+Check the detected boundaries against the raw activity, a few bursts at a time. The function draws
+whatever rows you give it, so filter first; `span="features"` shades the extracted onset/offset
+instead of the wider ISI-N group bounds:
+
+```python
+viz.plot_burst_panels(rec, burst_df[burst_df["kind"] == "network"], n=6, span="features")
+```
+
 
 ## 7. Analysis
 
