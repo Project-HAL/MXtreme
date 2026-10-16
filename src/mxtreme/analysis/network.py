@@ -24,7 +24,16 @@ Two separate analyses run on the same signal, the double-exponential smoothed fi
   rotates a 3-D view of it. Every trajectory function takes an optional precomputed :func:`pca`
   ``result``, so several figures of one recording can share a single eigendecomposition.
 
-:func:`network_metrics` reduces both to per-phase scalars, and the group-level
+- **GPFA** (Gaussian Process Factor Analysis, Yu et al. 2009): :func:`gpfa` and :func:`plot_gpfa`.
+  Both analyses above are instantaneous -- PCA finds a subspace but has no notion of time, so the
+  smoothness of its trajectories is whatever the double-exponential filter imposed. GPFA puts the
+  smoothing inside the model instead: each latent dimension carries a Gaussian-process prior whose
+  **timescale is fitted** along with the factor-analysis loadings, on square-rooted spike counts
+  rather than on the filtered rate. The outcome is a few smooth latent signals plus a timescale per
+  signal that belongs to the network rather than to our settings. :func:`plot_gpfa` draws them
+  against time, optionally coloured by burst kind as :func:`plot_pc_trajectory_by_label` does.
+
+:func:`network_metrics` reduces both correlation and PCA to per-phase scalars, and the group-level
 :func:`summarize_network_metrics` / :func:`plot_network_summary` take a ``RecordingID``,
 ``CultureID``, ``CultureSelector`` or several selectors, as in :mod:`~mxtreme.analysis.activity`.
 
@@ -34,12 +43,15 @@ enforces that: every result is per phase, so reading the ``pre`` phase is the eq
 .. note::
    The smoothed rate is built from ``Recording.spike_bin``, which is **binary**. On a real hour-long
    recording that discards ~30% of spikes, inside bursts, which is where the correlation structure
-   lives -- so correlations here are a lower bound on burst-driven coupling.
+   lives -- so correlations here are a lower bound on burst-driven coupling. :func:`gpfa` is the
+   exception: it bins ``Recording.spike_data`` instead, because its observation model wants actual
+   counts.
 """
 
 from __future__ import annotations
 
 import os
+from dataclasses import fields
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -52,21 +64,21 @@ from matplotlib.lines import Line2D
 from mxtreme import io
 from mxtreme.config import Config
 from mxtreme.identity import CultureID
-from mxtreme.params import CommunityParams, NetworkParams
+from mxtreme.params import CommunityParams, GPFAParams, NetworkParams
 from mxtreme.paths import CulturePaths, resolve_paths
 from mxtreme.recording import Recording
 from mxtreme.utils import get_n_colors
 from mxtreme.visualizations import _burst_spans_frames, _display_raster, finish_figure
-from mxtreme.analysis import _communities
+from mxtreme.analysis import _communities, _gpfa
 from mxtreme.analysis.activity import _double_exponential, _decimation
 from mxtreme.analysis._group import SummarySpec, culture_summary, fill_docs, plot_summary, summarize
 from mxtreme.analysis._paths import _summary_paths, recording_key, recording_label, unflatten_recording_arrays
 from mxtreme.analysis._plotting import categorical_colors, is_unphased, natural_key, phase_tag, sort_phases
 
 __all__ = [
-    "connectivity", "communities", "community_table", "pca", "network_metrics",
+    "connectivity", "communities", "community_table", "pca", "gpfa", "network_metrics",
     "summarize_network_metrics", "plot_network_summary",
-    "plot_connectivity", "plot_pc_trajectory", "animate_pc_trajectory",
+    "plot_connectivity", "plot_pc_trajectory", "animate_pc_trajectory", "plot_gpfa",
     "plot_connectivity_grid", "plot_pc_variance_explained", "plot_pc_trajectory_grid",
     "plot_pc_trajectory_by_label", "animate_pc_trajectory_by_label",
 ]
@@ -1485,3 +1497,376 @@ def animate_pc_trajectory_by_label(rec: Recording, burst_df, save_path, label_co
 
     anim = animation.FuncAnimation(fig, replay, frames=frame_times, blit=False)
     return _write_animation(anim, fig, save_path, writer, dpi)
+
+
+# --- Gaussian Process Factor Analysis -------------------------------------------------------------
+
+_SOURCES = ("spike_data", "spike_bin")
+
+
+def _counts(rec, bin_sec: float, source: str) -> np.ndarray:
+    """Spike counts per (electrode row, bin) at ``bin_sec``, rows aligned with ``rec.spike_bin``.
+
+    ``"spike_data"`` bins the spike times, so a bin holding five spikes reads five. ``"spike_bin"``
+    sums the binary matrix instead, which is what the rest of this module uses -- cheaper, but it
+    has already clipped every bin to one spike (see the module note), so the counts it produces are
+    a lower bound.
+
+    Spikes at a negative frame number are dropped rather than folded into bin 0. Real recordings
+    carry a few (eight out of 4.5 million on the recording this was measured on), from the offset
+    between the recording's start and the first frame.
+    """
+    if source not in _SOURCES:
+        raise ValueError(f"source must be one of {list(_SOURCES)}, not {source!r}")
+    channelmap = np.asarray(rec.channelmap)
+    spike_bin = np.asarray(rec.spike_bin)
+    n_rows = channelmap.shape[0]
+    # Both sources go through the same whole-number decimation, so they return the same shape.
+    decim = _decimation(rec.bin_size, bin_sec)
+    n_bins = spike_bin.shape[1] // decim
+
+    if source == "spike_bin":
+        return spike_bin[:, :n_bins * decim].reshape(n_rows, n_bins, decim).sum(axis=2,
+                                                                                dtype=np.float64)
+
+    # channelmap column 1 is the channel id; spike_data stores the channel, so invert that mapping
+    # once rather than searching it per spike.
+    channels = channelmap[:, 1].astype(np.int64)
+    row_of_channel = np.full(channels.max() + 1 if n_rows else 0, -1, dtype=np.int64)
+    row_of_channel[channels] = np.arange(n_rows)
+
+    channel = rec.spike_data["channel"].astype(np.int64)
+    # Masked rather than clipped: a channel id outside the map would otherwise land on whichever
+    # row sits at the clip bound and have its spikes counted as that electrode's.
+    known = (channel >= 0) & (channel < row_of_channel.size)
+    rows = np.where(known, row_of_channel[np.where(known, channel, 0)], -1)
+    bins = (rec.spike_data["frameno"] / (rec.samp_rate * bin_sec)).astype(np.int64)
+    keep = (rows >= 0) & (bins >= 0) & (bins < n_bins)
+    flat = np.bincount(rows[keep] * n_bins + bins[keep], minlength=n_rows * n_bins)
+    return flat.reshape(n_rows, n_bins).astype(np.float64)
+
+
+def _gpfa_window(rec, phase: str | None, start_sec, stop_sec, bin_sec: float, n_bins: int):
+    """Bin bounds of the window to fit, and the resolved phase name.
+
+    The phase's own window first (as :func:`_phase_columns` does, in bins of ``bin_sec`` rather than
+    of the rate matrix), then narrowed by ``start_sec`` / ``stop_sec``, which are absolute recording
+    seconds as in :func:`plot_pc_trajectory_by_label`.
+    """
+    window = _resolve_phase(rec, phase)
+    name = phase or "full" if window is None else window.name
+    lo, hi = 0, n_bins
+    if window is not None:
+        frames_per_bin = rec.samp_rate * bin_sec
+        lo = max(int(window.start_frame / frames_per_bin), 0)
+        hi = min(int(window.end_frame / frames_per_bin), n_bins)
+    if start_sec is not None:
+        lo = max(lo, int(start_sec / bin_sec))
+    if stop_sec is not None:
+        hi = min(hi, int(np.ceil(stop_sec / bin_sec)))
+    return lo, max(hi, lo), name
+
+
+def _select_channels(counts: np.ndarray, bin_sec: float, params: GPFAParams) -> np.ndarray:
+    """Rows of ``counts`` worth fitting: busy enough, and at most ``max_channels`` of them.
+
+    A near-silent electrode adds a row to ``C`` and to ``R`` and no signal, and GPFA's cost is linear
+    in the electrode count, so the quiet tail of a 1,000-electrode array is pure overhead.
+    """
+    totals = counts.sum(axis=1)
+    rates = totals / max(counts.shape[1] * bin_sec, 1e-12)
+    keep = np.flatnonzero(rates >= params.min_rate_hz)
+    if params.max_channels is not None and keep.size > params.max_channels:
+        # Busiest first, then back into row order so the loadings stay in array layout.
+        keep = np.sort(keep[np.argsort(totals[keep])[::-1][:int(params.max_channels)]])
+    return keep.astype(np.int32)
+
+
+def gpfa(rec: Recording, analysis_dir=None, *, phase: str | None = None,
+         start_sec: float | None = None, stop_sec: float | None = None, n_latents: int = 3,
+         params: GPFAParams | None = None, save: bool = True) -> dict:
+    """Gaussian Process Factor Analysis of one recording: a few smooth latent signals over time.
+
+    Where :func:`pca` finds a subspace and says nothing about time, GPFA (Yu et al. 2009,
+    *J Neurophysiol*) puts the smoothing inside the model. Each latent dimension carries a
+    Gaussian-process prior with its own timescale, and that timescale is **fitted** alongside the
+    loadings, so the smoothness of the trajectories is a property of the network rather than of our
+    filter settings. The observation model is factor analysis, ``y = C x + d + noise``, on
+    square-rooted spike counts.
+
+    The window is cut into independent segments of ``params.segment_sec`` that share every
+    parameter, since spontaneous activity has no trials to use. Any part of the window short of a
+    whole segment is dropped, and said so. Latents are extracted per segment inside a padded window
+    and stitched (see :class:`~mxtreme.params.GPFAParams`), so the trace has no dip at each seam.
+
+    What comes back in ``latents`` is **orthonormalized**: ``C`` is replaced by the ``U`` of its SVD
+    and the latents transformed to match, which leaves the model's predictions identical but orders
+    the dimensions by the share of shared variance they carry, as PCA's components are. Plot those.
+    ``latents_raw`` is the model's own basis, which ``tau_sec`` refers to -- read it only when the
+    timescales are well separated, because latents with near-equal timescales can rotate freely into
+    each other.
+
+    .. note::
+       On the culture data this was built against, **the fitted timescales saturate**: at bin widths
+       of 20, 50, 100 and 250 ms, all three landed within 1% of whichever lower bound they were
+       given. The shared signal in a bursting culture is the array-wide burst transient, which is
+       sharper than any of those resolutions, so the GP asks for a delta and gets the bound. A
+       warning is printed when that happens. Read ``tau_sec`` as a limit, not a measurement, unless
+       it comes back clear of the bounds -- the latents and ``shared_var_frac`` are still fine.
+
+    .. note::
+       A fit takes about a minute on a full hour-long phase at defaults. Pass ``start_sec`` /
+       ``stop_sec`` while exploring, and hand the result to :func:`plot_gpfa` through its ``result``
+       argument rather than fitting again per figure.
+
+    :param rec: The recording.
+    :param analysis_dir: Analysis output root; saved there as ``..._gpfa_<phase>_p<n>.npz`` (plus the
+        window when one is given) when ``save`` is on. The file name does **not** record the rest of
+        ``params``, so a cached file from different settings is overwritten rather than kept apart;
+        every setting is stored inside it.
+    :param phase: Phase to use; ``None`` selects the recording's first phase.
+    :param start_sec: Fit only from this time, in absolute recording seconds; ``None`` starts at the
+        phase start.
+    :param stop_sec: Fit only up to this time; ``None`` runs to the phase end.
+    :param n_latents: Number of latent dimensions. Two or three is the usual starting point; it is
+        clamped to the number of electrodes kept.
+    :param params: Settings; defaults to :class:`~mxtreme.params.GPFAParams`.
+    :param save: Write the result (needs ``analysis_dir``).
+    :returns: ``{"latents": (p, n_bins) orthonormalized latents -- what you plot, "latents_raw":
+        the model's own basis, "time_sec": each bin's time in the recording, "tau_sec": the GP
+        timescale of each raw latent, "C", "C_orth": (n_kept, p) loadings, "d", "R": per-electrode
+        offset and private variance, "singular_values", "shared_var_frac": each latent's share of
+        ``trace(C C')``, "shared_var_total": shared over total variance, "channels", "elec_index":
+        the electrodes kept, "log_likelihood": the EM trace, "n_iter", "converged", "bin_sec",
+        "segment_sec", "n_segments", "n_latents", "phase", "window_sec"}``.
+    """
+    params = params or GPFAParams()
+    if int(n_latents) < 1:
+        raise ValueError(f"n_latents must be at least 1, not {n_latents!r}")
+    bin_sec = _decimation(rec.bin_size, params.bin_sec) * rec.bin_size
+    if params.learn_tau and params.tau_bounds_sec[0] < bin_sec:
+        raise ValueError(f"tau_bounds_sec starts at {params.tau_bounds_sec[0]} s, below the "
+                         f"{bin_sec:g} s bin width; a timescale under one bin is indistinguishable "
+                         "from noise. Raise the lower bound or lower bin_sec.")
+
+    counts = _counts(rec, bin_sec, params.source)
+    lo, hi, name = _gpfa_window(rec, phase, start_sec, stop_sec, bin_sec, counts.shape[1])
+    n_bins_per_seg = max(round(params.segment_sec / bin_sec), 1)
+    if hi - lo < n_bins_per_seg:
+        raise ValueError(f"the window is {(hi - lo) * bin_sec:.3g} s but segment_sec is "
+                         f"{params.segment_sec:g} s, so there is not one whole segment to fit. "
+                         "Widen the window or lower segment_sec.")
+
+    keep = _select_channels(counts[:, lo:hi], bin_sec, params)
+    window = counts[np.ix_(keep, np.arange(lo, hi))]
+    if params.sqrt_transform:
+        window = np.sqrt(window)
+    dropped = (hi - lo) % n_bins_per_seg
+    if dropped:
+        print(f"  dropping the last {dropped * bin_sec:.3g} s: short of a whole segment")
+
+    model = _gpfa.fit(window, params, n_latents=n_latents, bin_sec=bin_sec,
+                      n_bins_per_seg=n_bins_per_seg)
+    pad = _gpfa.pad_bins(params, model["tau_sec"], n_bins_per_seg, bin_sec)
+    raw = _gpfa.latents(window, model, params, bin_sec=bin_sec, n_bins_per_seg=n_bins_per_seg,
+                        pad=pad)
+    c_orth, orth, singular, var_frac = _gpfa.orthonormalize(model["C"], raw)
+    shared = float(np.sum(model["C"] ** 2))
+    total_var = shared + float(np.sum(model["R"]))
+
+    n_kept = raw.shape[1]
+    result = {
+        "latents": orth.astype(np.float32), "latents_raw": raw.astype(np.float32),
+        "time_sec": (lo + np.arange(n_kept)) * bin_sec, "tau_sec": model["tau_sec"],
+        "C": model["C"], "C_orth": c_orth, "d": model["d"], "R": model["R"],
+        "singular_values": singular, "shared_var_frac": var_frac,
+        "shared_var_total": shared / total_var if total_var else np.nan,
+        "channels": np.asarray(rec.channelmap)[keep, 1].astype(np.int64), "elec_index": keep,
+        "log_likelihood": model["log_likelihood"], "n_iter": model["n_iter"],
+        "converged": model["converged"], "bin_sec": bin_sec,
+        "segment_sec": n_bins_per_seg * bin_sec, "n_segments": model["n_segments"],
+        "n_latents": orth.shape[0], "phase": name,
+        "window_sec": np.array([lo * bin_sec, (lo + n_kept) * bin_sec]),
+    }
+
+    if save and analysis_dir is not None:
+        windowed = "" if start_sec is None and stop_sec is None else \
+            f"_{round(result['window_sec'][0])}-{round(result['window_sec'][1])}s"
+        path = _recording_output(rec, analysis_dir,
+                                 f"gpfa_{name}_p{result['n_latents']}{windowed}.npz")
+        stored = {k: v for k, v in result.items() if k != "phase"}
+        np.savez_compressed(path, phase=np.array(name), **stored,
+                            **{f"params_{f.name}": np.array(getattr(params, f.name))
+                               for f in fields(params)})
+        print(f"Saved GPFA to {path}")
+    return result
+
+
+def _gpfa_result(rec, result, *, phase, start_sec, stop_sec, n_latents, params):
+    """The caller's precomputed :func:`gpfa` result, or a fresh fit.
+
+    Worth more than :func:`_pca_result`'s equivalent: a fit costs minutes, so refitting once per
+    figure is not something to do by accident.
+    """
+    if result is None:
+        return gpfa(rec, phase=phase, start_sec=start_sec, stop_sec=stop_sec, n_latents=n_latents,
+                    params=params, save=False)
+    missing = {"latents", "time_sec", "phase"} - set(result)
+    if missing:
+        raise ValueError(f"result is missing {sorted(missing)}; pass a dict from network.gpfa().")
+    if phase is not None and result["phase"] != phase:
+        raise ValueError(f"result was computed for phase {result['phase']!r}, but phase={phase!r} "
+                         "was requested; pass one or the other.")
+    return result
+
+
+def plot_gpfa(rec: Recording, *, phase: str | None = None, start_sec: float | None = None,
+              stop_sec: float | None = None, n_latents: int = 3, params: GPFAParams | None = None,
+              result: dict | None = None, burst_df=None, label_col: str = "kind", labels=None,
+              colors=None, span: str = "isi_n", time_unit: str = "min", offset=True,
+              base_color: str = "0.85", linewidth: float = 1.0, legend: bool = True, ax=None,
+              show_plot: bool = True, save_path=None, dpi: int = 150):
+    """The GPFA latents against time, optionally coloured by which kind of burst is happening.
+
+    One trace per latent dimension, stacked, strongest first (see :func:`gpfa` on
+    orthonormalization). Given a ``burst_df``, every sample inside a burst takes that burst's label
+    colour and everything else stays grey -- the same encoding as
+    :func:`plot_pc_trajectory_by_label`, so the two read alike. That is what shows whether network
+    bursts are excursions of the leading latent while minis stay near zero, or whether a kind of
+    burst has a signature of its own further down.
+
+    Any column of the burst table works as the label: ``"kind"``, a community assignment, a cluster
+    id you added. Bursts are taken exactly as given -- filter ``burst_df`` before calling.
+
+    :param rec: The recording.
+    :param phase: Phase to use; ``None`` selects the recording's first phase.
+    :param start_sec: Start of the window, in absolute recording seconds; ``None`` is the phase
+        start. With a precomputed ``result`` this narrows what is drawn, which is how you zoom into
+        a long fit without paying for it again.
+    :param stop_sec: End of the window; ``None`` is the phase end.
+    :param n_latents: Number of latent dimensions to fit (ignored when ``result`` is given).
+    :param params: Settings; defaults to :class:`~mxtreme.params.GPFAParams`.
+    :param result: A precomputed :func:`gpfa` result to plot, so a fit can serve several figures;
+        ``None`` fits, which takes minutes on a long window. Its phase must match ``phase`` if given.
+    :param burst_df: Burst DataFrame from :meth:`BurstSet.to_dataframe
+        <mxtreme.bursting.detection.BurstSet.to_dataframe>`; ``None`` draws plain traces.
+    :param label_col: Column of ``burst_df`` to colour by.
+    :param labels: Label values to draw, in order (later ones win where bursts overlap); ``None``
+        takes every value in the column, naturally sorted.
+    :param colors: Optional ``{label: colour}`` overrides; the rest come from
+        :data:`~mxtreme.analysis._plotting.CATEGORICAL_COLORS`.
+    :param span: Which burst boundaries to paint -- ``"isi_n"`` for the ISI-N group bounds, or
+        ``"features"`` for the extracted onset/offset.
+    :param time_unit: ``"min"`` or ``"s"`` for the time axis.
+    :param offset: Vertical spacing between traces: ``True`` picks one from their spread, ``False``
+        overlays them, a number sets it.
+    :param base_color: Colour of a trace outside any burst.
+    :param linewidth: Width of the traces.
+    :param legend: Draw the per-label legend, with each label's burst count.
+    :param ax: Axes to draw on; a new figure when ``None``.
+    :param show_plot: Show the figure (only when this function created it).
+    :param save_path: Full path (including filename) to save the figure to.
+    :param dpi: Resolution for the saved figure and the rasterized traces.
+    :returns: The matplotlib Figure.
+    """
+    if time_unit not in _TIME_UNITS:
+        raise ValueError(f"time_unit must be one of {sorted(_TIME_UNITS)}, not {time_unit!r}")
+    result = _gpfa_result(rec, result, phase=phase, start_sec=start_sec, stop_sec=stop_sec,
+                          n_latents=n_latents, params=params)
+    traces = np.asarray(result["latents"], dtype=float)
+    t_sec = np.asarray(result["time_sec"], dtype=float)
+    # Applied to the samples as well as to the fit, so a window means the same thing whether the fit
+    # happened here or was handed in through `result` -- a precomputed result covers its own window,
+    # and narrowing it further is how you zoom in without refitting.
+    keep = np.ones(t_sec.shape, bool)
+    if start_sec is not None:
+        keep &= t_sec >= start_sec
+    if stop_sec is not None:
+        keep &= t_sec <= stop_sec
+    traces, t_sec = traces[:, keep], t_sec[keep]
+    if t_sec.size < 2:
+        raise ValueError(f"the window leaves {t_sec.size} sample(s) of the fit to plot; widen "
+                         "start_sec/stop_sec, or check they fall inside the fitted window "
+                         f"{np.asarray(result.get('window_sec', [np.nan, np.nan]))}.")
+    t = t_sec / _TIME_UNITS[time_unit]
+    p = traces.shape[0]
+
+    codes, counts, note = None, {}, ""
+    if burst_df is not None:
+        if label_col not in burst_df.columns:
+            raise ValueError(f"burst_df has no column {label_col!r}; available: "
+                             f"{sorted(burst_df.columns)}")
+        if labels is None:
+            # Sorted, not first-seen: colour assignment must not depend on burst_df's row order.
+            labels = sorted(burst_df[label_col].dropna().unique(), key=natural_key)
+        else:
+            labels = list(labels)
+        codes, counts, n_fell_back = _label_codes(t_sec, burst_df, label_col, labels, span,
+                                                  rec.samp_rate)
+        note = (f" · {n_fell_back}/{len(burst_df)} bursts use ISI-N bounds (no features)"
+                if n_fell_back else "")
+    colours = categorical_colors(labels or [], colors)
+
+    # A fixed step keeps the traces apart without rescaling any of them, so their amplitudes stay
+    # comparable between dimensions -- the leading latent really is the biggest.
+    if offset is True:
+        spread = float(np.percentile(np.abs(traces), 99)) if traces.size else 1.0
+        step = 3.0 * (spread or 1.0)
+    else:
+        step = 0.0 if offset is False else float(offset)
+    centres = -step * np.arange(p)
+
+    owns_fig = ax is None
+    if owns_fig:
+        fig, ax = plt.subplots(figsize=(10, 1.1 * p + 2.0), constrained_layout=True)
+    else:
+        fig = ax.figure
+
+    for i in range(p):
+        y = traces[i] + centres[i]
+        if codes is None:
+            ax.plot(t, y, color="#333333", linewidth=linewidth, rasterized=True)
+            continue
+        segments = _segments(t, y)
+        seg_codes = codes[:-1]
+        for code, colour, width, zorder in [(_NO_BURST, base_color, linewidth * 0.8, 1)] + [
+                (c, colours[label], linewidth, 2 + c) for c, label in enumerate(labels)]:
+            selected = seg_codes == code
+            if not selected.any():
+                continue
+            lines = LineCollection(segments[selected], colors=colour, linewidth=width,
+                                   zorder=zorder)
+            # An hour at 20 ms is 180k segments per trace: as vectors that bloats a PDF.
+            lines.set_rasterized(True)
+            ax.add_collection(lines)
+    if codes is not None:
+        ax.set_xlim(t[0], t[-1])
+        ax.autoscale_view(scalex=False)
+
+    ax.set_yticks(centres)
+    ax.set_yticklabels([f"x{i + 1}" + (f"\n{result['shared_var_frac'][i]:.0%}"
+                                       if "shared_var_frac" in result else "")
+                        for i in range(p)], fontsize=8)
+    ax.set_xlabel(f"Time ({time_unit})", fontsize=9)
+    ax.set_ylabel("Latent", fontsize=9)
+    ax.spines[["top", "right"]].set_visible(False)
+    if legend and codes is not None:
+        handles = [Line2D([], [], color=colours[label], lw=2, label=f"{label} (n={counts[label]})")
+                   for label in labels]
+        handles.append(Line2D([], [], color=base_color, lw=2, label="no burst"))
+        # The legend sits in a strip of headroom opened above the traces, rather than over the
+        # leading latent -- which is exactly where the bursts it is labelling are.
+        low, high = ax.get_ylim()
+        ax.set_ylim(low, high + 0.18 * (high - low))
+        ax.legend(handles=handles, fontsize=8, frameon=False, ncol=len(handles),
+                  loc="upper center", bbox_to_anchor=(0.5, 1.0))
+
+    if owns_fig:
+        unphased = is_unphased([result["phase"]])
+        taus = ", ".join(f"{tau:.3g}" for tau in np.asarray(result.get("tau_sec", [])))
+        by = f" by {label_col}" if codes is not None else ""
+        ax.set_title(f"GPFA latents{by} — {recording_label(rec.DIV, rec.experiment)}"
+                     f"{phase_tag(result['phase'], unphased, '  (phase: {phase})')}"
+                     f"  (τ = {taus} s){note}", fontsize=11, fontweight="bold")
+        return finish_figure(fig, save_path=save_path, show_plot=show_plot, dpi=dpi)
+    return fig

@@ -63,6 +63,13 @@ Recording level: one :class:`~mxtreme.recording.Recording` in, the data out.
 .. autofunction:: mxtreme.analysis.network.plot_pc_trajectory_by_label
 .. autofunction:: mxtreme.analysis.network.animate_pc_trajectory_by_label
 
+Gaussian Process Factor Analysis: latent signals with a fitted timescale, where
+:func:`~mxtreme.analysis.network.pca` has no notion of time at all. Settings in
+:class:`~mxtreme.params.GPFAParams`.
+
+.. autofunction:: mxtreme.analysis.network.gpfa
+.. autofunction:: mxtreme.analysis.network.plot_gpfa
+
 Community structure of a connectivity matrix (the output of :func:`~mxtreme.analysis.network.connectivity`).
 
 .. autofunction:: mxtreme.analysis.network.communities

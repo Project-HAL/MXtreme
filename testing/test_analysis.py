@@ -16,9 +16,11 @@ from mxtreme.config import Config
 from mxtreme.identity import CultureID, CultureSelector
 from mxtreme.recording import Recording
 from mxtreme.bursting import BurstDetector
-from mxtreme.params import BurstDetectParams, BurstFeatureParams, CommunityParams, NetworkParams
+from mxtreme.params import (BurstDetectParams, BurstFeatureParams, CommunityParams, GPFAParams,
+                            NetworkParams)
 from mxtreme.paths import CulturePaths, resolve_paths, resolve_paths_flat
 from mxtreme.analysis import activity, network, performance, spatial, stimulation, generate_report
+from mxtreme.analysis import _gpfa
 from mxtreme.analysis._paths import _summary_paths, load_population_summaries
 from mxtreme.analysis._stats import aggregate_by_div_phase
 
@@ -1518,6 +1520,302 @@ def test_pca_result_passthrough_matches_a_fresh_computation(store):
             == len(cached.axes[0].collections[0].get_segments()))
     plt.close(fresh)
     plt.close(cached)
+
+
+# --- network: GPFA -------------------------------------------------------------------------------
+
+# Small enough that a dense reference of the whole pT x pT / qT x qT algebra is cheap to build.
+_GPFA_TINY = dict(q=5, p=2, n_bins=20, n_seg=3, bin_sec=0.02)
+
+
+def _gpfa_tiny_model(seed=0):
+    """A random GPFA model and some data on the tiny shape, plus its dense time-major references."""
+    s = _GPFA_TINY
+    rng = np.random.default_rng(seed)
+    C = rng.normal(size=(s["q"], s["p"]))
+    d = rng.normal(size=s["q"])
+    R = rng.uniform(0.5, 2.0, size=s["q"])
+    taus = np.array([0.08, 0.3])
+    Y = rng.normal(size=(s["q"], s["n_seg"], s["n_bins"])) * 1.5 + d[:, None, None]
+
+    sq = _gpfa._sq_dists(s["n_bins"], s["bin_sec"])
+    k_big = np.zeros((s["n_bins"] * s["p"], s["n_bins"] * s["p"]))
+    rows = np.arange(s["n_bins"]) * s["p"]
+    for i, tau in enumerate(taus):
+        index = rows + i
+        k_big[np.ix_(index, index)] = _gpfa._kernel(tau, sq, 1e-3)
+    c_big = np.kron(np.eye(s["n_bins"]), C)
+    r_big = np.kron(np.eye(s["n_bins"]), np.diag(R))
+    return C, d, R, taus, Y, sq, k_big, c_big, r_big
+
+
+def test_gpfa_loglik_matches_a_brute_force_marginal():
+    """One check over the determinant lemma, the Woodbury quadratic form and the kernel at once."""
+    from scipy.stats import multivariate_normal
+
+    s = _GPFA_TINY
+    C, d, R, taus, Y, sq, k_big, c_big, r_big = _gpfa_tiny_model()
+    kinvs, logdet_k = _gpfa._prior_precision(taus, sq, 1e-3)
+    post = _gpfa._posterior(kinvs, C, R, per_dim=False)
+    rhs = _gpfa._rhs(Y, C, R, d)
+    means = _gpfa._means(post["chol"], rhs, s["p"])
+
+    flat = Y.reshape(s["q"], -1)
+    n_total = s["n_seg"] * s["n_bins"]
+    quadratic = float(np.sum((np.einsum("qt,qt->q", flat, flat)
+                              - 2 * d * flat.sum(axis=1) + n_total * d * d) / R))
+    mine = _gpfa._loglik(s["n_seg"], s["n_bins"], R, logdet_k, post["logdet_prec"], quadratic,
+                         float(np.einsum("in,in->", rhs, _gpfa._time_major(means))))
+
+    cov = c_big @ k_big @ c_big.T + r_big
+    reference = sum(multivariate_normal.logpdf(Y[:, n, :].T.reshape(-1), mean=np.tile(d, s["n_bins"]),
+                                               cov=cov)
+                    for n in range(s["n_seg"]))
+    assert mine == pytest.approx(reference, rel=1e-9)
+
+
+def test_gpfa_posterior_mean_matches_a_dense_solve():
+    """The time-major packing (bin t, latent i -> t * p + i) is the likeliest place to go wrong, and
+    only a dense reference catches a transposed one."""
+    s = _GPFA_TINY
+    C, d, R, taus, Y, sq, k_big, c_big, r_big = _gpfa_tiny_model()
+    kinvs, _ = _gpfa._prior_precision(taus, sq, 1e-3)
+    post = _gpfa._posterior(kinvs, C, R, per_dim=True)
+    means = _gpfa._means(post["chol"], _gpfa._rhs(Y, C, R, d), s["p"])
+
+    precision = np.linalg.inv(k_big) + c_big.T @ np.linalg.inv(r_big) @ c_big
+    sigma = np.linalg.inv(precision)
+    assert _gpfa._precision(kinvs, C.T @ (C / R[:, None])) == pytest.approx(precision, abs=1e-8)
+
+    bins = np.arange(s["n_bins"])
+    assert post["sum_sigma_tt"] == pytest.approx(
+        sigma.reshape(s["n_bins"], s["p"], s["n_bins"], s["p"])[bins, :, bins, :].sum(axis=0))
+    for i in range(s["p"]):
+        index = bins * s["p"] + i
+        assert post["sigma_dim"][i] == pytest.approx(sigma[np.ix_(index, index)])
+
+    d_big = np.tile(d, s["n_bins"])
+    for n in range(s["n_seg"]):
+        y_vec = Y[:, n, :].T.reshape(-1)
+        reference = sigma @ (c_big.T @ np.linalg.solve(r_big, y_vec - d_big))
+        assert means[:, n, :].T.reshape(-1) == pytest.approx(reference, abs=1e-9)
+
+
+def _gpfa_sample(taus_true, q=30, n_bins=500, n_seg=20, bin_sec=0.02, seed=1):
+    """Data drawn from the GPFA model itself, with the true parameters alongside."""
+    rng = np.random.default_rng(seed)
+    C = rng.normal(size=(q, len(taus_true)))
+    d = rng.normal(size=q) * 0.2
+    R = rng.uniform(0.2, 0.6, size=q)
+    sq = _gpfa._sq_dists(n_bins, bin_sec)
+    latents = np.stack([np.linalg.cholesky(_gpfa._kernel(tau, sq, 1e-3)) @ rng.normal(size=(n_bins,
+                                                                                            n_seg))
+                        for tau in taus_true])
+    Y = np.einsum("qp,ptn->qnt", C, latents) + d[:, None, None]
+    Y += rng.normal(size=Y.shape) * np.sqrt(R)[:, None, None]
+    return Y.reshape(q, -1), C, R
+
+
+def test_gpfa_recovers_a_known_latent_subspace_and_timescale():
+    """Ground truth. The subspace is compared by principal angles, because ``C`` is identified only
+    up to a ``p x p`` transform -- comparing the loadings directly would be comparing an arbitrary
+    basis."""
+    taus_true = (0.3, 0.08)
+    Y, C_true, R_true = _gpfa_sample(taus_true, q=20, n_bins=150, n_seg=40)
+    # The timescales need ~150 iterations to finish separating; the likelihood is nearly flat long
+    # before they have. Keeping the segments short is what makes that affordable here.
+    model = _gpfa.fit(Y, GPFAParams(max_iter=150), n_latents=2, bin_sec=0.02, n_bins_per_seg=150,
+                      verbose=False)
+
+    fitted, true = np.linalg.qr(model["C"])[0], np.linalg.qr(C_true)[0]
+    angles = np.degrees(np.arccos(np.clip(np.linalg.svd(fitted.T @ true)[1], -1.0, 1.0)))
+    assert angles.max() < 10.0
+
+    # Measured error here is under 3%; 15% leaves room without pretending to more than GPFA gives.
+    for fitted_tau, true_tau in zip(np.sort(model["tau_sec"])[::-1], sorted(taus_true, reverse=True)):
+        assert fitted_tau == pytest.approx(true_tau, rel=0.15)
+    assert np.abs(model["R"] - R_true).mean() / R_true.mean() < 0.3
+
+
+@pytest.mark.parametrize("learn_tau", [True, False])
+def test_gpfa_log_likelihood_increases_monotonically(learn_tau):
+    """EM cannot go downhill. The timescale update is the only step that could break that, so it is
+    the ``True`` case that earns this test its keep."""
+    Y, _, _ = _gpfa_sample((0.3, 0.08), q=15, n_bins=200, n_seg=8)
+    model = _gpfa.fit(Y, GPFAParams(max_iter=25, learn_tau=learn_tau), n_latents=2, bin_sec=0.02,
+                      n_bins_per_seg=200, verbose=False)
+    trace = model["log_likelihood"]
+    assert trace.size == 25
+    assert np.all(np.diff(trace) >= -1e-6)
+    assert trace[-1] > trace[0]
+
+
+def test_gpfa_more_latents_fit_two_latent_data_better():
+    """A sanity check on the likelihood's sign and scale that monotonicity alone would pass over."""
+    Y, _, _ = _gpfa_sample((0.3, 0.08), q=15, n_bins=200, n_seg=8)
+    kwargs = dict(bin_sec=0.02, n_bins_per_seg=200, verbose=False)
+    one = _gpfa.fit(Y, GPFAParams(max_iter=25), n_latents=1, **kwargs)
+    two = _gpfa.fit(Y, GPFAParams(max_iter=25), n_latents=2, **kwargs)
+    assert two["log_likelihood"][-1] > one["log_likelihood"][-1]
+
+
+def test_gpfa_initial_timescales_are_spread_not_equal():
+    """Equal timescales are a saddle the fit crawls off over hundreds of iterations."""
+    taus = _gpfa._init_taus(GPFAParams(tau_init_sec=0.1), 3)
+    assert taus[0] < taus[1] < taus[2]
+    assert taus[1] == pytest.approx(0.1)
+    assert _gpfa._init_taus(GPFAParams(tau_init_sec=0.1), 1).tolist() == [0.1]
+    # Clamped into the bounds rather than starting outside them.
+    bounded = _gpfa._init_taus(GPFAParams(tau_init_sec=0.1, tau_bounds_sec=(0.05, 0.2)), 3)
+    assert bounded.min() >= 0.05 and bounded.max() <= 0.2
+
+
+def test_orthonormalize_preserves_the_reconstruction():
+    rng = np.random.default_rng(3)
+    C = rng.normal(size=(12, 3))
+    X = rng.normal(size=(3, 40))
+    C_orth, X_orth, singular, frac = _gpfa.orthonormalize(C, X)
+
+    assert C_orth @ X_orth == pytest.approx(C @ X, abs=1e-10)
+    assert C_orth.T @ C_orth == pytest.approx(np.eye(3), abs=1e-10)
+    assert np.all(np.diff(singular) <= 0)
+    assert np.all(C_orth.sum(axis=0) > 0)  # signs fixed, as in pca()
+    assert frac.sum() == pytest.approx(1.0) and np.all(np.diff(frac) <= 0)
+
+
+def _gpfa_test_params(**overrides):
+    """Settings small enough for the fixture recording; never the defaults, which take minutes."""
+    base = dict(max_iter=5, segment_sec=1.0, bin_sec=0.05, max_channels=10,
+                tau_bounds_sec=(0.05, 1.0))
+    return GPFAParams(**{**base, **overrides})
+
+
+def test_gpfa_recording_level(store):
+    config, cid_a, _ = store
+    rec, _ = _fixture_recording(config, cid_a)
+
+    result = network.gpfa(rec, config.analysis_dir, n_latents=2, params=_gpfa_test_params())
+    assert result["latents"].shape[0] == result["n_latents"] == 2
+    assert result["latents"].shape[1] == result["time_sec"].size
+    assert result["latents_raw"].shape == result["latents"].shape
+    assert result["phase"] == "full"
+    assert result["bin_sec"] == pytest.approx(0.05)
+    assert result["C"].shape == (result["elec_index"].size, 2)
+    assert np.array_equal(result["channels"],
+                          np.asarray(rec.channelmap)[result["elec_index"], 1].astype(np.int64))
+    assert np.all(np.diff(result["log_likelihood"]) >= -1e-6)
+    assert result["shared_var_frac"].sum() == pytest.approx(1.0)
+    assert 0.0 <= result["shared_var_total"] <= 1.0
+    # The window is a whole number of segments, so time_sec ends short of the recording.
+    assert result["time_sec"].size == result["n_segments"] * round(1.0 / 0.05)
+
+    saved = {p.name.split("well0_")[-1] for p in (config.analysis_dir / "network").rglob("*")}
+    assert "gpfa_full_p2.npz" in saved
+
+
+def test_gpfa_names_a_windowed_fit_separately(store):
+    config, cid_a, _ = store
+    rec, _ = _fixture_recording(config, cid_a)
+    network.gpfa(rec, config.analysis_dir, start_sec=5.0, stop_sec=15.0, n_latents=2,
+                 params=_gpfa_test_params())
+    saved = {p.name.split("well0_")[-1] for p in (config.analysis_dir / "network").rglob("*")}
+    assert "gpfa_full_p2_5-15s.npz" in saved
+
+
+def test_gpfa_does_not_save_without_an_analysis_dir(store):
+    config, cid_a, _ = store
+    rec, _ = _fixture_recording(config, cid_a)
+    network.gpfa(rec, n_latents=2, params=_gpfa_test_params())
+    assert not (config.analysis_dir / "network").exists()
+
+
+def test_gpfa_count_sources_agree_in_shape_and_spike_bin_loses_spikes(store):
+    """``spike_bin`` is binary, so summing it can only undercount a bin holding several spikes."""
+    config, cid_a, _ = store
+    rec, _ = _fixture_recording(config, cid_a)
+
+    from_spikes = network._counts(rec, 0.05, "spike_data")
+    from_bins = network._counts(rec, 0.05, "spike_bin")
+    assert from_spikes.shape == from_bins.shape
+    assert from_spikes.sum() > from_bins.sum()
+    # Per electrode, not per bin: a real recording can carry a handful of spikes at negative frame
+    # numbers, which preprocessing folded into bin 0 and which `_counts` drops as timeless. That
+    # makes the elementwise comparison false on real data while this one stays true, and it is this
+    # one that would catch a wrong row mapping between the two sources.
+    assert np.all(from_spikes.sum(axis=1) >= from_bins.sum(axis=1))
+    assert from_bins.max() <= round(0.05 / rec.bin_size)  # saturation: one spike per binary bin
+
+    with pytest.raises(ValueError, match="source must be one of"):
+        network._counts(rec, 0.05, "nope")
+
+
+@pytest.mark.parametrize("kwargs, match", [
+    (dict(n_latents=0), "n_latents must be at least 1"),
+    (dict(params=_gpfa_test_params(segment_sec=1e6)), "not one whole segment"),
+    (dict(params=_gpfa_test_params(tau_bounds_sec=(0.01, 1.0))), "below the 0.05 s bin width"),
+])
+def test_gpfa_rejects_impossible_settings(store, kwargs, match):
+    config, cid_a, _ = store
+    rec, _ = _fixture_recording(config, cid_a)
+    call = dict(n_latents=2, params=_gpfa_test_params(), save=False)
+    call.update(kwargs)
+    with pytest.raises(ValueError, match=match):
+        network.gpfa(rec, **call)
+
+
+def test_gpfa_on_a_window_with_no_busy_channels_returns_empty(store):
+    """Degenerate data comes back empty rather than raising, as elsewhere in the module."""
+    config, cid_a, _ = store
+    rec, _ = _fixture_recording(config, cid_a)
+    result = network.gpfa(rec, n_latents=2, params=_gpfa_test_params(min_rate_hz=1e9), save=False)
+    assert result["n_latents"] == 0 and result["latents"].shape[0] == 0
+    assert result["elec_index"].size == 0
+    assert not result["converged"]
+
+
+def test_plot_gpfa_renders_plain_and_by_label(store, tmp_path):
+    config, cid_a, _ = store
+    rec, bursts = _fixture_recording(config, cid_a)
+    result = network.gpfa(rec, n_latents=2, params=_gpfa_test_params(), save=False)
+
+    plain = network.plot_gpfa(rec, result=result, show_plot=False, save_path=tmp_path / "g.png")
+    assert (tmp_path / "g.png").exists()
+    assert len(plain.axes[0].lines) == 2 and plain.axes[0].get_legend() is None
+    plt.close(plain)
+
+    labelled = network.plot_gpfa(rec, result=result, burst_df=bursts, label_col="kind",
+                                 show_plot=False)
+    assert labelled.axes[0].collections  # one LineCollection per (latent, label present)
+    legend = [t.get_text() for t in labelled.axes[0].get_legend().get_texts()]
+    assert any(text.startswith("network (n=") for text in legend) and "no burst" in legend
+    assert "by kind" in labelled.axes[0].get_title()
+    plt.close(labelled)
+
+
+def test_plot_gpfa_on_a_caller_axes(store):
+    config, cid_a, _ = store
+    rec, _ = _fixture_recording(config, cid_a)
+    result = network.gpfa(rec, n_latents=2, params=_gpfa_test_params(), save=False)
+
+    fig, ax = plt.subplots()
+    assert network.plot_gpfa(rec, result=result, ax=ax, show_plot=False) is fig
+    assert not ax.get_title()  # the title belongs to the figure's owner
+    plt.close(fig)
+
+
+def test_plot_gpfa_rejects_a_mismatched_result_or_column(store):
+    config, cid_a, _ = store
+    rec, bursts = _fixture_recording(config, cid_a)
+    result = network.gpfa(rec, n_latents=2, params=_gpfa_test_params(), save=False)
+
+    with pytest.raises(ValueError, match="was computed for phase"):
+        network.plot_gpfa(rec, result=result, phase="nope", show_plot=False)
+    with pytest.raises(ValueError, match="missing"):
+        network.plot_gpfa(rec, result={"latents": result["latents"]}, show_plot=False)
+    with pytest.raises(ValueError, match="no column"):
+        network.plot_gpfa(rec, result=result, burst_df=bursts, label_col="nope", show_plot=False)
+    with pytest.raises(ValueError, match="time_unit must be"):
+        network.plot_gpfa(rec, result=result, time_unit="hours", show_plot=False)
 
 
 # --- spatial -------------------------------------------------------------------------------------

@@ -122,3 +122,75 @@ class NetworkParams:
     chunk_channels: int = 32
     var_thresholds: tuple[float, ...] = (0.8, 0.9)
     communities: CommunityParams = field(default_factory=CommunityParams)
+
+
+@dataclass(frozen=True)
+class GPFAParams:
+    """Settings for Gaussian Process Factor Analysis (:func:`mxtreme.analysis.network.gpfa`).
+
+    Defaults follow Yu et al. 2009 (*J Neurophysiol*) where it says anything -- 20 ms bins,
+    square-rooted counts, a fixed GP noise variance -- and are otherwise chosen for an hour of
+    continuous spontaneous activity, which is not what the paper fits (it fits behavioural trials).
+
+    The number of latent dimensions is *not* here: it is ``n_latents`` on the call, as
+    ``n_components`` is on :func:`~mxtreme.analysis.network.pca`.
+
+    :param bin_sec: Width of the count bins the model sees. Rounded to a whole multiple of the
+        recording's own ``bin_size``.
+    :param segment_sec: Length of the segments the recording is cut into, each treated as an
+        independent trial sharing all parameters. Counter-intuitively, **shorter is faster**: an EM
+        iteration factorizes one ``(n_latents * bins_per_segment)``-square matrix no matter how many
+        segments there are.
+    :param overlap_sec: Context fitted either side of a segment when extracting its latents, then
+        trimmed off, so the stitched trace has no dip at each seam. ``None`` uses four times the
+        largest fitted timescale, capped at a quarter of ``segment_sec``.
+    :param source: Where the counts come from. ``"spike_data"`` bins the spike times, giving true
+        counts; ``"spike_bin"`` sums the binary bin matrix, which saturates and on a real recording
+        loses ~30% of spikes, concentrated inside bursts.
+    :param sqrt_transform: Square-root the counts, the variance-stabilizing transform the paper
+        applies before fitting a Gaussian observation model to count data.
+    :param min_rate_hz: Channels firing below this over the fitted window are dropped. A near-silent
+        channel contributes a row to ``C`` and ``R`` and no signal.
+    :param max_channels: Keep at most this many channels, the busiest first (``None`` keeps all).
+        The fit is linear in the channel count, but so is memory.
+    :param tau_init_sec: Centre of the starting timescales. With more than one latent they start
+        log-spaced by a factor of three either side of it, not all equal: equal timescales are a
+        saddle, where the model is free to rotate the latents into each other and EM has nothing to
+        separate them with.
+    :param learn_tau: Learn the timescales. ``False`` holds them at their starting values, which
+        turns the model into factor analysis with a fixed smoothness prior -- much faster, and most
+        of the trajectory, but the timescale is then an assumption rather than a measurement.
+    :param tau_bounds_sec: Bounds on a learned timescale. The lower bound must be at least
+        ``bin_sec``: below one bin the kernel is the identity and the latent is pure noise.
+    :param tau_every: Update the timescales every this many EM iterations. Raising it trades
+        timescale accuracy for speed; the timescale search is the slowest part of an iteration.
+    :param sigma_n_sq: GP noise variance, held fixed. With the signal variance set to
+        ``1 - sigma_n_sq`` the latents have unit prior variance, which is what pins down the scale
+        split between ``C`` and ``x``. It also keeps the kernel well conditioned.
+    :param min_private_var: Floor on each channel's private variance, so a channel with no residual
+        variance can't send ``R^-1`` to infinity.
+    :param max_iter: Maximum EM iterations. A fit usually reaches this rather than converging; the
+        likelihood is nearly flat long before the timescales have finished separating.
+    :param tol: Stop when the log likelihood gains less than this **per channel-bin** in an
+        iteration. Per observation rather than relative, because the likelihood scales with the data:
+        at a magnitude of 1e5 nats a 1e-6 relative test stops on the first plateau it meets.
+    :param seed: Seed for the tiny jitter on the initial loadings, which breaks the tie when the
+        leading eigenvalues of the sample covariance are equal.
+    """
+
+    bin_sec: float = 0.02
+    segment_sec: float = 10.0
+    overlap_sec: float | None = None
+    source: str = "spike_data"
+    sqrt_transform: bool = True
+    min_rate_hz: float = 0.1
+    max_channels: int | None = 200
+    tau_init_sec: float = 0.1
+    learn_tau: bool = True
+    tau_bounds_sec: tuple[float, float] = (0.02, 1.0)
+    tau_every: int = 1
+    sigma_n_sq: float = 1e-3
+    min_private_var: float = 1e-3
+    max_iter: int = 100
+    tol: float = 1e-8
+    seed: int = 0
