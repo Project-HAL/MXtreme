@@ -721,7 +721,6 @@ def run_activity_scan(
             time.sleep(mx.Timing.waitAfterDownload)
             on_progress("  Running offset compensation...")
             mx.offset()  # amplifier offset compensation
-            time.sleep(mx.Timing.waitInMX2Offset)
 
             # 2. Record and save data from all wells
             on_progress(f"  Recording {params.rec_length_sec} s...")
