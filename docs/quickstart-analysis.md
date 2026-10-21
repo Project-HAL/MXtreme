@@ -1,5 +1,4 @@
-
-# Quickstart - Analysis 
+# Quickstart - Analysis
 
 This quickstart guide covers how to go from raw `.h5` files to a PDF report. Each step of the pipeline writes to a managed data store so you can stop after step and pick up later without recomputing.
 
@@ -12,6 +11,7 @@ Before starting, create an `mxtreme.toml` pointing at a directory you can write 
 [data]
 root = "~/mxtreme-data/"
 ```
+
 See [Configuration](concepts/configuration.md) for more details.
 
 ## 1. Configure the managed store for data organization
@@ -44,7 +44,7 @@ data = extract.extract(
 A user-supplied `metadata` dict is merged over the embedded metadata, so you can override or
 fill in individual, optional fields without restating all of them.
 
-See {func}`~mxtreme.extact.extract` for the metadata structure. 
+See {func}`~mxtreme.extact.extract` for the metadata structure.
 
 ## 3. Build and run a cleaning pipeline
 
@@ -69,7 +69,8 @@ pipeline = Pipeline([
 
 paths = pipeline.run(data, datastore=config.preprocessed_dir)
 ```
-Executing the pipeline with {meth}`~mxtreme.pipeline.Pipeline.run` transforms the data *AND* saves one well's data at a time (important for multiwell recordings). Wells with no spikes are skipped rather than saved. Every saved well is recorded and time-stamped in `registry.csv` automatically. 
+
+Executing the pipeline with {meth}`~mxtreme.pipeline.Pipeline.run` transforms the data *AND* saves one well's data at a time (important for multiwell recordings). Wells with no spikes are skipped rather than saved. Every saved well is recorded and time-stamped in `registry.csv` automatically.
 
 Each parameterized step stamps the values it used into `well['preprocessing_params']`, so the saved
 `.npz` carries a record of exactly how it was processed.
@@ -78,13 +79,13 @@ Each parameterized step stamps the values it used into `well['preprocessing_para
 paths = pipeline.run(data, datastore=config.preprocessed_dir)
 ```
 
-If working with the data in a notebook where saving the preprocessed data isn't necessary, it can be transformed without saving by using the {meth}`~mxtreme.pipeline.Pipeline.transform` function. 
+If working with the data in a notebook where saving the preprocessed data isn't necessary, it can be transformed without saving by using the {meth}`~mxtreme.pipeline.Pipeline.transform` function.
 
 ```python
 data_clean = pipeline.transform(data)
 ```
 
-See [Data dictionary](concepts/data-dictionary.md) for the structure of the data dictionary: every key, and the layout of the spike table, channel map, and binned spike matrix. 
+See [Data dictionary](concepts/data-dictionary.md) for the structure of the data dictionary: every key, and the layout of the spike table, channel map, and binned spike matrix.
 
 ## 4. Load a recording
 
@@ -109,7 +110,7 @@ from mxtreme.params import BurstDetectParams, BurstFeatureParams
 detection_params = BurstDetectParams()  
 
 # Initialize the burst detector
-burst_detector = BurstDetector(params=detection_params, method="isi_rate").detect(rec, burst_data_dir=config.burst_data_dir)
+burst_detector = BurstDetector(params=detection_params, method="isi_rate")
 
 # Detect bursts
 bursts = burst_detector.detect(rec, burst_data_dir=config.burst_data_dir)
@@ -125,7 +126,6 @@ burst_df = bursts.to_dataframe()
 
 # Save burst data to file
 csv_path = io.save_burst_data(bursts, config.burst_data_dir, rec) # Save burst data as csv
-
 ```
 
 Passing `burst_data_dir=` refreshes the per-batch burst log automatically. Omit it for pure
@@ -168,7 +168,6 @@ instead of the wider ISI-N group bounds:
 ```python
 viz.plot_burst_panels(rec, burst_df[burst_df["kind"] == "network"], n=6, span="features")
 ```
-
 
 ## 7. Analysis
 

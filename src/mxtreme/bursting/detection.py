@@ -297,9 +297,9 @@ class BurstDetector:
         if len(peaks) < 2:
             return None
 
-        p1, p2 = peaks[:2]  # valley between the first two modes ("first minima", per the paper)
+        #p1, p2 = peaks[:2]  # valley between the first two modes ("first minima", per the paper)
         # Alternative -- valley between the two *most prominent* modes (uncomment to A/B test):
-        # top2 = peaks[np.argsort(ys[peaks])[-2:]]; p1, p2 = sorted(top2)
+        top2 = peaks[np.argsort(ys[peaks])[-2:]]; p1, p2 = sorted(top2)
         valley = np.argmin(ys[p1:p2]) + p1
         return float(10 ** xs[valley] * samp_rate)
 
