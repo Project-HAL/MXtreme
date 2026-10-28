@@ -64,11 +64,11 @@ result = activity_scan.run_activity_scan(params, config)   # -> result.h5_path
 ```
 
 Two things land: the `.h5` in the recordings tree at
-`recordings/plating_<date>_<batch>/chip_<M1|M2>_<chip>/well_<w>/DIV_<div>/` — one file per well,
-with a multi-well scan recorded whole and then split ({func}`mxtreme.store.split_by_well`) — and one
+`recordings/plating_<date>_<batch>/chip_<M1|M2>_<chip>/DIV_<div>/` — one file holding every well
+scanned, named for them (`..._well_0-1_DIV_14_activity_scan.raw.h5`) — and one
 `activity_scan` row per scanned well in `registry.csv`. The row is written even when a scan stops
 early, so a short scan is still findable. Setting `ActivityScanParams.save_path` sends the `.h5`
-somewhere else instead, unsplit, and skips registration — a row pointing outside the store could
+somewhere else instead, and skips registration — a row pointing outside the store could
 never be resolved back.
 
 The scan then feeds {func}`mxtreme.scans.electrode_selection.select_electrodes`, which turns it into

@@ -49,15 +49,15 @@ A scan is an MXtreme output, so it goes into the managed store's recordings tree
 batch:
 
 ```
-recordings/plating_<plate_date>_<batch_id>/chip_<M1|M2>_<chip>/well_<w>/DIV_<div>/
-    plating_<plate_date>_<batch_id>_chip_<chip>_well_<w>_DIV_<div>_activity_scan.raw.h5
+recordings/plating_<plate_date>_<batch_id>/chip_<M1|M2>_<chip>/DIV_<div>/
+    plating_<plate_date>_<batch_id>_chip_<chip>_well_<wells>_DIV_<div>_activity_scan.raw.h5
 ```
 
-with one `activity_scan` row per scanned well in `registry.csv`. Each file in the tree holds one
-well: a multi-well scan (on a MaxTwo) records into a single `.h5` and is then split into one file
-per well ({func}`mxtreme.store.split_by_well`), so every culture's directory holds its own data.
-Set `save_path` to write somewhere else instead (a scratch directory on the rig, say); the scan is
-then left unsplit and out of the registry, since nothing says which store it belongs to.
+with one `activity_scan` row per scanned well in `registry.csv`. The file is kept as the rig wrote
+it: a MaxTwo scan of six wells is one `.h5`, and the `well_<wells>` token in its name says which
+wells it holds (`well_0`, `well_0-1-2-3-4-5`). Set `save_path` to write somewhere else instead (a
+scratch directory on the rig, say); the scan is then left out of the registry, since nothing says
+which store it belongs to.
 
 ```python
 params = activity_scan.ActivityScanParams(..., save_path="/tmp/scratch")
@@ -126,9 +126,9 @@ simultaneously. Progress is printed every 30 s; pass `on_progress=` to route it 
 scan cut short is still readable.
 
 The file goes into the recordings tree beside the activity scan it came from — the same
-`.../well_<w>/DIV_<div>/` directory, as `..._network_scan.raw.h5` — with one `network_scan` row per
-well in `registry.csv`. A multi-well scan is split per well on the way in, and `save_path` writes it
-elsewhere, unsplit and unregistered — the same rules as an activity scan.
+`.../chip_<M1|M2>_<chip>/DIV_<div>/` directory, as `..._network_scan.raw.h5` — with one
+`network_scan` row per well in `registry.csv`. `save_path` writes it elsewhere, unregistered — the
+same rules as an activity scan.
 
 A network scan is an ordinary recording, so it feeds straight into the analysis workflow below:
 
@@ -156,9 +156,9 @@ ingest_recording(
 )
 ```
 
-The file is copied into `.../well_<w>/DIV_<div>/` under the canonical name (pass `move=True` to move
-it instead), a multi-well file is split into one file per well, and each well gets an `experiment`
-row in `registry.csv`.
+The file is copied whole into `.../chip_<M1|M2>_<chip>/DIV_<div>/` under the canonical name (pass
+`move=True` to move it instead), and each well you name in `wells=` (every well it holds, by
+default) gets an `experiment` row in `registry.csv`.
 
 A scan recorded by MaxLab Live's own assays (Scope's Activity Scan, a network recording made from
 its Record tab) is not an experiment: pass `kind="activity_scan"` or `kind="network_scan"` instead

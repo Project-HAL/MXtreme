@@ -7,13 +7,12 @@ recordings, each routing a different random subset. Feed the resulting file to
 
 A scan is an MXtreme *output*, so it lands in the package-managed data store like every other one:
 :func:`run_activity_scan` takes a :class:`~mxtreme.config.Config`, writes the ``.h5`` into the
-recordings tree at ``config.recordings_dir/plating_<date>_<batch>/chip_<M1|M2>_<chip>/well_<w>/
-DIV_<div>/`` (see :mod:`mxtreme.store`) and upserts one ``activity_scan`` row per scanned well into
-``registry.csv``. Each file in that tree holds one well, so a multi-well scan is recorded as a
-single ``.h5`` and then split into per-well files (:func:`mxtreme.store.split_by_well`) on the way
-in. Set :attr:`ActivityScanParams.save_path` to write somewhere else instead -- a scratch directory
-on the rig, say -- and the scan is left unsplit and out of the registry, since nothing then says
-which store it belongs to.
+recordings tree at ``config.recordings_dir/plating_<date>_<batch>/chip_<M1|M2>_<chip>/DIV_<div>/``
+(see :mod:`mxtreme.store`) and upserts one ``activity_scan`` row per scanned well into
+``registry.csv``. The file is kept exactly as the rig wrote it: every well scanned together stays in
+the one ``.h5``, whose name says which wells it holds. Set :attr:`ActivityScanParams.save_path` to
+write somewhere else instead -- a scratch directory on the rig, say -- and the scan is left out of
+the registry, since nothing then says which store it belongs to.
 
 The module is split in two, deliberately:
 
@@ -100,8 +99,7 @@ class ActivityScanParams:
         the scan asks the rig the same question), and the run then checks the rig agrees.
     :param plate_date: Plating date as ``YYMMDD``; validated by :func:`mxtreme.scans.mx_setup.write_metadata`.
     :param div: Days *in vitro* at the time of the scan.
-    :param wells: Wells to scan, each in ``0..5``. All are scanned simultaneously (into one file,
-        split per well when it lands in the store).
+    :param wells: Wells to scan, each in ``0..5``. All are scanned simultaneously, into one file.
     :param conditions: Optional per-well condition labels; must be empty or the same length as
         ``wells``.
     :param description: Free-text description written to the file.
@@ -146,10 +144,9 @@ class ActivityScanParams:
     def file_name(self) -> str:
         """Base name of the ``.h5``, without MaxWell's ``.raw.h5`` suffix.
 
-        The store's canonical stem (``plating_<date>_<batch>_chip_<chip>_well_<w>_DIV_<div>``, see
-        :func:`mxtreme.store.recording_stem`) plus the ``_activity_scan`` tail that names the kind.
-        A multi-well scan records into one file first, so its well token is the joined list
-        (``0-3``) until :func:`mxtreme.store.split_by_well` breaks it into per-well names.
+        The store's canonical stem (``plating_<date>_<batch>_chip_<chip>_well_<wells>_DIV_<div>``,
+        see :func:`mxtreme.store.recording_stem`) plus the ``_activity_scan`` tail that names the
+        kind. The well token names every well scanned (``0-1-2-3-4-5`` for a full MaxTwo plate).
 
         :raises ValueError: If ``batch`` is unset -- the name is built from it.
         """
@@ -158,9 +155,8 @@ class ActivityScanParams:
                 "batch is unset, so this scan cannot be named. Every scan needs the plating batch "
                 "it records, e.g. batch='fall2026_batch1_DRG'."
             )
-        well_token = "-".join(str(w) for w in self.wells)
         return (
-            store.recording_stem(self.batch, self.plate_date, self.chip, well_token, self.div)
+            store.recording_stem(self.batch, self.plate_date, self.chip, self.wells, self.div)
             + "_activity_scan"
         )
 
@@ -182,9 +178,8 @@ class ActivityScanParams:
         """Return a copy whose ``save_path`` is filled in, so every path property is answerable.
 
         An explicit ``save_path`` wins and the object is returned unchanged; otherwise the scan
-        lands in the store's recordings tree. A single-well scan records straight into its final
-        home, ``.../well_<w>/DIV_<div>/``; a multi-well scan records into the chip directory and is
-        split into the well directories afterwards (see :func:`mxtreme.store.split_by_well`).
+        records straight into its home in the store's recordings tree, ``.../chip_<system>_<chip>/
+        DIV_<div>/``.
 
         Returning a copy rather than mutating in place keeps a caller's params reusable across
         scans, while :attr:`ActivityScanResult.params` still records where the scan actually went.
@@ -216,13 +211,9 @@ class ActivityScanParams:
                 "the chip directory is chip_<M1|M2>_<chip>. Set system='M1' or 'M2' (on the rig, "
                 "run_activity_scan fills it in from the connected device)."
             )
-        if len(self.wells) == 1:
-            directory = store.recording_dir(
-                config, self.batch, self.plate_date, self.chip, self.wells[0], self.div,
-                system=self.system,
-            )
-        else:
-            directory = store.chip_dir(config, self.batch, self.plate_date, self.chip, system=self.system)
+        directory = store.recording_dir(
+            config, self.batch, self.plate_date, self.chip, self.div, system=self.system
+        )
         return replace(self, save_path=str(directory))
 
     @property
@@ -307,16 +298,15 @@ class ActivityScanParams:
 class ActivityScanResult:
     """What a completed (or partially completed) scan produced.
 
-    :param h5_path: The file that was written -- after a multi-well store scan is split per well,
-        the first well's file. It exists even if the scan stopped early; the file is always
-        finalized.
+    :param h5_path: The file that was written, holding every well scanned. It exists even if the
+        scan stopped early; the file is always finalized.
     :param params: The parameters the scan ran with.
     :param scan_electrodes: ``{well: [electrodes_for_scan_0, electrodes_for_scan_1, ...]}``, holding
         only the scans that actually recorded.
     :param completed_scans: How many recordings finished.
     :param duration_sec: Wall-clock time spent scanning.
-    :param well_files: The file holding each well's data. For a single-well scan every well maps to
-        ``h5_path``; for a multi-well store scan these are the split per-well files.
+    :param well_files: ``{well: h5_path}`` for every well scanned -- one file, kept for the per-well
+        journal records (:func:`mxtreme.io.register_scan`).
     """
 
     h5_path: Path
@@ -610,12 +600,11 @@ def run_activity_scan(
     rounds of a well do not overlap until the array has been covered once.
 
     The scan goes into the managed store described by ``config``: the ``.h5`` into the recordings
-    tree (``.../well_<w>/DIV_<div>/`` for one well; a multi-well scan is recorded whole and then
-    split into per-well files there), and one ``activity_scan`` row per scanned well in
-    ``config.registry_path``. Registration happens after the recording finishes, including when it
-    stopped early, so a short scan is still findable. An explicit ``params.save_path`` overrides the
-    destination, skips the split, and skips registration -- a row for a file outside the store could
-    never be resolved back to it.
+    tree (``.../chip_<system>_<chip>/DIV_<div>/``, every well in the one file), and one
+    ``activity_scan`` row per scanned well in ``config.registry_path``. Registration happens after
+    the recording finishes, including when it stopped early, so a short scan is still findable. An
+    explicit ``params.save_path`` overrides the destination and skips registration -- a row for a
+    file outside the store could never be resolved back to it.
 
     The file is finalized and the arrays closed even if a round fails partway through -- otherwise
     every completed recording would be lost to an unclosed file. A failure still propagates, but the
@@ -760,64 +749,19 @@ def run_activity_scan(
             "Electrode selection will need it added before it can read this scan."
         )
 
-    well_files = {well: h5_path for well in params.wells}
-    if registry_path is not None and len(params.wells) > 1:
-        on_progress("\nSplitting into one file per well...")
-        well_files = _split_into_store(h5_path, params, config, "activity_scan", on_progress)
-        h5_path = well_files[min(well_files)]
-
     result = ActivityScanResult(
         h5_path=h5_path,
         params=params,
         scan_electrodes=recorded,
         completed_scans=completed,
         duration_sec=duration,
-        well_files=well_files,
+        well_files={well: h5_path for well in params.wells},
     )
     _register_scan(result, registry_path, on_progress)
 
     on_progress(f"\nActivity scan complete! ({duration / 60:.1f} min)")
 
     return result
-
-
-def _split_into_store(
-    h5_path: Path, params, config, kind: str, on_progress: ProgressFn
-) -> dict[int, Path]:
-    """Break a multi-well store scan into per-well files in their well/DIV directories.
-
-    Each culture's directory then holds its own ``.h5``, which is the store's contract. The combined
-    file is removed only after every well has been written. A failure to split must never cost the
-    recording itself, so it is reported and the combined file kept as recorded -- the data is all
-    still there, just not yet in per-well form. :mod:`mxtreme.scans.network_scan` shares this.
-
-    :param h5_path: The combined multi-well file, already in the store's chip directory.
-    :param params: The scan's params (supplies batch, plate date, chip, and DIV).
-    :param config: The :class:`~mxtreme.config.Config` describing the managed store.
-    :param kind: The file-name tail naming what was recorded: ``"activity_scan"`` or
-        ``"network_scan"``.
-    :param on_progress: Where to report progress and any failure.
-    :returns: ``{well: file}`` -- the per-well files, or every well mapped to the combined file
-        when splitting failed.
-    """
-    def destination(well: int) -> Path:
-        stem = store.recording_stem(params.batch, params.plate_date, params.chip, well, params.div)
-        return store.recording_dir(
-            config, params.batch, params.plate_date, params.chip, well, params.div,
-            system=params.system,
-        ) / f"{stem}_{kind}.raw.h5"
-
-    try:
-        return store.split_by_well(
-            h5_path, destination, on_progress=on_progress, delete_original=True
-        )
-    except Exception as exc:  # deliberately broad: the recording on disk outranks tidy layout
-        on_progress(
-            f"Warning: could not split {h5_path.name} into per-well files ({exc}). "
-            "The combined recording is kept as written; split it later with "
-            "mxtreme.store.split_by_well."
-        )
-        return {well: h5_path for well in params.wells}
 
 
 def _register_scan(

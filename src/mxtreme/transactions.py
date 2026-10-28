@@ -70,6 +70,7 @@ OPS: dict[str, str] = {
     "bursts.saved": "recording",  # data: {"path", "n_bursts"}
     "report.written": "culture",  # data: {"path", "divs", "sections"}; one per culture in it
     "recording.removed": "recording",  # data: {"path", "kind", "trashed_to"|"purged", "derived", ...}
+    "recording.moved": "recording",  # data: {"from": [paths], "path", "stitched"}; one per well (relayout_by_div)
     "registry.rebuilt": "store",  # data: {"registry", "n_recordings", "n_raw", "n_unparseable"}
     "batch.renamed": "batch",  # data: {"old", "new"}; recorded against the new id
 }
@@ -518,7 +519,7 @@ def backfill(config, *, on_progress=print) -> int:
     import pandas as pd
 
     from mxtreme.io import read_burst_log, read_registry
-    from mxtreme.store import find_chip_dir
+    from mxtreme.store import find_chip_dir, parse_recording_path
 
     def _when(value) -> str:
         """A registry or burst-log timestamp as ISO 8601; a stamp that does not parse is 'now'."""
@@ -562,12 +563,14 @@ def backfill(config, *, on_progress=print) -> int:
                         "network_scan.registered": "_network_scan",
                     }.get(op, f"_{experiment}")
                     chip_path = find_chip_dir(config, batch_id, plate_date, chip)
-                    div_dir = chip_path / f"well_{well}" / f"DIV_{div}" if chip_path else None
-                    matches = (
-                        sorted(div_dir.glob(f"*{tail}*.h5"), key=lambda p: p.stat().st_mtime)
-                        if div_dir is not None and div_dir.is_dir()
-                        else []
-                    )
+                    div_dir = chip_path / f"DIV_{div}" if chip_path else None
+                    matches = sorted(
+                        (
+                            p for p in div_dir.glob(f"*{tail}*.h5")
+                            if (loc := parse_recording_path(p, config.recordings_dir)) and well in loc.wells
+                        ),
+                        key=lambda p: p.stat().st_mtime,
+                    ) if div_dir is not None and div_dir.is_dir() else []
                     path = str(matches[-1]) if matches else ""
                 except (ValueError, OSError):
                     path = ""
