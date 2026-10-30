@@ -480,6 +480,9 @@ def run_network_scan(
         on_progress(f"  Well {well}: routing {len(electrodes)} electrodes...")
         array, _ = mx_setup.init_well(well, list(electrodes), stim_elecs=[])
         arrays[well] = array
+        # Save the routing beside the recording, so a later experiment can load exactly this
+        # channel assignment (array.load_config, or mx_setup.init_well given the .cfg path).
+        array.save_config(str(Path(params.save_path) / f"{params.file_name}_well{well}.cfg"))
         on_progress(f"  Well {well}: routed and downloaded")
 
     on_progress(f"Activating wells {params.wells}")
@@ -533,6 +536,11 @@ def run_network_scan(
         on_progress("\nSplitting into one file per well...")
         well_files = _split_into_store(h5_path, params, config, "network_scan", on_progress)
         h5_path = well_files[min(well_files)]
+        # Each .cfg follows its well's split .h5 (a failed split leaves both in place).
+        for well, path in well_files.items():
+            cfg = Path(params.save_path) / f"{params.file_name}_well{well}.cfg"
+            if path.parent != cfg.parent and cfg.exists():
+                cfg.rename(path.with_name(f"{path.name.removesuffix('.raw.h5')}_well{well}.cfg"))
 
     result = NetworkScanResult(
         h5_path=h5_path,
