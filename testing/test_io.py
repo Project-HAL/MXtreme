@@ -320,11 +320,11 @@ def test_burst_log_written_with_exp_id_reads_as_batch_id(tmp_path):
 
 
 def _store_with_scan(tmp_path, wells=(0, 1), metadata=True, kind="activity_scan"):
-    """Write per-well raw .h5 files into a managed store's recordings tree.
+    """Write one raw .h5 holding ``wells`` into a managed store's recordings tree.
 
-    Each file sits in its own ``well_<w>/DIV_<div>/`` directory, as :func:`mxtreme.store.split_by_well`
-    would have left it. The metadata blob (when written) carries the full well list, as MaxLab wrote
-    it into the combined recording -- condition recovery must index into it by well.
+    The file sits in the chip's ``DIV_<div>/`` directory, named for every well it holds, as a scan
+    leaves it. The metadata blob (when written) carries the full well list, as MaxLab wrote it --
+    condition recovery must index into it by well.
     """
     import h5py
 
@@ -333,30 +333,28 @@ def _store_with_scan(tmp_path, wells=(0, 1), metadata=True, kind="activity_scan"
 
     config = Config(data_root=tmp_path)
     params = _FakeScanParams(wells=wells, conditions=("ctrl", "drug")[: len(wells)])
-    paths = []
-    for well in params.wells:
-        stem = store.recording_stem(BATCH, params.plate_date, params.chip, well, params.div)
-        h5_path = store.recording_dir(config, BATCH, params.plate_date, params.chip, well, params.div
-        , system="M1") / f"{stem}_{kind}.raw.h5"
-        h5_path.parent.mkdir(parents=True, exist_ok=True)
+    stem = store.recording_stem(BATCH, params.plate_date, params.chip, params.wells, params.div)
+    h5_path = store.recording_dir(
+        config, BATCH, params.plate_date, params.chip, params.div, system="M1"
+    ) / f"{stem}_{kind}.raw.h5"
+    h5_path.parent.mkdir(parents=True, exist_ok=True)
 
-        with h5py.File(h5_path, "w") as f:
-            if metadata:
-                blob = str({
-                    "Batch ID": BATCH, "Chip ID": params.chip,
-                    "Plate date": params.plate_date, "DIV": params.div,
-                    "Well IDs": list(params.wells), "Conditions": list(params.conditions),
-                })
-                f.create_dataset("/assay/metadata", data=np.array([blob.encode("utf-8")]))
-        paths.append(h5_path)
-    return config, paths
+    with h5py.File(h5_path, "w") as f:
+        if metadata:
+            blob = str({
+                "Batch ID": BATCH, "Chip ID": params.chip,
+                "Plate date": params.plate_date, "DIV": params.div,
+                "Well IDs": list(params.wells), "Conditions": list(params.conditions),
+            })
+            f.create_dataset("/assay/metadata", data=np.array([blob.encode("utf-8")]))
+    return config, [h5_path]
 
 
 def test_rebuild_registry_recovers_raw_files_from_their_paths(tmp_path):
     import pandas as pd
 
     config, _ = _store_with_scan(tmp_path)
-    assert io.rebuild_registry(config) == 2  # one file per well, no recordings
+    assert io.rebuild_registry(config) == 1  # one file, holding both wells; no recordings
 
     df = pd.read_csv(config.registry_path).sort_values("well").reset_index(drop=True)
     assert list(df["well"]) == [0, 1]
@@ -383,7 +381,7 @@ def test_rebuild_registry_registers_a_raw_file_with_no_embedded_metadata(tmp_pat
 def test_rebuild_registry_reports_a_file_outside_the_layout(tmp_path, capsys):
     """A file whose path does not follow the recordings layout is counted, not guessed at."""
     config, _ = _store_with_scan(tmp_path, wells=(0,))
-    stray = config.recordings_dir / "misc" / "a" / "b" / "c" / "stray.raw.h5"
+    stray = config.recordings_dir / "misc" / "a" / "b" / "stray.raw.h5"
     stray.parent.mkdir(parents=True)
     stray.touch()
 
@@ -401,7 +399,7 @@ def test_rebuild_registry_recovers_an_ingested_experiment(tmp_path):
 
     config = Config(data_root=tmp_path)
     stem = store.recording_stem(BATCH, 250512, "C1", 0, 3)
-    h5_path = store.recording_dir(config, BATCH, 250512, "C1", 0, 3, system="M1") / f"{stem}_burst_game_v2.raw.h5"
+    h5_path = store.recording_dir(config, BATCH, 250512, "C1", 3, system="M1") / f"{stem}_burst_game_v2.raw.h5"
     h5_path.parent.mkdir(parents=True)
     with h5py.File(h5_path, "w"):
         pass

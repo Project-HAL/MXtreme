@@ -9,15 +9,15 @@ later stage reads back from there. The structure is as follows:
 
 ```
 <data_root>/
-├── recordings/                    raw .h5 — scans and ingested experiments, one file per well
+├── recordings/                    raw .h5 — scans and ingested experiments, as the rig wrote them
 │   └── plating_<plate_date>_<batch_id>/
 │       └── chip_<M1|M2>_<chip>/
-│           └── well_<N>/
-│               └── DIV_<d>/
-│                   ├── plating_…_chip_<chip>_well_<N>_DIV_<d>_activity_scan.raw.h5
-│                   ├── plating_…_chip_<chip>_well_<N>_DIV_<d>_network_scan.raw.h5
-│                   ├── plating_…_chip_<chip>_well_<N>_DIV_<d>_network_scan_<i>.raw.h5   (several on one DIV: numbered from 0)
-│                   └── plating_…_chip_<chip>_well_<N>_DIV_<d>_<experiment>.raw.h5
+│           └── DIV_<d>/
+│               ├── plating_…_chip_<chip>_well_<wells>_DIV_<d>_activity_scan.raw.h5
+│               ├── plating_…_chip_<chip>_well_<wells>_DIV_<d>_network_scan.raw.h5
+│               ├── plating_…_chip_<chip>_well_<wells>_DIV_<d>_network_scan_<i>.raw.h5   (several on one DIV: numbered from 0)
+│               ├── plating_…_chip_<chip>_well_<wells>_DIV_<d>_<experiment>.raw.h5
+│               └── electrode_selection/      figures and electrode lists a network scan was planned from
 ├── preprocessed/                  cleaned .npz, one per well per recording
 │   └── <batch_id>/<chip>/well<N>/DIV<d>_<plate_date>_<chip>_<batch_id>_well<N>[_<experiment>]_exp_data.npz
 ├── burst_data/                    per-recording burst CSVs + per-batch burst logs
@@ -31,10 +31,12 @@ later stage reads back from there. The structure is as follows:
 └── transactions.jsonl             append-only journal of everything that changed the store
 ```
 
-The recordings tree is keyed by **plating batch** — one plating event, named at the bench — and every
-file in it holds exactly one well, so one culture's whole history sits in one directory. A multi-well
-recording (a MaxTwo) is recorded into a single `.h5` and split per well on the way in
-({func}`mxtreme.store.split_by_well`).
+The recordings tree is keyed by **plating batch** — one plating event, named at the bench — then by
+chip and by DIV. A file is kept exactly as the rig wrote it: a MaxOne recording holds its one well,
+a MaxTwo recording holds every well recorded together, and the `well_<wells>` token in the name
+(`well_0`, `well_0-1-2-3-4-5`) says which, so a culture's files are found without opening any. The
+other trees stay per well. (Stores written before 2026-10-28 had a `well_<N>/` directory between
+the chip and the DIV and one file per well; {func}`mxtreme.store.relayout_by_div` converts them.)
 
 A scan MXtreme ran itself lands there automatically. A raw `.h5` acquired **outside** MXtreme joins
 the same tree through {func}`mxtreme.store.ingest_recording`, which files and registers it under the
