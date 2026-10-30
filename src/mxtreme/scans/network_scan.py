@@ -23,9 +23,9 @@ routing capacity is free data, so each well is topped up to the limit with rando
 :func:`pad_electrodes`).
 
 Like an activity scan it lands in the package-managed store -- the ``.h5`` in the recordings tree at
-``.../well_<w>/DIV_<div>/`` (a multi-well recording is split into per-well files on the way in), one
-``network_scan`` row per well in ``registry.csv`` -- and setting :attr:`NetworkScanParams.save_path`
-writes it elsewhere, unsplit and unregistered.
+``.../chip_<system>_<chip>/DIV_<div>/``, every well in the one file, one ``network_scan`` row per
+well in ``registry.csv`` -- and setting :attr:`NetworkScanParams.save_path` writes it elsewhere,
+unregistered.
 
 Typical use::
 
@@ -61,7 +61,6 @@ from mxtreme.scans.activity_scan import (
     _require_maxlab,
     _with_connected_system,
     _saved_file,
-    _split_into_store,
 )
 
 #: Amplifier channels per well. Every one is saved, via a single recording group -- a channel with no
@@ -172,9 +171,8 @@ class NetworkScanParams:
 
         The store's canonical stem (see :func:`mxtreme.store.recording_stem`) plus the
         ``_network_scan`` tail, so :func:`mxtreme.io.scan_kind` can tell it from an activity scan of
-        the same culture -- the two sit in the same directory and carry the same metadata blob. A
-        multi-well scan's well token is the joined list (``0-3``) until
-        :func:`mxtreme.store.split_by_well` breaks it into per-well names.
+        the same culture -- the two sit in the same directory and carry the same metadata blob. The
+        well token names every well recorded (``0-1-3`` for three).
 
         :raises ValueError: If ``batch`` is unset -- the name is built from it.
         """
@@ -183,9 +181,8 @@ class NetworkScanParams:
                 "batch is unset, so this scan cannot be named. Every scan needs the plating batch "
                 "it records, e.g. batch='fall2026_batch1_DRG'."
             )
-        well_token = "-".join(str(w) for w in self.wells)
         return (
-            store.recording_stem(self.batch, self.plate_date, self.chip, well_token, self.div)
+            store.recording_stem(self.batch, self.plate_date, self.chip, self.wells, self.div)
             + "_network_scan"
         )
 
@@ -207,9 +204,8 @@ class NetworkScanParams:
         """Return a copy whose ``save_path`` is filled in, so every path property is answerable.
 
         An explicit ``save_path`` wins and the object is returned unchanged; otherwise the scan
-        lands beside the activity scan it came from, in the recordings tree: straight into
-        ``.../well_<w>/DIV_<div>/`` for one well, or into the chip directory (split per well
-        afterwards) for several.
+        lands beside the activity scan it came from, in the recordings tree:
+        ``.../chip_<system>_<chip>/DIV_<div>/``.
 
         :param config: The :class:`~mxtreme.config.Config` describing the managed store. Only needed
             when ``save_path`` is unset.
@@ -237,13 +233,9 @@ class NetworkScanParams:
                 "the chip directory is chip_<M1|M2>_<chip>. Set system='M1' or 'M2' (on the rig, "
                 "run_network_scan fills it in from the connected device)."
             )
-        if len(self.wells) == 1:
-            directory = store.recording_dir(
-                config, self.batch, self.plate_date, self.chip, self.wells[0], self.div,
-                system=self.system,
-            )
-        else:
-            directory = store.chip_dir(config, self.batch, self.plate_date, self.chip, system=self.system)
+        directory = store.recording_dir(
+            config, self.batch, self.plate_date, self.chip, self.div, system=self.system
+        )
         return replace(self, save_path=str(directory))
 
     @property
@@ -315,15 +307,14 @@ class NetworkScanParams:
 class NetworkScanResult:
     """What a completed (or early-stopped) network scan produced.
 
-    :param h5_path: The file that was written -- after a multi-well store scan is split per well,
-        the first well's file. It exists even if the scan stopped early; the file is always
-        finalized.
+    :param h5_path: The file that was written, holding every well recorded. It exists even if the
+        scan stopped early; the file is always finalized.
     :param params: The parameters the scan ran with.
     :param recorded_sec: How long the recording actually ran, which is less than
         ``params.rec_length_sec`` only when it was stopped early.
     :param duration_sec: Wall-clock time from the start of recording, including teardown.
-    :param well_files: The file holding each well's data. For a single-well scan every well maps to
-        ``h5_path``; for a multi-well store scan these are the split per-well files.
+    :param well_files: ``{well: h5_path}`` for every well recorded -- one file, kept for the
+        per-well journal records (:func:`mxtreme.io.register_scan`).
     """
 
     h5_path: Path
@@ -414,12 +405,11 @@ def run_network_scan(
     simultaneously for ``params.rec_length_sec``.
 
     The scan goes into the managed store described by ``config``: the ``.h5`` into the recordings
-    tree (``.../well_<w>/DIV_<div>/`` for one well; a multi-well scan is recorded whole and then
-    split into per-well files there), and one ``network_scan`` row per well in
-    ``config.registry_path``. Registration happens after the recording finishes, including when it
-    stopped early, so a short scan is still findable. An explicit ``params.save_path`` overrides the
-    destination, skips the split, and skips registration -- a row for a file outside the store could
-    never be resolved back to it.
+    tree (``.../chip_<system>_<chip>/DIV_<div>/``, every well in the one file), and one
+    ``network_scan`` row per well in ``config.registry_path``. Registration happens after the
+    recording finishes, including when it stopped early, so a short scan is still findable. An
+    explicit ``params.save_path`` overrides the destination and skips registration -- a row for a
+    file outside the store could never be resolved back to it.
 
     The file is finalized and the arrays closed even if the recording fails partway through, so what
     was recorded up to that point is readable. A failure still propagates; registration is skipped on
@@ -547,7 +537,7 @@ def run_network_scan(
         params=params,
         recorded_sec=recorded_sec,
         duration_sec=duration,
-        well_files=well_files,
+        well_files={well: h5_path for well in params.wells},
     )
     _register_scan(result, registry_path, on_progress)
 

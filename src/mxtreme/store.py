@@ -1,4 +1,4 @@
-"""The ``recordings/`` tree of the managed store: batches, layout, naming, splitting, and ingest.
+"""The ``recordings/`` tree of the managed store: batches, layout, naming, and ingest.
 
 Every raw ``.h5`` the store manages -- activity scans, network scans, and exogenous experiment
 recordings -- lives in one tree, keyed by the *plating batch* the culture came from rather than by an
@@ -7,11 +7,10 @@ experiment name::
     <data_root>/recordings/
         plating_<plate_date>_<batch_id>/
             chip_<M1|M2>_<chip>/
-                well_<well>/
-                    DIV_<div>/
-                        plating_<plate_date>_<batch_id>_chip_<chip>_well_<well>_DIV_<div>_activity_scan.raw.h5
-                        plating_<plate_date>_<batch_id>_chip_<chip>_well_<well>_DIV_<div>_network_scan.raw.h5
-                        plating_<plate_date>_<batch_id>_chip_<chip>_well_<well>_DIV_<div>_<experiment>.raw.h5
+                DIV_<div>/
+                    plating_<plate_date>_<batch_id>_chip_<chip>_well_<wells>_DIV_<div>_activity_scan.raw.h5
+                    plating_<plate_date>_<batch_id>_chip_<chip>_well_<wells>_DIV_<div>_network_scan.raw.h5
+                    plating_<plate_date>_<batch_id>_chip_<chip>_well_<wells>_DIV_<div>_<experiment>.raw.h5
 
 A *batch* is one plating event, named at the bench when it happens -- see :class:`Batch` -- and
 its id is the identity everything downstream is keyed by. The ``<experiment>`` tail is a free string
@@ -24,11 +23,15 @@ A culture can be network-scanned more than once on one DIV. The first such file 
 index (:func:`network_scan_slot`). Every one of them is a network scan -- the number is not an
 experiment name -- and the readers here accept either form.
 
-Each file in the tree holds exactly one well, so one culture's whole history sits in one directory.
-A multi-well recording (a MaxTwo) is recorded as a single ``.h5`` and then broken apart by
-:func:`split_by_well`.
+A file is kept exactly as the rig wrote it: a MaxOne recording holds its one well, a MaxTwo
+recording holds every well that was recorded together. The ``well_<wells>`` token in the name says
+which (``well_0``, ``well_0-1-2-3-4-5``; see :func:`well_token`), so one chip's DIV directory holds
+that day's files for all of its cultures, and a reader can tell which cultures a file covers without
+opening it. Files from before 2026-10-28 were split into one per well, under a ``well_<N>/``
+directory between the chip and the DIV; :func:`relayout_by_div` brings such a store into this layout,
+stitching the pieces of one recording back together (:func:`stitch_wells`).
 
-The module is import-light on purpose: everything here except splitting/ingest is pure path and
+The module is import-light on purpose: everything here except stitching/ingest is pure path and
 string logic, and ``h5py``/``numpy``/``mxtreme.io`` are imported inside the functions that need
 them -- so ``import mxtreme`` (which re-exports :class:`Batch`) stays fast and rig-safe.
 """
@@ -77,6 +80,9 @@ _NETWORK_INDEX = re.compile(r"_network_scan(?:_(\d+))?\.raw\.h5$")
 _EXP_TAIL = re.compile(r"_DIV_\d+_(?P<experiment>.+?)\.raw\.h5$")
 
 #: Plating dates are ``YYMMDD``, matching :func:`mxtreme.scans.mx_setup.write_metadata`.
+#: The wells a store file holds, from its name (see :func:`well_token`).
+_WELLS_IN_NAME = re.compile(r"_well_(?P<wells>\d+(?:-\d+)*)_DIV_\d+_")
+
 _PLATE_DATE = re.compile(r"^\d{6}$")
 
 #: The directory names the layout functions below produce, for reading the tree back.
@@ -214,23 +220,36 @@ def _find_chip_dir_in(plating_dir: Path, chip: str) -> Path | None:
     return None
 
 
-def recording_dir(
-    config, batch: Batch | str, plate_date, chip: str, well: int, div: int, *, system: str
-) -> Path:
-    """Directory one culture's recordings for one DIV land in: ``.../well_<well>/DIV_<div>``."""
-    return chip_dir(config, batch, plate_date, chip, system=system) / f"well_{int(well)}" / f"DIV_{int(div)}"
+def recording_dir(config, batch: Batch | str, plate_date, chip: str, div: int, *, system: str) -> Path:
+    """Directory one chip's recordings for one DIV land in: ``.../chip_<system>_<chip>/DIV_<div>``."""
+    return chip_dir(config, batch, plate_date, chip, system=system) / f"DIV_{int(div)}"
 
 
-def recording_stem(batch: Batch | str, plate_date, chip: str, well, div: int) -> str:
-    """Base name shared by every file of one well on one DIV, without the kind/experiment tail.
+def well_token(wells: int | Iterable[int]) -> str:
+    """The wells a file holds, as its name carries them: ``"0"`` for one, ``"0-1-3"`` for several.
 
-    ``plating_<plate_date>_<batch_id>_chip_<chip>_well_<well>_DIV_<div>``. ``well`` is normally an
-    int; a multi-well recording awaiting :func:`split_by_well` uses a joined token (``"0-3"``)
-    instead, which is why the parameter is not coerced.
+    Ascending and joined with ``-``; never a range, so ``"0-3"`` is wells 0 and 3. The token is
+    how a reader learns which cultures a file covers without opening it (:func:`parse_recording_path`).
+    """
+    if isinstance(wells, int):
+        return str(wells)
+    return "-".join(str(w) for w in sorted({int(w) for w in wells}))
+
+
+def parse_well_token(token: str) -> tuple[int, ...]:
+    """The inverse of :func:`well_token`: ``"0-1-3"`` -> ``(0, 1, 3)``."""
+    return tuple(sorted({int(part) for part in token.split("-")}))
+
+
+def recording_stem(batch: Batch | str, plate_date, chip: str, wells: int | Iterable[int], div: int) -> str:
+    """Base name shared by every file of these wells on one DIV, without the kind/experiment tail.
+
+    ``plating_<plate_date>_<batch_id>_chip_<chip>_well_<token>_DIV_<div>``, the token from
+    :func:`well_token`: the one well of a MaxOne recording, or every well a MaxTwo recording holds.
     """
     return (
         f"plating_{_validate_plate_date(plate_date)}_{Batch.parse(batch).id}"
-        f"_chip_{chip}_well_{well}_DIV_{int(div)}"
+        f"_chip_{chip}_well_{well_token(wells)}_DIV_{int(div)}"
     )
 
 
@@ -366,7 +385,7 @@ class RecordingLocation:
     :param plate_date: Plating date (``YYMMDD``), from the plating directory.
     :param chip: Chip serial, from the chip directory.
     :param system: ``M1`` or ``M2``, from the chip directory.
-    :param well: Well number, from the well directory.
+    :param wells: The wells the file holds, ascending, from its name's ``well_`` token.
     :param div: Days *in vitro*, from the DIV directory.
     :param kind: See :data:`RECORDING_KINDS`.
     :param experiment: The experiment-name tail for ``kind="experiment"``; ``""`` for scans.
@@ -376,7 +395,7 @@ class RecordingLocation:
     plate_date: int
     chip: str
     system: str
-    well: int
+    wells: tuple[int, ...]
     div: int
     kind: str
     experiment: str
@@ -385,24 +404,24 @@ class RecordingLocation:
 def parse_recording_path(h5_path: Path, recordings_dir: Path) -> RecordingLocation | None:
     """Read a file's identity back out of its path in the recordings tree.
 
-    The inverse of :func:`recording_dir` + :func:`recording_stem`: the tree encodes the full
-    identity in fixed-format directory names, so -- unlike the old flat scans tree -- a file here
-    *can* be identified without opening it. Used by :func:`mxtreme.io.rebuild_registry`.
+    The inverse of :func:`recording_dir` + :func:`recording_stem`: the directories are fixed-format
+    and the file name carries the wells, so a file here is identified without being opened. Used by
+    :func:`mxtreme.io.rebuild_registry`.
 
     :param h5_path: The file, anywhere under ``recordings_dir``.
     :param recordings_dir: The tree root (``config.recordings_dir``).
     :returns: The parsed identity, or ``None`` if the path does not follow the layout.
     """
     try:
-        plating, chip_part, well_part, div_part = h5_path.relative_to(recordings_dir).parts[:-1]
+        plating, chip_part, div_part = h5_path.relative_to(recordings_dir).parts[:-1]
     except ValueError:
         return None
 
     plating_match = _PLATING_DIR.match(plating)
     chip_match = _CHIP_DIR.match(chip_part)
-    well_match = re.match(r"^well_(\d+)$", well_part)
     div_match = re.match(r"^DIV_(\d+)$", div_part)
-    if not (plating_match and chip_match and well_match and div_match):
+    wells_match = _WELLS_IN_NAME.search(h5_path.name)
+    if not (plating_match and chip_match and div_match and wells_match):
         return None
     try:
         batch = Batch.parse(plating_match["batch_id"])
@@ -413,23 +432,23 @@ def parse_recording_path(h5_path: Path, recordings_dir: Path) -> RecordingLocati
     experiment = ""
     if kind == "experiment":
         exp_match = _EXP_TAIL.search(h5_path.name)
-        # A foreign file name still has a full identity from the directories; falling back to its
-        # stem keeps it indexable rather than skipped.
-        experiment = exp_match["experiment"] if exp_match else h5_path.name.removesuffix(".raw.h5").removesuffix(".h5")
+        experiment = exp_match["experiment"] if exp_match else ""
+        if not experiment:
+            return None
 
     return RecordingLocation(
         batch=batch,
         plate_date=int(plating_match["plate_date"]),
         chip=chip_match["chip"],
         system=chip_match["system"],
-        well=int(well_match.group(1)),
+        wells=parse_well_token(wells_match["wells"]),
         div=int(div_match.group(1)),
         kind=kind,
         experiment=experiment,
     )
 
 
-# --- splitting a multi-well recording -------------------------------------------------------------
+# --- the wells inside a file, and putting a split recording back together -------------------------
 
 
 def _well_number(group_name: str) -> int:
@@ -453,134 +472,112 @@ def wells_in_file(h5_path: str | Path) -> list[int]:
         return sorted(_well_number(name) for name in f["wells"])
 
 
-def _rewrite_metadata_wells(out, well: int) -> None:
-    """Narrow a split file's ``/assay/metadata`` blob to the one well it now holds.
+def _read_metadata_blob(f) -> dict | None:
+    """The ``/assay/metadata`` blob of an open file as a dict, or ``None`` if it has none that parses.
 
-    The blob is stored as ``str(dict)`` (see :func:`mxtreme.scans.mx_setup.write_metadata`) and read
-    back with quotes swapped (see :func:`mxtreme.io._embedded_metadata`); the same round-trip is
-    used here. A file with no parseable blob is left as it is -- the path already carries the
-    identity, so an unreadable blob costs nothing.
+    Stored as ``str(dict)`` (see :func:`mxtreme.scans.mx_setup.write_metadata`) and read back with
+    quotes swapped, the same round-trip as :func:`mxtreme.io._embedded_metadata`.
     """
     import json
 
+    try:
+        raw = f["/assay/metadata"][:][0]
+        return json.loads(raw.decode("utf-8").strip().replace("'", '"'))
+    except (KeyError, ValueError, IndexError):
+        return None
+
+
+def _write_metadata_blob(f, metadata: dict) -> None:
+    """Replace an open file's ``/assay/metadata`` blob, in the format the readers expect."""
     import numpy as np
 
-    try:
-        raw = out["/assay/metadata"][:][0]
-        metadata = json.loads(raw.decode("utf-8").strip().replace("'", '"'))
-    except (KeyError, ValueError, IndexError):
-        return
-
-    well_ids = list(metadata.get("Well IDs") or [])
-    conditions = list(metadata.get("Conditions") or [])
-    condition = None
-    if well in well_ids:
-        index = well_ids.index(well)
-        if index < len(conditions):
-            condition = conditions[index]
-
-    metadata["Well IDs"] = [well]
-    metadata["Conditions"] = [] if condition is None else [condition]
-
-    del out["/assay/metadata"]
-    out["assay"].create_dataset("metadata", data=np.array([str(metadata).encode("utf-8")]))
+    if "/assay/metadata" in f:
+        del f["/assay/metadata"]
+    f.require_group("assay").create_dataset("metadata", data=np.array([str(metadata).encode("utf-8")]))
 
 
-def split_by_well(
-    h5_path: str | Path,
-    dest_for_well: Callable[[int], Path],
+def stitch_wells(
+    parts: Iterable[str | Path],
+    dest: str | Path,
     *,
     on_progress: Callable[[str], None] = print,
-    delete_original: bool = False,
-    wells: Iterable[int] | None = None,
-) -> dict[int, Path]:
-    """Break a multi-well MaxWell ``.h5`` into one file per well.
+) -> Path:
+    """Put the per-well pieces of one multi-well recording back into a single ``.h5``.
 
-    A MaxTwo records every well into a single file, but in the store each culture gets its own --
-    so the shared parts (``/assay``, settings, version, root attributes) are copied into each output
-    and only that well's data comes along. Both of MaxWell's views of the data are preserved:
-    ``/wells/wellNNN/...`` is copied, and ``/recordings/recMMMM/wellNNN`` is re-created as a hard
-    link to it, so no data is duplicated inside the output file. The metadata blob's well list is
-    narrowed to the one well each file now holds.
+    The inverse of the split the store used to do on the way in: each piece holds one well's
+    ``/wells/wellNNN/...`` and a ``/recordings/recMMMM/wellNNN`` view of it, plus the shared parts
+    (``/assay``, settings, version) copied from the original. The shared parts are taken from the
+    first piece, every piece's wells are copied in, the recordings view is re-created as hard links
+    to the copies (no data is duplicated inside the output), and the metadata blob's ``Well IDs`` /
+    ``Conditions`` are merged back into one list in well order.
 
-    :param h5_path: The multi-well file. A single-well file splits fine too (one output).
-    :param dest_for_well: Called with each well number; returns the full destination file path.
-        Parent directories are created as needed.
+    The pieces must be of one recording -- the same chip, DIV and kind, recorded together. Nothing
+    here checks the timestamps; :func:`relayout_by_div` groups the pieces before calling this.
+
+    :param parts: The per-well files, in any order.
+    :param dest: Where to write the combined file. Its parent is created; it must not exist.
     :param on_progress: Called with each progress line.
-    :param delete_original: Remove ``h5_path`` after every well has been written successfully.
-        On any failure the original is always kept.
-    :param wells: Only split out these wells; ``None`` means every well the file holds. A well
-        asked for that the file does not hold is an error, not silently skipped.
-    :returns: ``{well: destination}`` for every well written.
-    :raises ValueError: If the file has no ``/wells`` group, or ``wells`` names one it lacks.
-    :raises FileExistsError: If a destination already exists.
+    :returns: ``dest``.
+    :raises ValueError: If ``parts`` is empty, a piece has no ``/wells`` group, or two pieces hold
+        the same well.
+    :raises FileExistsError: If ``dest`` exists.
     """
     import h5py
 
-    h5_path = Path(h5_path)
+    parts = [Path(p) for p in parts]
+    dest = Path(dest)
+    if not parts:
+        raise ValueError("stitch_wells needs at least one file.")
+    if dest.exists():
+        raise FileExistsError(f"Refusing to overwrite {dest}.")
+    dest.parent.mkdir(parents=True, exist_ok=True)
 
-    written: dict[int, Path] = {}
-    with h5py.File(str(h5_path), "r") as f:
-        if "wells" not in f:
-            raise ValueError(f"{h5_path} has no /wells group; nothing to split by.")
-        well_groups = sorted(f["wells"], key=_well_number)
-        if wells is not None:
-            wanted = sorted({int(w) for w in wells})
-            present = {_well_number(name) for name in well_groups}
-            missing = [w for w in wanted if w not in present]
-            if missing:
-                raise ValueError(
-                    f"{h5_path.name} holds no well {missing} (it has {sorted(present)})."
-                )
-            well_groups = [name for name in well_groups if _well_number(name) in wanted]
-
-        for group_name in well_groups:
-            well = _well_number(group_name)
-            dest = Path(dest_for_well(well))
-            if dest.exists():
-                raise FileExistsError(f"Refusing to overwrite {dest}.")
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            on_progress(f"  Well {well}: writing {dest.name}")
-
-            try:
-                with h5py.File(str(dest), "w") as out:
-                    for key, value in f.attrs.items():
-                        out.attrs[key] = value
-                    for key in f:
-                        if key not in ("wells", "recordings"):
-                            f.copy(f[key], out, name=key)
-
-                    out.require_group("wells")
-                    f.copy(f["wells"][group_name], out["wells"], name=group_name)
-
-                    # /recordings/recMMMM/wellNNN mirrors /wells/wellNNN/recMMMM (mxtreme.extract
-                    # reads the former). Hard-link to the copy just made where the two line up; fall
-                    # back to a real copy for any recording group the wells view doesn't carry.
-                    if "recordings" in f:
-                        for rec in f["recordings"]:
-                            if group_name not in f["recordings"][rec]:
-                                continue
-                            rec_group = out.require_group(f"recordings/{rec}")
-                            copied = f"wells/{group_name}/{rec}"
-                            if copied in out:
-                                rec_group[group_name] = out[copied]
-                            else:
-                                f.copy(f["recordings"][rec][group_name], rec_group, name=group_name)
-
-                    _rewrite_metadata_wells(out, well)
-            except BaseException:
-                # A half-written output would block the retry (FileExistsError) and could be
-                # mistaken for real data; the original still holds everything, so drop it.
-                dest.unlink(missing_ok=True)
-                raise
-
-            written[well] = dest
-
-    if delete_original:
-        h5_path.unlink()
-        on_progress(f"  Removed the combined file {h5_path.name}")
-
-    return written
+    well_ids: dict[int, object] = {}  # well -> condition (None when the piece had none)
+    metadata: dict | None = None
+    try:
+        with h5py.File(str(dest), "w") as out:
+            out.require_group("wells")
+            for index, part in enumerate(parts):
+                with h5py.File(str(part), "r") as f:
+                    if "wells" not in f:
+                        raise ValueError(f"{part} has no /wells group; not a MaxWell recording.")
+                    if index == 0:
+                        for key, value in f.attrs.items():
+                            out.attrs[key] = value
+                        for key in f:
+                            if key not in ("wells", "recordings"):
+                                f.copy(f[key], out, name=key)
+                        metadata = _read_metadata_blob(f)
+                    blob = _read_metadata_blob(f) or {}
+                    ids = list(blob.get("Well IDs") or [])
+                    conditions = list(blob.get("Conditions") or [])
+                    for group_name in sorted(f["wells"], key=_well_number):
+                        well = _well_number(group_name)
+                        if group_name in out["wells"]:
+                            raise ValueError(f"Well {well} appears in more than one of the pieces ({part.name}).")
+                        on_progress(f"  Well {well}: from {part.name}")
+                        f.copy(f["wells"][group_name], out["wells"], name=group_name)
+                        if "recordings" in f:
+                            for rec in f["recordings"]:
+                                if group_name not in f["recordings"][rec]:
+                                    continue
+                                rec_group = out.require_group(f"recordings/{rec}")
+                                copied = f"wells/{group_name}/{rec}"
+                                if copied in out:
+                                    rec_group[group_name] = out[copied]
+                                else:
+                                    f.copy(f["recordings"][rec][group_name], rec_group, name=group_name)
+                        condition = conditions[ids.index(well)] if well in ids and ids.index(well) < len(conditions) else None
+                        well_ids[well] = condition
+            if metadata is not None:
+                metadata["Well IDs"] = sorted(well_ids)
+                labelled = [well_ids[w] for w in sorted(well_ids)]
+                metadata["Conditions"] = labelled if any(c is not None for c in labelled) else []
+                _write_metadata_blob(out, metadata)
+    except BaseException:
+        dest.unlink(missing_ok=True)  # a half-written output must not pass for the recording
+        raise
+    return dest
 
 
 def _ensure_metadata_blob(h5_path: Path, metadata: dict) -> None:
@@ -632,8 +629,9 @@ def derived_files(config, h5_path: str | Path) -> list[Path]:
     """The files elsewhere in the store that were computed from one raw recording.
 
     An activity scan's derivatives are its electrode selection (the figures and the electrode
-    list in ``electrode_selection/`` beside it). A network scan's, or an ingested experiment's,
-    are the preprocessed ``.npz`` and the burst CSV for that well and DIV, under the batch id
+    lists in ``electrode_selection/`` beside it, named after the scan file). A network scan's, or
+    an ingested experiment's, are the preprocessed ``.npz`` and the burst CSV of each of its wells
+    on that DIV, under the batch id
     (an experiment's carry its name as a file-name tail, see :func:`mxtreme.io.recording_file_name`;
     one preprocessed before that sits under a directory named for the experiment instead). Analysis
     summaries and reports are per culture across DIVs, and are left alone: they are rebuilt from
@@ -648,22 +646,36 @@ def derived_files(config, h5_path: str | Path) -> list[Path]:
     out: list[Path] = []
     if location.kind == "activity_scan":
         selection = h5_path.parent / "electrode_selection"
+        prefix = selection_prefix(h5_path) + "_"
         if selection.is_dir():
-            out.extend(sorted(p for p in selection.iterdir() if p.is_file() and f"well{location.well}" in p.name))
+            out.extend(sorted(p for p in selection.iterdir() if p.is_file() and p.name.startswith(prefix)))
         return out
-    well_tail = Path(location.chip) / f"well{location.well}"
-    tail = f"well{location.well}_{location.experiment}_" if location.experiment else f"well{location.well}_"
-    places = [(location.batch.id, tail)]
-    if location.experiment:  # preprocessed before batch_id was the identity: filed under its name
-        places.append((location.experiment, f"well{location.well}_"))
-    for top, tail in places:
-        for root, pattern in (
-            (config.preprocessed_dir / top / well_tail, f"DIV{location.div}_*{tail}exp_data.npz"),
-            (config.burst_data_dir / top / well_tail, f"DIV{location.div}_*{tail}burst_data.csv"),
-        ):
-            if root.is_dir():
-                out.extend(sorted(root.glob(pattern)))
+    for well in location.wells:
+        well_tail = Path(location.chip) / f"well{well}"
+        tail = f"well{well}_{location.experiment}_" if location.experiment else f"well{well}_"
+        places = [(location.batch.id, tail)]
+        if location.experiment:  # preprocessed before batch_id was the identity: filed under its name
+            places.append((location.experiment, f"well{well}_"))
+        for top, tail in places:
+            for root, pattern in (
+                (config.preprocessed_dir / top / well_tail, f"DIV{location.div}_*{tail}exp_data.npz"),
+                (config.burst_data_dir / top / well_tail, f"DIV{location.div}_*{tail}burst_data.csv"),
+            ):
+                if root.is_dir():
+                    out.extend(sorted(root.glob(pattern)))
     return out
+
+
+def selection_prefix(h5_path: str | Path) -> str:
+    """The name an activity scan's electrode-selection outputs start with: its file name without
+    MaxWell's ``.raw.h5``. They sit in ``electrode_selection/`` beside the scan as
+    ``<prefix>_AS_well<N>.png``, ``<prefix>_network_well<N>.png`` and ``<prefix>_network_well<N>.npz``,
+    one of each per well selected."""
+    name = Path(h5_path).name
+    for suffix in (".raw.h5", ".h5"):
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
 
 
 def _drop_burst_log_rows(
@@ -773,29 +785,31 @@ def remove_recording(
                 shutil.move(str(f), str(dest))
             on_progress(f"Moved to {trash_root}")
 
-    # The registry: the recording's own rows, and its preprocessed rows when those files went.
+    # The registry: the recording's own rows (one per well), and its preprocessed rows when those
+    # files went.
     registry_rows = 0
-    if not dry_run:
-        registry_rows += io.unregister(
-            config.registry_path, chip=location.chip, well=location.well, div=location.div,
-            kind=location.kind, batch_id=location.batch.id, experiment=location.experiment,
-        )
-        if derived and location.kind != "activity_scan":
-            registry_rows += io.unregister(
-                config.registry_path, chip=location.chip, well=location.well, div=location.div,
-                kind="preprocessed", batch_id=location.batch.id, experiment=location.experiment,
-            )
-            if location.experiment:  # preprocessed before batch_id was the identity
-                registry_rows += io.unregister(
-                    config.registry_path, chip=location.chip, well=location.well, div=location.div,
-                    kind="preprocessed", batch_id=location.experiment, experiment="",
-                )
     burst_log_rows = 0
-    if derived and location.kind != "activity_scan":
-        burst_log_rows = _drop_burst_log_rows(
-            config, location.batch.id, location.chip, location.well, location.div, location.experiment,
-            dry_run=dry_run,
-        )
+    for well in location.wells:
+        if not dry_run:
+            registry_rows += io.unregister(
+                config.registry_path, chip=location.chip, well=well, div=location.div,
+                kind=location.kind, batch_id=location.batch.id, experiment=location.experiment,
+            )
+            if derived and location.kind != "activity_scan":
+                registry_rows += io.unregister(
+                    config.registry_path, chip=location.chip, well=well, div=location.div,
+                    kind="preprocessed", batch_id=location.batch.id, experiment=location.experiment,
+                )
+                if location.experiment:  # preprocessed before batch_id was the identity
+                    registry_rows += io.unregister(
+                        config.registry_path, chip=location.chip, well=well, div=location.div,
+                        kind="preprocessed", batch_id=location.experiment, experiment="",
+                    )
+        if derived and location.kind != "activity_scan":
+            burst_log_rows += _drop_burst_log_rows(
+                config, location.batch.id, location.chip, well, location.div, location.experiment,
+                dry_run=dry_run,
+            )
 
     pruned: list[Path] = []
     if not dry_run:
@@ -814,27 +828,29 @@ def remove_recording(
         pruned_dirs=tuple(pruned),
     )
     if not dry_run:
-        transactions.record(
-            config,
-            "recording.removed",
-            batch_id=location.batch,
-            plate_date=location.plate_date,
-            experiment=location.experiment,
-            chip=location.chip,
-            well=location.well,
-            div=location.div,
-            actor=actor,
-            note=reason,
-            data={
-                "path": str(h5_path),
-                "kind": location.kind,
-                "trashed_to": None if trash_root is None else str(trash_root),
-                "purged": bool(purge),
-                "derived": [str(f) for f in files[1:]],
-                "registry_rows": registry_rows,
-                "burst_log_rows": burst_log_rows,
-            },
-        )
+        for well in location.wells:  # one record per culture the file held, like its registration
+            transactions.record(
+                config,
+                "recording.removed",
+                batch_id=location.batch,
+                plate_date=location.plate_date,
+                experiment=location.experiment,
+                chip=location.chip,
+                well=well,
+                div=location.div,
+                actor=actor,
+                note=reason,
+                data={
+                    "path": str(h5_path),
+                    "kind": location.kind,
+                    "wells": list(location.wells),
+                    "trashed_to": None if trash_root is None else str(trash_root),
+                    "purged": bool(purge),
+                    "derived": [str(f) for f in files[1:]],
+                    "registry_rows": registry_rows,
+                    "burst_log_rows": burst_log_rows,
+                },
+            )
         on_progress(
             f"Removed {h5_path.name}: {len(files)} file(s), {registry_rows} registry row(s), "
             f"{burst_log_rows} burst-log row(s)."
@@ -1202,12 +1218,12 @@ def ingest_recording(
     noted in the new file's journal record. The registry keeps one ``network_scan`` row per well
     and DIV whichever way, as it does for a scan MaxLab re-ran.
 
-    A file holding several wells is split into one file per well on the way in (see
-    :func:`split_by_well`), so each culture's directory holds its own data; ``wells`` narrows that
-    to the wells worth keeping (the plated ones of a MaxTwo plate). An ingested copy with no
-    ``/assay/metadata`` blob gets one written from the identity given here, so
-    :func:`mxtreme.extract.extract` and a registry rebuild can read it back without being handed
-    the metadata again; a blob the file already carries is left as recorded. ::
+    The file is kept whole, however many wells it holds; ``wells`` says which of them are cultures
+    worth registering (the plated ones of a MaxTwo plate) -- those name the file and get registry
+    rows, the rest ride along as the rig recorded them. An ingested copy with no ``/assay/metadata``
+    blob gets one written from the identity given here, so :func:`mxtreme.extract.extract` and a
+    registry rebuild can read it back without being handed the metadata again; a blob the file
+    already carries is left as recorded. ::
 
         from mxtreme.config import Config
         from mxtreme.store import ingest_recording
@@ -1235,19 +1251,20 @@ def ingest_recording(
     :param experiment: For an ``experiment``, its free-form name -- becomes the file-name tail and
         the registry row's ``experiment``. Letters, digits, ``.``, ``-``, ``_``. Required for an
         experiment; not accepted for a scan. Either way the recording's identity is its batch.
-    :param wells: Which of the file's wells to ingest; ``None`` means all of them.
+    :param wells: Which of the file's wells to register (and name the file by); ``None`` means
+        all of them. The file itself is copied whole either way.
     :param conditions: Optional per-well condition labels, keyed by well number.
     :param system: Which system the chip is on, ``"M1"`` or ``"M2"`` -- it names the chip
         directory. ``None`` takes what the file says about its plate
         (:attr:`RecordingDescription.system`); a file that does not say needs it given.
-    :param move: Move the file instead of copying it. A multi-well source is removed after a
-        successful split either way when this is set; on any failure the original is kept.
+    :param move: Move the file instead of copying it.
     :param actor: Who, for the journal; the OS user when ``None``.
     :param note: A remark for the journal (where the file came from, say).
     :param on_progress: Called with each progress line.
-    :returns: ``{well: destination path}`` for every well ingested.
+    :returns: ``{well: destination path}`` for every well registered -- one file, so every well
+        maps to the same path.
     :raises FileNotFoundError: If ``h5_path`` does not exist.
-    :raises FileExistsError: If a destination file already exists -- nothing is overwritten. A
+    :raises FileExistsError: If the destination file already exists -- nothing is overwritten. A
         network scan never collides (it takes the next index instead).
     :raises ValueError: On a malformed batch id, plate date, kind or experiment, a file with no wells,
         ``wells`` naming one the file lacks, or no way to tell which system the chip is on.
@@ -1299,70 +1316,53 @@ def ingest_recording(
     if system not in SYSTEMS:
         raise ValueError(f"system must be one of {SYSTEMS}, got {system!r}.")
 
-    slots: dict[int, tuple[str, list[tuple[Path, Path]]]] = {}
-
-    def destination(well: int) -> Path:
-        stem = recording_stem(batch, plate_date, chip, well, div)
-        div_dir = recording_dir(config, batch, plate_date, chip, well, div, system=system)
-        well_tail = tail
-        if kind == "network_scan":
-            if well not in slots:
-                slots[well] = network_scan_slot(div_dir, stem)
-            well_tail = slots[well][0]
-        return div_dir / f"{stem}_{well_tail}.raw.h5"
+    stem = recording_stem(batch, plate_date, chip, chosen, div)
+    div_dir = recording_dir(config, batch, plate_date, chip, div, system=system)
+    renames: list[tuple[Path, Path]] = []
+    if kind == "network_scan":
+        tail, renames = network_scan_slot(div_dir, stem)
+    dest = div_dir / f"{stem}_{tail}.raw.h5"
+    if dest.exists():
+        raise FileExistsError(f"Refusing to overwrite {dest}.")
 
     # A network scan joining others of its DIV: number what is there before anything lands, so the
     # new file's name and the renames it caused are settled together (and journaled together).
-    renamed: dict[int, dict[str, str]] = {}
-    for well in chosen:
-        destination(well)
-        for old, new in slots.get(well, ("", []))[1]:
-            if new.exists():
-                raise FileExistsError(f"Refusing to overwrite {new}.")
-            on_progress(f"Numbering the DIV's earlier network scan: {old.name} -> {new.name}")
-            old.rename(new)
-            renamed.setdefault(well, {})[str(old)] = str(new)
+    renamed: dict[str, str] = {}
+    for old, new in renames:
+        if new.exists():
+            raise FileExistsError(f"Refusing to overwrite {new}.")
+        on_progress(f"Numbering the DIV's earlier network scan: {old.name} -> {new.name}")
+        old.rename(new)
+        renamed[str(old)] = str(new)
 
-    if len(present) == 1 and chosen == present:
-        # One well: a straight file copy (or move) is faster and bit-exact; nothing to split.
-        well = present[0]
-        dest = destination(well)
-        if dest.exists():
-            raise FileExistsError(f"Refusing to overwrite {dest}.")
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        on_progress(f"{'Moving' if move else 'Copying'} {h5_path.name} -> {dest}")
-        if move:
-            shutil.move(str(h5_path), str(dest))
-        else:
-            shutil.copy2(str(h5_path), str(dest))
-        written = {well: dest}
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    on_progress(f"{'Moving' if move else 'Copying'} {h5_path.name} -> {dest}")
+    if move:
+        shutil.move(str(h5_path), str(dest))
     else:
-        on_progress(f"Splitting {h5_path.name} into {len(chosen)} per-well file(s)...")
-        written = split_by_well(
-            h5_path, destination, on_progress=on_progress, delete_original=move, wells=chosen
-        )
+        shutil.copy2(str(h5_path), str(dest))
+    written = {well: dest for well in chosen}
 
-    for well, dest in written.items():
-        condition = conditions.get(well)
-        _ensure_metadata_blob(dest, {
-            "Batch ID": batch.id,
-            **({"Experiment": experiment} if experiment else {}),
-            "Chip ID": chip,
-            "Plate date": _validate_plate_date(plate_date),
-            "DIV": int(div),
-            "Well IDs": [well],
-            "Conditions": [] if condition is None else [condition],
-        })
-        if kind == "activity_scan":
-            from mxtreme.scans.activity_scan import ensure_record_time, has_record_time
+    labels = [conditions.get(well) for well in chosen]
+    _ensure_metadata_blob(dest, {
+        "Batch ID": batch.id,
+        **({"Experiment": experiment} if experiment else {}),
+        "Chip ID": chip,
+        "Plate date": _validate_plate_date(plate_date),
+        "DIV": int(div),
+        "Well IDs": list(chosen),
+        "Conditions": labels if any(label is not None for label in labels) else [],
+    })
+    if kind == "activity_scan":
+        from mxtreme.scans.activity_scan import ensure_record_time, has_record_time
 
-            if not has_record_time(dest):
-                try:
-                    seconds = ensure_record_time(dest)
-                except ValueError as exc:
-                    on_progress(f"  Well {well}: {exc}")
-                else:
-                    on_progress(f"  Well {well}: wrote record_time = {seconds} s from the file's timestamps")
+        if not has_record_time(dest):
+            try:
+                seconds = ensure_record_time(dest)
+            except ValueError as exc:
+                on_progress(f"  {exc}")
+            else:
+                on_progress(f"  Wrote record_time = {seconds} s from the file's timestamps")
 
     io.register(
         {
@@ -1374,19 +1374,19 @@ def ingest_recording(
                 "batch_id": batch.id,
                 "plate_date": _validate_plate_date(plate_date),
             }
-            for well in written
+            for well in chosen
         },
         config.registry_path,
         kind=kind,
     )
-    on_progress(f"Registered wells {sorted(written)} as {kind} in {config.registry_path}")
+    on_progress(f"Registered wells {chosen} as {kind} in {config.registry_path}")
 
     from mxtreme import transactions
 
-    for well, dest in written.items():
+    for well in chosen:
         data = {"source": str(h5_path), "path": str(dest), "moved": bool(move), "kind": kind, "system": system}
-        if well in renamed:
-            data["renamed"] = renamed[well]
+        if renamed:
+            data["renamed"] = renamed
         transactions.record(
             config,
             "recording.ingested",
@@ -1672,4 +1672,385 @@ def rename_batch(
     return BatchRename(
         old=old, new=new, paths=renamed, h5_files=h5_files, npz_files=npz_files,
         csv_files=csv_files, registry_rows=registry_rows, plate_dates=plate_dates,
+    )
+
+
+# --- moving a store from per-well directories to per-DIV ones ------------------------------------
+
+
+@dataclass(frozen=True)
+class Relayout:
+    """What :func:`relayout_by_div` changed, or -- with ``dry_run`` -- would change.
+
+    :param moved: Single-piece files, ``(old, new)``: their directory changed, their name did not.
+    :param stitched: Recordings put back together, ``(pieces, new)``: the per-well files of one
+        recording and the combined file written from them.
+    :param redundant: Per-well pieces of a recording whose whole file was also still there (a
+        split that failed part-way left both): the whole file is kept, these go to the trash.
+    :param selection_files: Electrode-selection outputs moved beside their scan, ``(old, new)``.
+    :param npz_files: Preprocessed files whose embedded ``path_to_h5`` was pointed at the new file.
+    :param skipped: Files left where they were, each with the reason.
+    :param trashed_to: Where the stitched recordings' pieces and the redundant files went, or
+        ``None`` (dry run, or nothing to trash).
+    :param pruned_dirs: Directories the move left empty and removed.
+    """
+
+    moved: tuple[tuple[Path, Path], ...]
+    stitched: tuple[tuple[tuple[Path, ...], Path], ...]
+    redundant: tuple[Path, ...]
+    selection_files: tuple[tuple[Path, Path], ...]
+    npz_files: tuple[Path, ...]
+    skipped: tuple[tuple[Path, str], ...]
+    trashed_to: Path | None
+    pruned_dirs: tuple[Path, ...]
+
+
+_OLD_WELL_DIR = re.compile(r"^well_(\d+)$")
+_DIV_DIR = re.compile(r"^DIV_(\d+)$")
+_OLD_TAIL = re.compile(r"_DIV_\d+_(?P<tail>.+?)\.raw\.h5$")
+
+#: Pieces of one recording were written by one ``start_recording``; their first recordings start
+#: within a few milliseconds of each other. Separate recordings of one chip are minutes apart.
+_SAME_RECORDING_MS = 2000
+
+
+def _recording_starts(h5_path: Path) -> list[int]:
+    """Start stamps (ms) of a file's recordings, from its first well, in recording order."""
+    import h5py
+
+    with h5py.File(str(h5_path), "r") as f:
+        if "wells" not in f or not len(f["wells"]):
+            raise ValueError(f"{h5_path.name} has no wells.")
+        first = f["wells"][min(f["wells"], key=_well_number)]
+        starts = []
+        for rec in sorted(first):
+            group = first[rec]
+            starts.append(int(group["start_time"][0]) if isinstance(group, h5py.Group) and "start_time" in group else 0)
+        return starts
+
+
+def relayout_by_div(
+    config,
+    *,
+    dry_run: bool = False,
+    reason: str = "",
+    actor: str | None = None,
+    on_progress: Callable[[str], None] = print,
+) -> Relayout:
+    """Move a store recorded under ``chip_*/well_<N>/DIV_<d>/`` into the per-DIV layout.
+
+    Until 2026-10-28 the tree had a well directory between the chip and the DIV, and a MaxTwo
+    recording was split into one file per well on its way in. The layout is now
+    ``chip_*/DIV_<d>/`` with each recording kept whole (see the module docstring). This brings an
+    existing store across:
+
+    - the pieces of one split recording -- the files of one chip, DIV and kind whose recordings
+      started together -- are stitched back into a single file (:func:`stitch_wells`), named for
+      every well it holds, and the pieces go to :attr:`~mxtreme.config.Config.trash_dir`;
+    - a file that is the whole recording already (a MaxOne scan, a network scan that only ever
+      covered well 0, a multi-well file a failed split left in the chip directory) is moved into
+      the DIV directory unchanged, name and all; per-well pieces of a recording whose whole file
+      is still there are redundant and go to the trash with nothing stitched;
+    - electrode-selection outputs follow their scan into ``DIV_<d>/electrode_selection/``, renamed
+      to the scan's new prefix where it changed; outputs left in a chip directory by a selection
+      run on the unsplit file go there too;
+    - a preprocessed ``.npz`` whose ``path_to_h5`` named a piece is pointed at the new file;
+    - the move is journaled (``recording.moved``, one record per well of each file).
+
+    Nothing here checks whether a scan is still recording into the store; a file the rig holds
+    open cannot be read and is skipped, but run this between recordings, not during one.
+
+    Two recordings of the same wells and kind on one DIV (a scan re-run after its split failed)
+    both survive: the earlier keeps the plain name, the later takes ``_1``, ``_2`` after its tail,
+    the way MaxLab names a collision. The registry is not touched: its rows carry no paths. A file
+    that cannot be read, or whose name does not carry a DIV and tail, is left where it is and
+    reported in ``skipped``; the rest proceed. Run it with ``dry_run=True`` first and read the plan.
+
+    :param config: The :class:`~mxtreme.config.Config` describing the managed store.
+    :param dry_run: Work out and report the plan without changing anything.
+    :param reason: Why, for the journal.
+    :param actor: Who, for the journal; the OS user when ``None``.
+    :param on_progress: Called with each progress line.
+    :returns: What was (or would be) changed.
+    """
+    import os
+    import shutil
+    from datetime import datetime
+
+    import numpy as np
+
+    root = Path(config.recordings_dir)
+    verb = "Would" if dry_run else "Will"
+
+    # -- find every file in the old layout, with what is needed to group the pieces ----------------
+    @dataclass
+    class _Piece:
+        path: Path
+        chip_dir: Path
+        batch: Batch
+        plate_date: int
+        chip: str
+        div: int
+        tail: str
+        wells: list[int]
+        starts: list[int]
+
+    pieces: list[_Piece] = []
+    skipped: list[tuple[Path, str]] = []
+    for plating_dir in sorted(root.iterdir()) if root.is_dir() else []:
+        plating_match = _PLATING_DIR.match(plating_dir.name)
+        if not plating_dir.is_dir() or plating_match is None:
+            continue
+        try:
+            batch = Batch.parse(plating_match["batch_id"])
+        except ValueError:
+            continue
+        for chip_path in sorted(plating_dir.iterdir()):
+            chip_match = _CHIP_DIR.match(chip_path.name)
+            if not chip_path.is_dir() or chip_match is None:
+                continue
+            # The old per-well directories, plus any file sitting in the chip directory itself: a
+            # multi-well scan recorded there and never split (the split failed and kept it).
+            candidates: list[tuple[Path, int]] = []
+            for h5_path in sorted(chip_path.glob("*.h5")):
+                div_match = re.search(r"_DIV_(\d+)_", h5_path.name)
+                if div_match is not None:
+                    candidates.append((h5_path, int(div_match.group(1))))
+            for well_dir in sorted(chip_path.iterdir()):
+                if not well_dir.is_dir() or not _OLD_WELL_DIR.match(well_dir.name):
+                    continue
+                for div_dir in sorted(well_dir.iterdir()):
+                    div_match = _DIV_DIR.match(div_dir.name)
+                    if div_dir.is_dir() and div_match is not None:
+                        candidates.extend((h5_path, int(div_match.group(1))) for h5_path in sorted(div_dir.glob("*.h5")))
+            for h5_path, div in candidates:
+                tail_match = _OLD_TAIL.search(h5_path.name)
+                if tail_match is None:
+                    skipped.append((h5_path, "name does not end in _DIV_<n>_<tail>.raw.h5"))
+                    continue
+                try:
+                    wells, starts = wells_in_file(h5_path), _recording_starts(h5_path)
+                except OSError as exc:  # locked by a recording in progress, unreadable, not HDF5
+                    skipped.append((h5_path, f"cannot be read: {exc}"))
+                    continue
+                except (ValueError, KeyError):
+                    # An aborted scan with no wells inside: nothing to stitch it with, but its
+                    # name still says where it belongs, so it moves on its own.
+                    wells_match = _WELLS_IN_NAME.search(h5_path.name)
+                    wells, starts = list(parse_well_token(wells_match["wells"])) if wells_match else [], []
+                pieces.append(_Piece(
+                    path=h5_path, chip_dir=chip_path, batch=batch,
+                    plate_date=int(plating_match["plate_date"]), chip=chip_match["chip"],
+                    div=div, tail=tail_match["tail"], wells=wells, starts=starts,
+                ))
+
+    # -- group the pieces of one recording: same chip, DIV and tail, recordings started together ---
+    groups: list[list[_Piece]] = []
+    by_key: dict[tuple, list[_Piece]] = {}
+    for piece in pieces:
+        by_key.setdefault((piece.chip_dir, piece.div, piece.tail, len(piece.starts)), []).append(piece)
+    for members in by_key.values():
+        members.sort(key=lambda m: (m.starts[0] if m.starts else 0, m.path))
+        current: list[_Piece] = []
+        for piece in members:
+            if current and abs((piece.starts[0] if piece.starts else 0) - (current[0].starts[0] if current[0].starts else 0)) <= _SAME_RECORDING_MS:
+                current.append(piece)
+            else:
+                if current:
+                    groups.append(current)
+                current = [piece]
+        if current:
+            groups.append(current)
+
+    # -- the plan ------------------------------------------------------------------------------------
+    moved: list[tuple[Path, Path]] = []
+    stitched: list[tuple[tuple[Path, ...], Path]] = []
+    redundant: list[Path] = []
+    selection_moves: list[tuple[Path, Path]] = []
+    npz_rewrites: list[tuple[Path, Path, dict]] = []  # (npz, new h5, contents)
+    journal: list[tuple[_Piece, list[Path], Path, bool]] = []
+    taken: set[Path] = set()
+    selection_sources: set[Path] = set()
+    selection_targets: set[Path] = set()
+    stray_claims: list[tuple[Path, str, Path]] = []  # (chip_dir, base prefix, dest) -- settled last
+
+    def _plan_selection(src: Path, target: Path) -> None:
+        """Move a selection output beside its scan -- or, if that name is taken (the same figure
+        from the whole file and from a piece), trash the extra rather than overwrite anything."""
+        if src in selection_sources:
+            return
+        selection_sources.add(src)
+        if target.exists() or target in selection_targets:
+            redundant.append(src)
+        else:
+            selection_targets.add(target)
+            selection_moves.append((src, target))
+
+    def _free_name(div_dir: Path, stem: str, tail: str) -> Path:
+        """``<stem>_<tail>.raw.h5``, or -- when two recordings of the same wells and kind met on
+        one DIV (a scan re-run after a failed split, say) -- the next ``_1``, ``_2`` after it, the
+        way MaxLab itself names a collision. The earlier recording keeps the plain name."""
+        base = re.sub(r"_\d+$", "", tail)
+        candidates = [div_dir / f"{stem}_{tail}.raw.h5"]
+        candidates += (div_dir / f"{stem}_{base}_{n}.raw.h5" for n in range(1, 1000))
+        return next(c for c in candidates if not c.exists() and c not in taken)
+
+    def _starts(group: list[_Piece]) -> int:
+        return min((piece.starts[0] if piece.starts else 0) for piece in group)
+
+    for group in sorted(groups, key=lambda g: (g[0].chip_dir, g[0].div, g[0].tail, _starts(g))):
+        first = group[0]
+        wells = sorted({w for piece in group for w in piece.wells})
+        whole = [piece for piece in group if sorted(piece.wells) == wells]
+        if not whole and len(wells) != sum(len(piece.wells) for piece in group):
+            for piece in group:
+                skipped.append((piece.path, "two pieces of this recording hold the same well"))
+            continue
+        div_dir = first.chip_dir / f"DIV_{first.div}"
+        stem = recording_stem(first.batch, first.plate_date, first.chip, wells, first.div)
+        dest = _free_name(div_dir, stem, first.tail)
+        taken.add(dest)
+        new_prefix = selection_prefix(dest)
+        if whole:
+            # The recording as the rig wrote it is still here: keep it, and the pieces a failed
+            # split made of it are copies with nothing to add.
+            keep = whole[0]
+            moved.append((keep.path, dest))
+            pieces_of = [piece for piece in group if piece is not keep]
+            redundant.extend(piece.path for piece in pieces_of)
+            for piece in pieces_of:
+                old_selection = piece.path.parent / "electrode_selection"
+                if old_selection.is_dir():
+                    redundant.extend(
+                        f for f in sorted(old_selection.iterdir())
+                        if f.is_file() and f.name.startswith(selection_prefix(piece.path) + "_")
+                    )
+            group = [keep]
+        elif len(group) == 1:
+            moved.append((first.path, dest))
+        else:
+            stitched.append((tuple(piece.path for piece in group), dest))
+        for piece in group:
+            old_prefix = selection_prefix(piece.path)
+            old_selection = piece.path.parent / "electrode_selection"
+            if old_selection.is_dir() and old_selection != div_dir / "electrode_selection":
+                for f in sorted(old_selection.iterdir()):
+                    if f.is_file() and f.name.startswith(old_prefix + "_"):
+                        _plan_selection(f, div_dir / "electrode_selection" / (new_prefix + f.name[len(old_prefix):]))
+        if not whole:
+            # Outputs a selection left in the chip directory, from a run on the unsplit file before
+            # it was split, are named for the whole recording; a stitched one claims them -- after
+            # every whole file still present has claimed its own.
+            stray_claims.append((first.chip_dir, selection_prefix(f"{stem}_{first.tail}.raw.h5"), dest))
+        old_paths = {str(piece.path) for piece in group} | {str(p) for p in redundant}
+        for well in wells:
+            well_dir = Path(config.preprocessed_dir) / first.batch.id / first.chip / f"well{well}"
+            for npz_path in sorted(well_dir.glob(f"DIV{first.div}_*exp_data.npz")) if well_dir.is_dir() else []:
+                with np.load(npz_path, allow_pickle=True) as npz:
+                    if "path_to_h5" not in npz.files or str(np.asarray(npz["path_to_h5"]).item()) not in old_paths:
+                        continue
+                    contents = {key: npz[key] for key in npz.files}
+                contents["path_to_h5"] = np.array(str(dest), dtype=object if contents["path_to_h5"].dtype == object else None)
+                npz_rewrites.append((npz_path, dest, contents))
+        journal.append((first, [piece.path for piece in group], dest, len(group) > 1))
+
+    for chip_path, base_prefix, dest in stray_claims:
+        stray = chip_path / "electrode_selection"
+        new_prefix = selection_prefix(dest)
+        if stray.is_dir():
+            for f in sorted(stray.iterdir()):
+                if f.is_file() and f.name.startswith(base_prefix + "_"):
+                    _plan_selection(f, dest.parent / "electrode_selection" / (new_prefix + f.name[len(base_prefix):]))
+
+    for src, dest in moved:
+        on_progress(f"{verb} move {src.relative_to(root)} -> {dest.relative_to(root)}")
+    for parts, dest in stitched:
+        on_progress(f"{verb} stitch {len(parts)} files -> {dest.relative_to(root)}")
+        for part in parts:
+            on_progress(f"    {part.relative_to(root)}")
+    for src, dest in selection_moves:
+        on_progress(f"{verb} move selection output {src.relative_to(root)} -> {dest.relative_to(root)}")
+    for src in redundant:
+        on_progress(f"{verb} trash {src.relative_to(root)} (a copy of part of a recording that is kept whole)")
+    for npz_path, dest, _ in npz_rewrites:
+        on_progress(f"{verb} point {npz_path.name} at {dest.name}")
+    for path, why in skipped:
+        on_progress(f"Skipping {path}: {why}")
+
+    trash_root = None
+    pruned: list[Path] = []
+    npz_done: list[Path] = []
+    if not dry_run:
+        for parts, dest in stitched:
+            on_progress(f"Stitching {dest.name}...")
+            stitch_wells(parts, dest, on_progress=on_progress)
+        for src, dest in moved:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            os.rename(src, dest)
+        for src, dest in selection_moves:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            os.rename(src, dest)
+        for npz_path, _, contents in npz_rewrites:
+            stat = npz_path.stat()
+            tmp = npz_path.with_name(npz_path.name + ".tmp")
+            with open(tmp, "wb") as fh:
+                np.savez_compressed(fh, **contents)
+            os.replace(tmp, npz_path)
+            os.utime(npz_path, (stat.st_atime, stat.st_mtime))
+            npz_done.append(npz_path)
+        to_trash = [part for parts, _ in stitched for part in parts] + redundant
+        if to_trash:
+            stamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
+            trash_root = Path(config.trash_dir) / f"{stamp}_relayout"
+            data_root = Path(config.data_root).resolve()
+            for part in to_trash:
+                target = trash_root / part.resolve().relative_to(data_root)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(part), str(target))
+            on_progress(f"Pieces of the stitched recordings and redundant copies moved to {trash_root}")
+        # Prune what the move emptied, deepest first: electrode_selection/, DIV_*/, then well_*/.
+        prunable = re.compile(r"^(electrode_selection|DIV_\d+|well_\d+)$")
+        candidates = sorted(
+            {d for piece in pieces for d in (piece.path.parent / "electrode_selection", piece.path.parent, piece.path.parent.parent)}
+            | {piece.chip_dir / "electrode_selection" for piece in pieces},
+            key=lambda d: len(d.parts), reverse=True,
+        )
+        for d in candidates:
+            if d.is_dir() and prunable.match(d.name) and not any(d.iterdir()):
+                d.rmdir()
+                pruned.append(d)
+
+        from mxtreme import transactions
+
+        for first, sources, dest, was_stitched in journal:
+            location = parse_recording_path(dest, root)
+            for well in (location.wells if location else []):
+                transactions.record(
+                    config,
+                    "recording.moved",
+                    batch_id=first.batch,
+                    plate_date=first.plate_date,
+                    experiment=location.experiment,
+                    chip=first.chip,
+                    well=well,
+                    div=first.div,
+                    actor=actor,
+                    note=reason,
+                    data={"from": [str(s) for s in sources], "path": str(dest), "stitched": was_stitched},
+                )
+        on_progress(
+            f"Relayout done: {len(moved)} file(s) moved, {len(stitched)} recording(s) stitched, "
+            f"{len(redundant)} redundant file(s) trashed, {len(selection_moves)} selection output(s) "
+            f"moved, {len(npz_done)} .npz re-pointed, {len(skipped)} skipped."
+        )
+
+    return Relayout(
+        moved=tuple(moved),
+        stitched=tuple(stitched),
+        redundant=tuple(redundant),
+        selection_files=tuple(selection_moves),
+        npz_files=tuple(npz_done if not dry_run else [n for n, _, _ in npz_rewrites]),
+        skipped=tuple(skipped),
+        trashed_to=trash_root,
+        pruned_dirs=tuple(pruned),
     )

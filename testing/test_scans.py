@@ -144,29 +144,29 @@ def _params(**overrides):
 
 
 def test_scan_defaults_into_the_managed_store(tmp_path):
-    """No save_path means the store: a single-well scan records straight into its well/DIV home."""
+    """No save_path means the store: the scan records straight into the chip's DIV directory."""
     from mxtreme.config import Config
 
     config = Config(data_root=tmp_path)
     resolved = _params().resolved(config)
 
     assert resolved.h5_path.parent == (
-        config.recordings_dir / f"plating_250512_{BATCH}" / "chip_M1_C0001" / "well_0" / "DIV_14"
+        config.recordings_dir / f"plating_250512_{BATCH}" / "chip_M1_C0001" / "DIV_14"
     )
     assert resolved.h5_path.name == f"{STEM}_activity_scan.raw.h5"
 
 
-def test_multi_well_scan_records_into_the_chip_directory(tmp_path):
-    """Several wells record into one file first, so it stages in the chip dir until it is split."""
+def test_multi_well_scan_records_into_the_same_directory_as_one_file(tmp_path):
+    """Several wells record into one file that stays whole; its name carries every well."""
     from mxtreme.config import Config
 
     config = Config(data_root=tmp_path)
     resolved = _params(wells=[0, 3]).resolved(config)
 
     assert resolved.h5_path.parent == (
-        config.recordings_dir / f"plating_250512_{BATCH}" / "chip_M1_C0001"
+        config.recordings_dir / f"plating_250512_{BATCH}" / "chip_M1_C0001" / "DIV_14"
     )
-    assert "well_0-3" in resolved.h5_path.name
+    assert resolved.h5_path.name == f"{STEM.replace('well_0', 'well_0-3')}_activity_scan.raw.h5"
 
 
 def test_scan_into_the_store_requires_a_batch(tmp_path):
@@ -188,7 +188,7 @@ def test_scan_into_the_store_requires_the_system(tmp_path):
     with pytest.raises(ValueError, match="system"):
         _params(system=None).resolved(Config(data_root=tmp_path))
     resolved = _params(system="M2").resolved(Config(data_root=tmp_path))
-    assert resolved.h5_path.parent.parent.parent.name == "chip_M2_C0001"
+    assert resolved.h5_path.parent.parent.name == "chip_M2_C0001"
 
 
 def test_connected_system_fills_or_checks_the_params():

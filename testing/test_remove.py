@@ -37,7 +37,7 @@ def populated(tmp_path):
     """A store with one culture on DIV 26: activity scan + selection outputs, network scan +
     preprocessed npz + burst CSV + burst-log row, all registered and journaled."""
     config = Config(data_root=tmp_path / "store")
-    div_dir = store.recording_dir(config, BATCH, PLATE, CHIP, 0, 26, system="M1")
+    div_dir = store.recording_dir(config, BATCH, PLATE, CHIP, 26, system="M1")
     div_dir.mkdir(parents=True)
     stem = store.recording_stem(BATCH, PLATE, CHIP, 0, 26)
     activity = div_dir / f"{stem}_activity_scan.raw.h5"
@@ -46,8 +46,8 @@ def populated(tmp_path):
     network.write_bytes(b"NS")
     sel = div_dir / "electrode_selection"
     sel.mkdir()
-    (sel / f"{stem}_AS_well0.png").write_bytes(b"png")
-    (sel / f"{stem}_network_well0.npz").write_bytes(b"npz")
+    (sel / f"{stem}_activity_scan_AS_well0.png").write_bytes(b"png")  # named after the scan file
+    (sel / f"{stem}_activity_scan_network_well0.npz").write_bytes(b"npz")
     io.register_scan(_Params(), config.registry_path, kind="activity_scan", well_files={0: activity})
     io.register_scan(_Params(), config.registry_path, kind="network_scan", well_files={0: network})
     pre = config.preprocessed_dir / BATCH / CHIP / "well0"
@@ -73,8 +73,8 @@ def _rows(config):
 def test_derived_files_of_each_kind(populated):
     config, activity, network, npz, csv, _ = populated
     assert [p.name for p in store.derived_files(config, activity)] == [
-        f"{activity.name.removesuffix('_activity_scan.raw.h5')}_AS_well0.png",
-        f"{activity.name.removesuffix('_activity_scan.raw.h5')}_network_well0.npz",
+        f"{activity.name.removesuffix('.raw.h5')}_AS_well0.png",
+        f"{activity.name.removesuffix('.raw.h5')}_network_well0.npz",
     ]
     assert store.derived_files(config, network) == [npz, csv]
     assert store.derived_files(config, Path("/elsewhere/x.h5")) == []
@@ -120,8 +120,46 @@ def test_remove_activity_scan_takes_its_selection_and_prunes_empty_dirs(populate
     assert len(removal.files) == 3  # the scan and its two selection outputs
     assert not activity.parent.exists()  # DIV_26 emptied and pruned, electrode_selection with it
     assert set(removal.pruned_dirs) == {activity.parent / "electrode_selection", activity.parent}
-    assert activity.parent.parent.is_dir()  # the well directory stays
+    assert activity.parent.parent.is_dir()  # the chip directory stays
     assert _rows(config).empty
+
+
+def test_remove_a_multiwell_file_takes_every_well_with_it(tmp_path):
+    """A MaxTwo recording is one file for several cultures: removing it drops every well's rows
+    and derivatives, and journals one record per well, as its registration did."""
+    config = Config(data_root=tmp_path / "store")
+    div_dir = store.recording_dir(config, BATCH, PLATE, CHIP, 26, system="M2")
+    div_dir.mkdir(parents=True)
+    stem = store.recording_stem(BATCH, PLATE, CHIP, [0, 3], 26)
+    network = div_dir / f"{stem}_network_scan.raw.h5"
+    network.write_bytes(b"NS")
+
+    class _Both(_Params):
+        wells = (0, 3)
+
+    io.register_scan(_Both(), config.registry_path, kind="network_scan", well_files={0: network, 3: network})
+    npzs = []
+    for well in (0, 3):
+        pre = config.preprocessed_dir / BATCH / CHIP / f"well{well}"
+        pre.mkdir(parents=True)
+        npz = pre / f"DIV26_{PLATE}_{CHIP}_{BATCH}_well{well}_exp_data.npz"
+        np.savez(npz, x=np.arange(3))
+        npzs.append(npz)
+        io.register({well: {"batch_id": BATCH, "chip": CHIP, "DIV": 26, "plate_date": PLATE}}, config.registry_path)
+    assert len(_rows(config)) == 4
+
+    location = store.parse_recording_path(network, config.recordings_dir)
+    assert location.wells == (0, 3)
+    assert store.derived_files(config, network) == npzs
+
+    removal = store.remove_recording(network, config, actor="kam", on_progress=lambda _: None)
+
+    assert removal.files == (network, *npzs)
+    assert not network.exists() and not any(p.exists() for p in npzs)
+    assert removal.registry_rows == 4 and _rows(config).empty
+    log = [t for t in tx.read(config) if t.op == "recording.removed"]
+    assert [t.well for t in log] == [0, 3]
+    assert all(t.data["wells"] == [0, 3] and t.data["path"] == str(network) for t in log)
 
 
 def test_dry_run_touches_nothing(populated):
