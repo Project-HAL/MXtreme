@@ -470,6 +470,9 @@ def run_network_scan(
         on_progress(f"  Well {well}: routing {len(electrodes)} electrodes...")
         array, _ = mx_setup.init_well(well, list(electrodes), stim_elecs=[])
         arrays[well] = array
+        # Save the routing beside the recording, so a later experiment can load exactly this
+        # channel assignment (array.load_config, or mx_setup.init_well given the .cfg path).
+        array.save_config(str(Path(params.save_path) / f"{params.file_name}_well{well}.cfg"))
         on_progress(f"  Well {well}: routed and downloaded")
 
     on_progress(f"Activating wells {params.wells}")

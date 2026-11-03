@@ -128,7 +128,9 @@ scan cut short is still readable.
 The file goes into the recordings tree beside the activity scan it came from — the same
 `.../chip_<M1|M2>_<chip>/DIV_<div>/` directory, as `..._network_scan.raw.h5` — with one
 `network_scan` row per well in `registry.csv`. `save_path` writes it elsewhere, unregistered — the
-same rules as an activity scan.
+same rules as an activity scan. Each well's routing is also saved as a MaxLab `.cfg`
+(`..._well<w>.cfg`) beside the `.h5`, so a later experiment can reload the exact same routing with
+`array.load_config` or `mx_setup.init_well`.
 
 A network scan is an ordinary recording, so it feeds straight into the analysis workflow below:
 
