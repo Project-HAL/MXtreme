@@ -31,3 +31,9 @@ def test_from_toml_missing_root_raises(tmp_path):
     toml = _write_toml(tmp_path, "[data]\n")
     with pytest.raises(KeyError):
         Config.from_toml(toml)
+
+
+def test_from_toml_simulations_dir_is_optional(tmp_path):
+    assert Config.from_toml(_write_toml(tmp_path, '[data]\nroot = "/data/store"\n')).simulations_dir is None
+    cfg = Config.from_toml(_write_toml(tmp_path, '[data]\nroot = "/data/store"\n\n[simulations]\ndir = "/local/sims"\n'))
+    assert str(cfg.simulations_dir) == "/local/sims" and str(cfg.data_root) == "/data/store"
