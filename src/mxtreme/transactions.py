@@ -61,6 +61,8 @@ OPS: dict[str, str] = {
     "chip.set_device": "chip",  # data: {"device": one of DEVICES}
     "note": "batch",  # a remark against a batch, chip or culture; changes no state
     "treatment.applied": "culture",  # data: {"applied_at", "name", "dose", "units", "group"}; see below
+    "burst.relabelled": "recording",  # data: {"path", "burst_id", "kind", "was"}; a detected burst's kind corrected by eye ("network", "mini" or "ignore")
+    "burst.added": "recording",  # data: {"path", "onset_frame", "offset_frame", "kind"}; a burst detection missed, marked by eye
     # -- what MXtreme did to the store, journaled by the function that did it ---------------------
     "activity_scan.registered": "recording",  # data: {"path"}; one per well
     "network_scan.registered": "recording",  # data: {"path"}; one per well
@@ -107,8 +109,11 @@ TREATMENT_FIELDS = ("applied_at", "name", "dose", "units", "group")
 DEVICES = ("MaxOne", "MaxOne+", "MaxTwo")
 
 #: The ops that a person records rather than MXtreme -- for a reader that wants to show the two
-#: kinds apart.
-DECISION_OPS = STRICT_OPS
+#: kinds apart. The burst edits are decisions too, but about a recording that is already on disk,
+#: so they carry the identity its registry row has rather than one someone typed, and are not
+#: strict: an older store's batch ids predate the convention and its recordings are still worth
+#: correcting. :func:`mxtreme.analysis.intervals.annotated_bursts` folds them over the burst table.
+DECISION_OPS = STRICT_OPS | frozenset({"burst.relabelled", "burst.added"})
 
 
 @dataclass(frozen=True)

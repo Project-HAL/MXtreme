@@ -39,7 +39,7 @@ def _unwrap(key: str, value: np.ndarray):
     return value
 
 
-def load_preprocessed(filepath: str | Path) -> dict:
+def load_preprocessed(filepath: str | Path, *, skip: tuple[str, ...] = ()) -> dict:
     """Load a preprocessed ``.npz`` produced by :func:`save_preprocessed`, as a well dict.
 
     ``.npz`` files can only hold arrays, so single values are saved wrapped: identity fields and
@@ -50,6 +50,11 @@ def load_preprocessed(filepath: str | Path) -> dict:
 
     :param filepath: Path to the ``.npz`` file.
     :type filepath: str or Path
+    :param skip: Saved fields to leave unread. ``np.load`` is lazy, so a skipped array is never
+        decompressed: ``skip=("spike_bin",)`` reads an hour-long recording's spikes in a fraction
+        of a second instead of inflating its binned matrix (gigabytes as ``float64`` in older
+        files). A :class:`~mxtreme.recording.Recording` built from such a dict derives its
+        ``asdr`` from the spikes and has ``spike_bin`` set to ``None``.
     :raises FileNotFoundError: If ``filepath`` does not exist.
     :returns: The saved fields keyed by name (e.g. ``spike_data``, ``channelmap``, ``samp_rate``).
     :rtype: dict
@@ -57,7 +62,7 @@ def load_preprocessed(filepath: str | Path) -> dict:
     if not os.path.isfile(filepath):
         raise FileNotFoundError(f"File does not exist: {filepath}")
     with np.load(filepath, allow_pickle=True) as saved:
-        well = {key: _unwrap(key, saved[key]) for key in saved.files}
+        well = {key: _unwrap(key, saved[key]) for key in saved.files if key not in skip}
     if well.get("preprocessing_params") is None:
         well["preprocessing_params"] = {}
     return _current_identity(well)
