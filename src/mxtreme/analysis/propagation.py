@@ -14,6 +14,9 @@ Read at the recording's own time resolution (one frame, 0.1 ms at 10 kHz), three
 - **burst scale, one burst at a time** -- :func:`per_burst`: a plane fitted to first spike
   time against position (its R2 beside the R2 with the times shuffled), how long the channels
   take to come in, and how fast the population rate rises.
+- **one burst as a shape** -- :func:`burst_shape`: how much of the array it engaged, which way
+  it travelled (the plane's direction, with how often shuffled positions do as well), how fast
+  the population rate rose and fell, and that rate's envelope on a grid every burst shares.
 
 Everything takes the spike table as flat arrays -- ``frames`` (ascending), ``rows`` (each
 spike's row in the channel map) and ``xy`` (the rows' positions in µm) -- which
@@ -273,6 +276,122 @@ def per_burst(frames, rows, xy, samp_rate: float, spans, *, min_channels: int = 
         out["t10_50_ms"][k] = q[1] - q[0]
         out["t10_90_ms"][k] = q[2] - q[0]
         out["early_sd_um"][k] = np.hypot(*p[early].std(0))
+    return out
+
+
+#: What :func:`burst_shape` reports per burst, beside the envelope.
+BURST_SHAPE = (
+    "engaged", "heading_deg", "heading_r2", "heading_p", "peak_hz", "rise_ms", "fall_ms", "rise_hz_per_ms", "fall_hz_per_ms",
+)
+
+
+def _crossing(rate, i: int, j: int, level: float) -> float:
+    """Where, between bins ``i`` and ``j`` (neighbours), a straight line through their rates
+    meets ``level``, in bins."""
+    a, b = float(rate[i]), float(rate[j])
+    return float(i) if a == b else i + (level - a) / (b - a) * (j - i)
+
+
+def burst_shape(
+    frames, rows, xy, samp_rate: float, spans, *, pre_ms: float = 20.0, post_ms: float = 100.0, bin_ms: float = 2.0,
+    span_ms: float | None = None, points: int = 48, min_channels: int = 50, n_shuffle: int = 200, seed: int = 1,
+) -> dict[str, np.ndarray]:
+    """One burst as a shape: how much of the array it took, which way it went, how it rose and fell.
+
+    Aligned with ``spans``. Per burst:
+
+    - ``engaged``: the share of the array's channels (the rows of ``xy``) that fired in it;
+    - ``heading_deg``: the direction it travelled -- the direction in which first spike time
+      increases on a plane fitted to it against position -- in degrees from +x toward +y, in
+      the electrodes' own coordinates, ``[0, 360)``. ``heading_r2`` is the share of first spike
+      timing that plane explains, and ``heading_p`` how often a plane does at least as well when
+      the times are dealt out again among the channels (``n_shuffle`` times; the smallest value
+      it can take is ``1 / (n_shuffle + 1)``). A heading is only worth reading when
+      ``heading_p`` is small: a plane always points somewhere. ``nan`` with fewer than
+      ``min_channels`` channels;
+    - ``peak_hz``: the peak of the population rate inside the burst, in spikes per second per
+      channel of the array. The rate is counted in ``bin_ms`` bins from ``pre_ms`` before the
+      onset to ``post_ms`` after the offset and smoothed over three bins (1-2-1);
+    - ``rise_ms``: from the last time before the peak the rate was under 10% of it to the first
+      time after that it reached 90%; ``fall_ms``: from the last time it was at 90% to the first
+      time after the peak it was back under 10%. Both read between bins by straight lines, and
+      are ``nan`` when the window never shows the rate under 10% on that side;
+    - ``rise_hz_per_ms`` / ``fall_hz_per_ms``: the slopes those stand for, 80% of the peak over
+      the time taken.
+
+    And, for drawing every burst on one axis, ``envelope``: an ``(n, points)`` array of the
+    population rate (same units, not smoothed) from ``pre_ms`` before each burst's onset to
+    ``span_ms`` after it (default: the longest burst plus ``post_ms``), with
+    ``envelope_ms``, the ``points + 1`` bin edges in ms from the onset. A short burst's row
+    carries on past its offset into whatever followed it.
+    """
+    f = np.asarray(frames, dtype=np.int64)
+    ch = np.asarray(rows, dtype=np.int64)
+    pos = np.asarray(xy, dtype=float)
+    hz = float(samp_rate)
+    spans = np.asarray(spans, dtype=np.int64).reshape(-1, 2)
+    n_chan = max(1, len(pos))
+    rng = np.random.default_rng(seed)
+    out = {k: np.full(len(spans), np.nan) for k in BURST_SHAPE}
+    if span_ms is None:
+        span_ms = (float((spans[:, 1] - spans[:, 0]).max()) * 1000.0 / hz if len(spans) else 0.0) + post_ms
+    edges_ms = np.linspace(-pre_ms, span_ms, int(points) + 1)
+    edges_fr = edges_ms * hz / 1000.0
+    env_scale = 1.0 / n_chan / (np.diff(edges_ms) / 1000.0)
+    envelope = np.zeros((len(spans), int(points)))
+    per_bin = bin_ms * hz / 1000.0
+    pre, post = int(round(pre_ms * hz / 1000.0)), int(round(post_ms * hz / 1000.0))
+
+    for k, (on, off) in enumerate(spans):
+        envelope[k] = np.diff(np.searchsorted(f, on + edges_fr)) * env_scale
+
+        # the rate, finely, and its rise and fall around the peak inside the burst
+        t0 = on - pre
+        a, b = np.searchsorted(f, [t0, off + post])
+        n_bins = int(np.ceil((off + post - t0) / per_bin))
+        rate = np.bincount(((f[a:b] - t0) / per_bin).astype(np.int64), minlength=n_bins)[:n_bins] / n_chan / (bin_ms / 1000.0)
+        rate = np.convolve(rate, [0.25, 0.5, 0.25], mode="same")
+        lo, hi = int(pre / per_bin), max(int(pre / per_bin) + 1, int(np.ceil((off - t0) / per_bin)))
+        if rate[lo:hi].max() > 0:
+            ip = lo + int(np.argmax(rate[lo:hi]))
+            peak = float(rate[ip])
+            out["peak_hz"][k] = peak
+            under = np.flatnonzero(rate[:ip + 1] < 0.1 * peak)
+            if under.size:
+                i10 = int(under[-1])
+                i90 = i10 + 1 + int(np.argmax(rate[i10 + 1:ip + 1] >= 0.9 * peak))
+                out["rise_ms"][k] = (_crossing(rate, i90 - 1, i90, 0.9 * peak) - _crossing(rate, i10, i10 + 1, 0.1 * peak)) * bin_ms
+            under = np.flatnonzero(rate[ip:] < 0.1 * peak)
+            if under.size:
+                j10 = ip + int(under[0])
+                j90 = int(np.flatnonzero(rate[ip:j10] >= 0.9 * peak)[-1]) + ip
+                out["fall_ms"][k] = (_crossing(rate, j10 - 1, j10, 0.1 * peak) - _crossing(rate, j90, j90 + 1, 0.9 * peak)) * bin_ms
+            for name in ("rise", "fall"):
+                ms = out[f"{name}_ms"][k]
+                if ms > 0:
+                    out[f"{name}_hz_per_ms"][k] = 0.8 * peak / ms
+
+        # how much of the array, and which way
+        cc, first = first_spikes(f, ch, on, off)
+        out["engaged"][k] = cc.size / n_chan
+        if cc.size < max(min_channels, 4):
+            continue
+        t = (first - first.min()) * 1000.0 / hz
+        tc = t - t.mean()
+        sst = float(tc @ tc)
+        pc = pos[cc] - pos[cc].mean(0)
+        if sst <= 0 or np.linalg.matrix_rank(pc) < 2:
+            continue
+        slope = np.linalg.lstsq(pc, tc, rcond=None)[0]  # ms per µm, along x and y
+        q = np.linalg.qr(pc)[0]
+        r2 = float(np.sum((q.T @ tc) ** 2) / sst)
+        out["heading_deg"][k] = float(np.degrees(np.arctan2(slope[1], slope[0])) % 360.0)
+        out["heading_r2"][k] = r2
+        if n_shuffle:
+            dealt = rng.permuted(np.tile(tc, (int(n_shuffle), 1)), axis=1)
+            out["heading_p"][k] = (1 + int(np.sum(np.sum((dealt @ q) ** 2, axis=1) / sst >= r2))) / (n_shuffle + 1)
+    out["envelope"] = envelope
+    out["envelope_ms"] = edges_ms
     return out
 
 

@@ -203,3 +203,48 @@ def test_load_simulation_fills_what_a_simulation_lacks(tmp_path):
         load_simulation(tmp_path / "not_a_sim.npz")
     with pytest.raises(FileNotFoundError):
         load_simulation(tmp_path / "missing.npz")
+
+
+def test_burst_shape_heading_follows_the_wave():
+    gx, gy = np.meshgrid(np.arange(12) * 100.0, np.arange(10) * 100.0)
+    xy = np.c_[gx.ravel(), gy.ravel()]
+    onsets = np.arange(4) * 5001 + 1000
+    for delay, want in ((xy[:, 0] / 10.0, 0.0), (xy[:, 1] / 10.0, 90.0), (-xy[:, 0] / 10.0 + 110, 180.0), (-xy[:, 1] / 10.0 + 90, 270.0)):
+        frames, rows = _wave(xy, onsets, np.round(delay).astype(int))
+        spans = np.c_[onsets, onsets + 200]
+        res = pr.burst_shape(frames, rows, xy, HZ, spans, n_shuffle=99)
+        assert set(pr.BURST_SHAPE) <= set(res)
+        assert np.allclose(res["engaged"], 1.0)
+        assert np.allclose((res["heading_deg"] - want + 180) % 360 - 180, 0.0, atol=1e-6)
+        assert np.all(res["heading_r2"] > 0.99) and np.allclose(res["heading_p"], 0.01)
+    # no order across the array: a heading is still reported, and the shuffles say not to read it
+    rng = np.random.default_rng(3)
+    frames, rows = _wave(xy, onsets, rng.integers(0, 150, len(xy)))
+    res = pr.burst_shape(frames, rows, xy, HZ, np.c_[onsets, onsets + 200], n_shuffle=99)
+    assert np.all(res["heading_r2"] < 0.1) and np.all(res["heading_p"] > 0.05)
+    # half the array silent, and too few channels for a heading
+    half = rows < 60
+    res = pr.burst_shape(frames[half], rows[half], xy, HZ, np.c_[onsets, onsets + 200], min_channels=100)
+    assert np.allclose(res["engaged"], 0.5) and np.all(np.isnan(res["heading_deg"]))
+
+
+def test_burst_shape_rise_fall_and_envelope():
+    # 100 channels; the rate climbs over 10 ms, holds for 20 ms, and falls over 40 ms
+    n_chan, on = 100, 5000
+    ms = np.arange(-20, 120)
+    level = np.interp(ms, [0, 10, 30, 70], [0, 20, 20, 0], left=0, right=0)  # spikes per ms
+    frames = np.concatenate([on + m * 10 + (np.arange(int(k)) * 10) // max(1, int(k)) for m, k in zip(ms, level)]).astype(np.int64)
+    rows = np.arange(len(frames)) % n_chan
+    xy = np.c_[np.arange(n_chan) * 10.0, np.zeros(n_chan)]
+    res = pr.burst_shape(frames, rows, xy, HZ, np.array([[on, on + 700]]), pre_ms=20, post_ms=50, bin_ms=1.0, span_ms=100.0, points=24)
+    assert res["peak_hz"][0] == pytest.approx(200.0)  # 20 spikes per ms over 100 channels
+    assert res["rise_ms"][0] == pytest.approx(8.0, abs=1.0) and res["fall_ms"][0] == pytest.approx(32.0, abs=2.0)
+    assert res["rise_hz_per_ms"][0] > 3 * res["fall_hz_per_ms"][0]
+    assert res["envelope"].shape == (1, 24) and res["envelope_ms"][0] == -20.0 and res["envelope_ms"][-1] == 100.0
+    assert res["envelope"][0, :4].sum() == 0 and res["envelope"][0].max() == pytest.approx(200.0)
+    assert res["envelope"][0].sum() * 5 / 1000 * n_chan == pytest.approx(len(frames))  # 5 ms bins hold every spike
+    # the rate never under 10% before the peak inside the window: no rise to report
+    cut = pr.burst_shape(frames, rows, xy, HZ, np.array([[on + 150, on + 700]]), pre_ms=5, post_ms=50, bin_ms=1.0)
+    assert np.isnan(cut["rise_ms"][0]) and np.isnan(cut["rise_hz_per_ms"][0]) and cut["fall_ms"][0] > 0
+    empty = pr.burst_shape(frames, rows, xy, HZ, np.array([[90000, 90100]]))
+    assert np.isnan(empty["peak_hz"][0]) and empty["engaged"][0] == 0 and not empty["envelope"].any()
