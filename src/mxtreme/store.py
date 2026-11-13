@@ -79,6 +79,10 @@ _NETWORK_INDEX = re.compile(r"_network_scan(?:_(\d+))?\.raw\.h5$")
 #: Extracts the experiment-name tail of a store file name: everything after the ``DIV_<div>_`` marker.
 _EXP_TAIL = re.compile(r"_DIV_\d+_(?P<experiment>.+?)\.raw\.h5$")
 
+#: A recording named the way files were before the store's layout, and still are by tools that
+#: record on their own (``DIV21_261013_M09473_CAIT.raw.h5``): its experiment is the tail.
+_FLAT_EXP_NAME = re.compile(r"^DIV\d+_\d{6}_[^_]+_(?P<experiment>.+?)\.raw\.h5$")
+
 #: Plating dates are ``YYMMDD``, matching :func:`mxtreme.scans.mx_setup.write_metadata`.
 #: The wells a store file holds, from its name (see :func:`well_token`).
 _WELLS_IN_NAME = re.compile(r"_well_(?P<wells>\d+(?:-\d+)*)_DIV_\d+_")
@@ -446,6 +450,71 @@ def parse_recording_path(h5_path: Path, recordings_dir: Path) -> RecordingLocati
         kind=kind,
         experiment=experiment,
     )
+
+
+def experiment_name(h5_path: str | Path) -> str:
+    """The experiment a raw recording's file name carries; ``""`` for a scan.
+
+    The store's own names end ``_DIV_<n>_<experiment>.raw.h5``. A file named the older, flat way
+    (``DIV<n>_<plate date>_<chip>_<experiment>.raw.h5``) carries it as its tail too. Any other
+    name is its own experiment, whole: a foreign file still has a full identity from the
+    directories it sits in, and this keeps it indexable rather than skipped.
+    """
+    name = Path(h5_path).name
+    if recording_kind(name) != "experiment":
+        return ""
+    match = _EXP_TAIL.search(name) or _FLAT_EXP_NAME.match(name)
+    return match["experiment"] if match else name.removesuffix(".raw.h5").removesuffix(".h5")
+
+
+def filed_metadata(h5_path: str | Path, recordings_dir: str | Path) -> dict | None:
+    """The identity a raw recording has by where it is filed, as :func:`mxtreme.extract.extract`
+    takes it (its ``metadata``).
+
+    For a recording that did not come through this package -- one a separate tool wrote straight
+    into the tree, with no ``/assay/metadata`` blob, or with one that names another batch -- the
+    directories are the record of what it is: the plating directory gives the batch and plate
+    date, the chip directory the chip, the ``DIV_<n>`` directory the DIV, and the file name the
+    experiment (:func:`experiment_name`). Passed to ``extract``, these win over whatever the
+    file embeds, so its preprocessed ``.npz`` is filed where every other recording of that
+    culture is.
+
+    Unlike :func:`parse_recording_path`, which reads only names this package wrote, this asks
+    nothing of the file's name. Both places a recording can sit are read: the layout's
+    ``<plating>/<chip>/DIV_<n>/`` and the per-well ``<plating>/<chip>/well_<w>/DIV_<n>/`` that
+    stores laid out before :func:`relayout_by_div` still have. The wells are not part of the
+    answer -- they are in the file.
+
+    :param h5_path: The file, anywhere under ``recordings_dir``.
+    :param recordings_dir: The tree root (``config.recordings_dir``).
+    :returns: ``{"Batch ID", "Plate date", "Chip ID", "DIV", "Experiment"}``, or ``None`` if the
+        path does not follow the layout.
+    """
+    h5_path = Path(h5_path)
+    try:
+        parts = h5_path.relative_to(recordings_dir).parts[:-1]
+    except ValueError:
+        return None
+    if len(parts) == 4 and re.match(r"^well_\d+$", parts[2]):
+        parts = (parts[0], parts[1], parts[3])
+    if len(parts) != 3:
+        return None
+    plating_match = _PLATING_DIR.match(parts[0])
+    chip_match = _CHIP_DIR.match(parts[1])
+    div_match = re.match(r"^DIV_(\d+)$", parts[2])
+    if not (plating_match and chip_match and div_match):
+        return None
+    try:
+        batch = Batch.parse(plating_match["batch_id"])
+    except ValueError:
+        return None
+    return {
+        "Batch ID": batch.id,
+        "Plate date": int(plating_match["plate_date"]),
+        "Chip ID": chip_match["chip"],
+        "DIV": int(div_match.group(1)),
+        "Experiment": experiment_name(h5_path),
+    }
 
 
 # --- the wells inside a file, and putting a split recording back together -------------------------
