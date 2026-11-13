@@ -521,17 +521,6 @@ def run_network_scan(
     # reporting a path.
     h5_path = _saved_file(params, scan_start)
 
-    well_files = {well: h5_path for well in params.wells}
-    if registry_path is not None and len(params.wells) > 1:
-        on_progress("\nSplitting into one file per well...")
-        well_files = _split_into_store(h5_path, params, config, "network_scan", on_progress)
-        h5_path = well_files[min(well_files)]
-        # Each .cfg follows its well's split .h5 (a failed split leaves both in place).
-        for well, path in well_files.items():
-            cfg = Path(params.save_path) / f"{params.file_name}_well{well}.cfg"
-            if path.parent != cfg.parent and cfg.exists():
-                cfg.rename(path.with_name(f"{path.name.removesuffix('.raw.h5')}_well{well}.cfg"))
-
     result = NetworkScanResult(
         h5_path=h5_path,
         params=params,
