@@ -16,11 +16,17 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Callable
 
 import numpy as np
 
 
-def extract(filepath: str, metadata: dict | None = None, wells: list | int | None = None) -> dict[int, dict]:
+def extract(
+    filepath: str,
+    metadata: dict | None = None,
+    wells: list | int | None = None,
+    on_empty: Callable[[int, str], None] | None = None,
+) -> dict[int, dict]:
     """Extract per-well data from a single raw ``.h5`` file.
 
     :param filepath: Path to the raw ``.raw.h5`` file.
@@ -48,8 +54,17 @@ def extract(filepath: str, metadata: dict | None = None, wells: list | int | Non
     :type metadata: dict, optional
     :param wells: Well number(s) to extract. ``None`` extracts every well present in the file.
     :type wells: list or int, optional
+    :param on_empty: What to do with a well that holds nothing -- no raw frames, and for a file
+        without raw data no spikes either. A MaxTwo file can hold one such well beside five good
+        ones (a well that was not recording when the file was closed). ``None`` (the default)
+        raises for it, which is right when the caller asked for that recording. A callable is
+        called with ``(well, reason)`` instead and the well is left out of the result, so the
+        other wells of the file are still extracted; a file whose every well is empty then
+        returns an empty mapping.
+    :type on_empty: callable, optional
     :raises FileNotFoundError: If ``filepath`` does not exist.
-    :raises ValueError: If the file has no embedded metadata and ``metadata`` was not supplied.
+    :raises ValueError: If the file has no embedded metadata and ``metadata`` was not supplied,
+        or a well is empty and ``on_empty`` was not given.
     :returns: Mapping of well number to that well's data dict.
     :rtype: dict[int, dict]
     """
@@ -153,22 +168,31 @@ def extract(filepath: str, metadata: dict | None = None, wells: list | int | Non
             # Start frame of the raw recording (used to normalise spike/event frames to start at 0)
             h5_object = f["wells"]["well{0:0>3}".format(well)]["rec{0:0>4}".format(0)]
             groups = h5_object["groups"]
+            empty = None  # why this well holds nothing, when it does
             if not groups.keys():
                 if len(well_data["spike_data"]) == 0:
-                    raise ValueError(
-                        f"{filepath} holds no data for well {well}: no raw frames and no spikes. "
-                        "An empty or aborted recording cannot be extracted."
-                    )
-                print(f"Warning: No raw data for {filepath} for well no {well}")
-                well_data["raw_start"] = np.min(well_data["spike_data"]["frameno"])
+                    empty = "no raw frames and no spikes"
+                else:
+                    print(f"Warning: No raw data for {filepath} for well no {well}")
+                    well_data["raw_start"] = np.min(well_data["spike_data"]["frameno"])
             else:
                 group0 = groups[next(iter(groups))]
                 if group0["frame_nos"].shape[0] == 0:
+                    empty = "the recording has 0 frames"
+                else:
+                    well_data["raw_start"] = int(group0["frame_nos"][0])
+            if empty is not None:
+                if on_empty is None:
                     raise ValueError(
-                        f"{filepath} holds no data for well {well}: the recording has 0 frames. "
+                        f"{filepath} holds no data for well {well}: {empty}. "
                         "An empty or aborted recording cannot be extracted."
                     )
-                well_data["raw_start"] = int(group0["frame_nos"][0])
+                # The caller would rather have the file's other wells than nothing.
+                del data[well]
+                h5_metadata["wells"].remove(well)
+                print(f"  well {well} | empty ({empty}): left out")
+                on_empty(well, empty)
+                continue
 
             # Event data (stimulation start/stop markers, etc.)
             events = None
