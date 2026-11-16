@@ -9,8 +9,8 @@ Two stages, kept as separate, composable pieces:
 - **ISI-N grouping** (:meth:`BurstDetector._isi_n_groups`) -- the burst detector of Bakkum et al. 2013
   (*Parameters for burst detection*, Front. Comput. Neurosci. ``fncom.2013.00193``). ``ISI_N`` is the
   span of ``N`` consecutive spikes; spikes ``S_i .. S_{i+N-1}`` are one burst when that span is below
-  an auto threshold taken from the valley of the ``log10(ISI_N)`` distribution. Returns spike
-  intervals.
+  an auto threshold taken from the first deep valley of the ``log10(ISI_N)`` distribution. Returns
+  spike intervals.
 - **Rate thresholding** (:meth:`BurstDetector._rate_threshold_groups`) -- within each group's ASDR
   segment, pick peaks and classify them ``"network"`` / ``"mini"`` by height. Minis whose window
   overlaps any network burst's window, starts within ``network_gap_sec`` after one, or ends within
@@ -22,7 +22,7 @@ Methods: ``"isi_n"`` runs the grouping stage alone (one burst per group); ``"isi
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Optional
 
@@ -39,6 +39,11 @@ from mxtreme.phases import Phases
 # Fitting gaussian_kde on every inter-spike interval of a long recording is the dominant detection
 # cost; a large seeded subsample locates the same log10(ISI_N) valley far faster and reproducibly.
 KDE_MAX_SAMPLES = 100_000
+# Minimum void, 1 - valley / sqrt(peak_a * peak_b), for a valley of the log10(ISI_N) density to
+# separate bursting from tonic firing (Pasquale et al. 2010, J. Comput. Neurosci. 29:213).
+ISI_N_MIN_VOID = 0.7
+# Minimum mean firing rate (Hz) for a channel to count as active when ``n="auto"``.
+AUTO_N_MIN_RATE_HZ = 0.1
 
 
 def _rec_label(recording) -> str:
@@ -158,6 +163,8 @@ class BurstDetector:
     def __init__(self, params: Optional[BurstDetectParams] = None, method: str = "isi_rate") -> None:
         self.params = params or BurstDetectParams()
         self.method = method
+        # N actually used for ISI-N; "auto" is resolved per recording in :meth:`detect`.
+        self._n = None if self.params.n == "auto" else int(self.params.n)
         # Method dispatch table -- register additional detection methods here in the future.
         self._methods = {
             "isi_rate": self._detect_isi_rate,
@@ -188,7 +195,10 @@ class BurstDetector:
         print(f"Detecting bursts | {_rec_label(recording)} | method={self.method}")
         print("-" * 60)
 
+        self._n = self._resolve_n(recording)
+
         bursts = handler(recording, phases)
+        bursts.detect_params = replace(self.params, n=self._n)  # log the N actually used
         bursts.detected_at = datetime.now().isoformat(timespec="seconds")
 
         kinds = Counter(b.kind for b in bursts)
@@ -197,6 +207,23 @@ class BurstDetector:
         _log_burst_set(burst_data_dir, recording, bursts)
         print("=" * 60)
         return bursts
+
+    def _resolve_n(self, recording) -> int:
+        """Return the ISI-N window size ``N`` to use for ``recording``.
+
+        An integer ``params.n`` is used as-is. ``"auto"`` sets ``N`` to half the number of active
+        channels (mean firing rate >= 0.1 Hz), following J. Zegers-Delgado et al. 2026. Channels with
+        no spikes at all never appear in ``spike_data``, so they count as silent too.
+        """
+        n = self.params.n
+        if n != "auto":
+            return int(n)
+        n_chan = len(recording.channelmap)
+        _, spike_counts = np.unique(recording.spike_data["channel"], return_counts=True)
+        n_active = int(np.sum(spike_counts / recording.rec_t_sec >= AUTO_N_MIN_RATE_HZ))
+        n_auto = max(n_active // 2, 2)  # the ISI-N span needs at least 2 spikes
+        print(f"Auto N = {n_auto} ({n_active}/{n_chan} channels >= {AUTO_N_MIN_RATE_HZ} Hz)")
+        return n_auto
 
     # ------------------------------------------------------------------ methods
 
@@ -232,7 +259,7 @@ class BurstDetector:
     def _detect_isi_rate(self, recording, phases: Phases) -> BurstSet:
         """ISI-N grouping followed by rate-threshold peak picking within each group."""
         samp_rate = float(recording.samp_rate)
-        bin_size = float(recording.bin_size)
+        bin_size = float(recording.bin_size)        
 
         groups = self._isi_n_groups(recording.spike_data["frameno"], samp_rate, bin_size)
         bursts = self._rate_threshold_groups(recording.asdr, groups, phases, samp_rate, bin_size)
@@ -247,7 +274,7 @@ class BurstDetector:
         :returns: ``(start_frame, stop_frame, n_spikes)`` per burst, boundaries at the first/last
             spike of the group (per the paper).
         """
-        N = self.params.n
+        N = self._n
         if len(spike_frames) <= N:
             print("Too few spikes in recording to compute ISI-N.")
             return []
@@ -275,10 +302,14 @@ class BurstDetector:
         """Auto ISI-N threshold (in frames) from the valley of the ``log10(ISI_N)`` distribution.
 
         ``ISI_N`` is the span of ``N`` consecutive spikes: ``T[i+(N-1)] - T[i]`` (Bakkum et al. 2013).
-        The distribution is bimodal (bursting = low, tonic = high); the threshold is the valley between
-        the first two modes.
+        The distribution is bimodal (bursting = low, tonic = high); the threshold is the first *deep*
+        valley between two modes. Depth matters because the bursting mode can itself split into
+        sub-modes (seen when nearly all spikes fall inside bursts): the shallow dip between them would
+        otherwise be taken as the threshold, at under a millisecond, and shred every burst into
+        fragments too short to hold a rate peak. A valley is deep when its void reaches
+        :data:`ISI_N_MIN_VOID`. If none does, the deepest valley is used and a warning is printed.
         """
-        N = self.params.n
+        N = self._n
         isi_n = (spike_frames[N - 1:] - spike_frames[:-(N - 1)]) / samp_rate  # span of N spikes
         isi_n = isi_n[isi_n > 0]
         if len(isi_n) < 2:
@@ -297,11 +328,31 @@ class BurstDetector:
         if len(peaks) < 2:
             return None
 
-        #p1, p2 = peaks[:2]  # valley between the first two modes ("first minima", per the paper)
         # Alternative -- valley between the two *most prominent* modes (uncomment to A/B test):
-        top2 = peaks[np.argsort(ys[peaks])[-2:]]; p1, p2 = sorted(top2)
-        valley = np.argmin(ys[p1:p2]) + p1
-        return float(10 ** xs[valley] * samp_rate)
+        # top2 = peaks[np.argsort(ys[peaks])[-2:]]; p1, p2 = sorted(top2)
+        # valley = np.argmin(ys[p1:p2]) + p1; return float(10 ** xs[valley] * samp_rate)
+
+        #p1, p2 = peaks[:2]  # valley between the first two modes ("first minima", per the paper)
+        # Score the valley between every pair of modes by its void, 1 - valley / sqrt(peak_a * peak_b)
+        # (Pasquale et al. 2010): ~1 for a valley that empties out, ~0 for a ripple. Pairs are visited
+        # earliest-first, so two clean modes still give the paper's "first minimum".
+        best_void, best_valley = -np.inf, None
+        for a in range(len(peaks) - 1):
+            for b in range(a + 1, len(peaks)):
+                pa, pb = peaks[a], peaks[b]
+                valley = int(np.argmin(ys[pa:pb])) + pa
+                void = 1.0 - ys[valley] / np.sqrt(ys[pa] * ys[pb])
+                if void >= ISI_N_MIN_VOID:
+                    return float(10 ** xs[valley] * samp_rate)
+                if void > best_void:
+                    best_void, best_valley = void, valley
+
+        # No valley is deep enough: keep the deepest one rather than dropping the recording, but say so.
+        print(
+            f"Warning: no ISI-N valley reaches void >= {ISI_N_MIN_VOID} (deepest {best_void:.2f}); "
+            f"using it anyway, threshold {10 ** xs[best_valley] * 1000:.2f} ms. Check the detected bursts."
+        )
+        return float(10 ** xs[best_valley] * samp_rate)
 
     def _rate_threshold_groups(self, asdr, groups, phases, samp_rate, bin_size) -> list[Burst]:
         """Pick and classify rate peaks within each ISI-N group.
