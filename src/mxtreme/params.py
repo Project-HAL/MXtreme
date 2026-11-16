@@ -11,6 +11,7 @@ Defaults mirror the historical ``constants.py`` values, so behaviour is unchange
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Union
 
 
 @dataclass(frozen=True)
@@ -24,7 +25,9 @@ class BurstDetectParams:
     priority, so mini and network burst periods never overlap), starts within ``network_gap_sec``
     after a network burst's window ends, or ends within ``network_lead_sec`` before one begins.
 
-    :param n: Number of spikes ``N`` in the ISI-N window (minimum spikes comprising a burst).
+    :param n: Number of spikes ``N`` in the ISI-N window (minimum spikes comprising a burst), or
+        ``"auto"`` to set it per recording to half the number of active channels (mean firing rate
+        >= 0.1 Hz; J. Zegers-Delgado et al. 2026).
     :param noise_thresh: Lower rate bound (fraction of channels active) below which peaks are ignored.
     :param burst_thresh: Rate (fraction of channels active) separating ``mini`` from ``network`` peaks.
     :param min_dist_bins: Minimum separation between detected peaks, in bins.
@@ -34,12 +37,16 @@ class BurstDetectParams:
         seconds. Discards pre-burst run-up activity; ``0`` only forbids overlap.
     """
 
-    n: int = 300
+    n: Union[int, str] = 300
     noise_thresh: float = 0.05
     burst_thresh: float = 0.15
     min_dist_bins: int = 30
     network_gap_sec: float = 0.2
     network_lead_sec: float = 0.1
+
+    def __post_init__(self) -> None:
+        if self.n != "auto" and (isinstance(self.n, (str, bool)) or int(self.n) != self.n or self.n < 2):
+            raise ValueError(f"n must be an integer >= 2 or 'auto', got {self.n!r}.")
 
 
 @dataclass(frozen=True)

@@ -24,7 +24,12 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = ["ipykernel>=6", "pytest", "ruff"]
+dev = [
+    "ipykernel>=6",
+    "ipympl>=0.10.0",
+    "pytest",
+    "ruff",
+]
 docs = [
     "furo>=2025.12.19",
     "myst-parser>=5.1.0",

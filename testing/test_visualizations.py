@@ -365,3 +365,176 @@ def test_plot_burst_panels_saves_and_closes(tmp_path):
                                 show_plot=False)
     assert out.exists()
     assert not plt.fignum_exists(fig.number)
+
+
+# --- interactive ASDR explorer --------------------------------------------------------------------
+
+
+class _AsdrRecording(_FakeRecording):
+    """A fake recording that also carries the ASDR the explorer plots (5 s at 10 ms bins)."""
+
+    def __init__(self, n_bins=500):
+        super().__init__(spike_bin=(np.random.default_rng(1).random((32, n_bins)) > 0.9).astype(float))
+        self.asdr = self.spike_bin.mean(axis=0)
+
+
+def _explorer_burst_df(n=4, extracted=True):
+    df = _span_burst_df(n, extracted)
+    df["peak_amp"] = 0.3
+    return df
+
+
+def _explore(*args, **kwargs):
+    """Build an explorer figure quietly: Agg is non-interactive, which explore_asdr warns about."""
+    with pytest.warns(UserWarning, match="non-interactive"):
+        fig = viz.explore_asdr(*args, show=False, **kwargs)
+    return fig, fig._asdr_explorer
+
+
+def _line_xs(collection):
+    return sorted(float(seg[0][0]) for seg in collection.get_segments())
+
+
+def test_explore_asdr_plots_one_series_in_seconds():
+    rec = _AsdrRecording()
+    fig, ex = _explore(rec)
+    assert len(ex.axes) == 1
+    assert ex.axes[0].get_xlim() == (0.0, 5.0)  # 500 bins of 10 ms, in seconds
+    assert ex.axes[0].get_xlabel() == "Time (s)"
+    assert ex.artists == [{}]                   # no burst frame, no annotations
+    plt.close(fig)
+
+
+def test_explore_asdr_marks_peaks_onsets_and_offsets():
+    rec, df = _AsdrRecording(), _explorer_burst_df()
+    fig, ex = _explore(rec, df)
+    artists = ex.artists[0]
+    np.testing.assert_allclose(artists["peaks_network"].get_xdata(), df["peak_frame"] / rec.samp_rate)
+    np.testing.assert_allclose(artists["peaks_network"].get_ydata(), 0.32)
+    assert _line_xs(artists["onset"]) == pytest.approx(sorted(df["onset_frame"] / rec.samp_rate))
+    assert _line_xs(artists["offset"]) == pytest.approx(sorted(df["offset_frame"] / rec.samp_rate))
+    assert "onset_fallback" not in artists
+    plt.close(fig)
+
+
+def test_explore_asdr_span_isi_n_uses_group_bounds():
+    rec, df = _AsdrRecording(), _explorer_burst_df()
+    fig, ex = _explore(rec, df, span="isi_n")
+    assert _line_xs(ex.artists[0]["onset"]) == pytest.approx(sorted(df["group_start_frame"] / rec.samp_rate))
+    assert _line_xs(ex.artists[0]["offset"]) == pytest.approx(sorted(df["group_stop_frame"] / rec.samp_rate))
+    plt.close(fig)
+
+
+def test_explore_asdr_draws_fallback_bounds_as_a_separate_dashed_artist():
+    rec, df = _AsdrRecording(), _explorer_burst_df()
+    df.loc[0, ["onset_frame", "offset_frame"]] = -1
+    fig, ex = _explore(rec, df)
+    artists = ex.artists[0]
+    assert len(artists["onset"].get_segments()) == 3
+    assert _line_xs(artists["onset_fallback"]) == pytest.approx([df.loc[0, "group_start_frame"] / rec.samp_rate])
+    assert _line_xs(artists["offset_fallback"]) == pytest.approx([df.loc[0, "group_stop_frame"] / rec.samp_rate])
+    assert "ISI-N" in artists["onset_fallback"].get_label()
+    plt.close(fig)
+
+
+def test_explore_asdr_filters_by_kind_and_skips_ignored_bursts():
+    rec, df = _AsdrRecording(), _explorer_burst_df()
+    df.loc[0, "kind"] = "mini"
+    df["ignore"] = [False, True, False, False]
+    fig, ex = _explore(rec, df, kind="network")
+    assert len(ex.artists[0]["peaks_network"].get_xdata()) == 2
+    plt.close(fig)
+
+    fig, ex = _explore(rec, df, show_peaks=False, show_spans=False)
+    assert ex.artists == [{}]
+    plt.close(fig)
+
+
+def test_explore_asdr_links_two_series_and_spans_the_longer_one():
+    short, long = _AsdrRecording(300), _AsdrRecording(500)
+    fig, ex = _explore(short, _explorer_burst_df(2), compare=long, compare_bursts=_explorer_burst_df(4),
+                       labels=("before", "after"))
+    top, bottom = ex.axes
+    assert [ax.get_title(loc="left") for ax in ex.axes] == ["before", "after"]
+    assert top.get_xlim() == bottom.get_xlim() == (0.0, 5.0)
+    assert len(ex.artists[1]["peaks_network"].get_xdata()) == 4
+
+    bottom.set_xlim(1.0, 2.0)  # what a toolbar zoom on the lower plot does
+    bottom.set_ylim(0.0, 0.1)
+    assert top.get_xlim() == (1.0, 2.0)
+    assert top.get_ylim() == (0.0, 0.1)
+    plt.close(fig)
+
+
+def test_explore_asdr_zoom_pan_and_reset():
+    fig, ex = _explore(_AsdrRecording(), zoom=(1.0, 3.0))
+    ax = ex.axes[0]
+    assert ax.get_xlim() == pytest.approx((1.0, 3.0))
+
+    ex.zoom_x(0.5, center=1.5)  # the point under the cursor stays put
+    assert ax.get_xlim() == pytest.approx((1.25, 2.25))
+    ex.pan_x(0.25)
+    assert ax.get_xlim() == pytest.approx((1.5, 2.5))
+    ex.pan_x(100)               # panning stops at the end of the recording, keeping the width
+    assert ax.get_xlim() == pytest.approx((4.0, 5.0))
+    ex.zoom_x(1000)             # zooming out stops at the whole recording
+    assert ax.get_xlim() == pytest.approx((0.0, 5.0))
+    ex.zoom_x(1e-9)             # zooming in stops at a few bins
+    lo, hi = ax.get_xlim()
+    assert hi - lo == pytest.approx(0.05)
+
+    ax.set_ylim(0.0, 0.01)
+    ex.reset()
+    assert ax.get_xlim() == (0.0, 5.0)
+    assert ax.get_ylim() == ex.y_full[0]
+    plt.close(fig)
+
+
+def test_explore_asdr_responds_to_scroll_keys_and_double_click():
+    from matplotlib.backend_bases import KeyEvent, MouseEvent
+
+    fig, ex = _explore(_AsdrRecording())
+    ax, canvas = ex.axes[0], fig.canvas
+    canvas.draw()
+    x, y = ax.transData.transform((2.5, 0.05))
+
+    canvas.callbacks.process("scroll_event", MouseEvent("scroll_event", canvas, x, y, button="up", step=1))
+    assert ax.get_xlim() == pytest.approx((0.5, 4.5))
+    canvas.callbacks.process("key_press_event", KeyEvent("key_press_event", canvas, "left", x, y))
+    assert ax.get_xlim() == pytest.approx((0.0, 4.0))
+    canvas.callbacks.process("key_press_event", KeyEvent("key_press_event", canvas, "up", x, y))
+    assert ax.get_xlim() == pytest.approx((1.0, 3.0))
+    canvas.callbacks.process("button_press_event",
+                             MouseEvent("button_press_event", canvas, x, y, button=1, dblclick=True))
+    assert ax.get_xlim() == (0.0, 5.0)
+    plt.close(fig)
+
+
+def test_explore_asdr_rejects_mismatched_arguments():
+    rec = _AsdrRecording()
+    with pytest.raises(ValueError, match="compare_bursts"):
+        viz.explore_asdr(rec, compare_bursts=_explorer_burst_df(), show=False)
+    with pytest.raises(ValueError, match="labels"):
+        viz.explore_asdr(rec, labels=("a", "b"), show=False)
+    with pytest.raises(ValueError, match="extract_features"):
+        viz.explore_asdr(rec, _explorer_burst_df(extracted=False), show=False)
+    plt.close("all")
+
+
+def test_explore_asdr_colours_peaks_by_burst_kind():
+    rec, df = _AsdrRecording(), _explorer_burst_df()
+    df.loc[[0, 1, 2], "kind"] = "mini"
+    fig, ex = _explore(rec, df)
+    network, mini = ex.artists[0]["peaks_network"], ex.artists[0]["peaks_mini"]
+    assert (len(network.get_xdata()), len(mini.get_xdata())) == (1, 3)
+    assert network.get_color() != mini.get_color()
+    labels = [text.get_text() for text in ex.axes[0].get_legend().get_texts()]
+    assert labels[:2] == ["network peak", "mini peak"]
+    plt.close(fig)
+
+
+def test_explore_asdr_closes_its_figure_when_building_fails():
+    before = plt.get_fignums()
+    with pytest.raises(ValueError, match="extract_features"):
+        viz.explore_asdr(_AsdrRecording(), _explorer_burst_df(extracted=False), show=False)
+    assert plt.get_fignums() == before

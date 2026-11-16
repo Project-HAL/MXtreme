@@ -16,6 +16,9 @@ Burst overlays (consume a burst DataFrame from :meth:`BurstSet.to_dataframe
 - :func:`plot_origin_heatmap` -- burst-origin density over the MEA (``method="hist"``/``"kde"``).
 - :func:`plot_burst_vectors` -- origin->peak arrows over the MEA.
 
+Interactive:
+- :func:`explore_asdr` -- scroll/zoom through a whole recording's ASDR, bursts marked; can link two.
+
 Each accepts an optional ``ax`` so panels can be composed (e.g. a shared-x ASDR-over-raster figure); when
 ``ax`` is ``None`` the function makes its own figure and shows it.
 """
@@ -680,3 +683,275 @@ def plot_burst_panels(rec, burst_df, *, n=None, burst_ids=None, span="isi_n", pa
             title += f"\n{fell_back.sum()} of {len(panels)} use ISI-N bounds (no features)"
     fig.suptitle(title, fontsize=11, fontweight="bold")
     return finish_figure(fig, save_path=save_path, show_plot=show_plot, dpi=dpi)
+
+
+# --- interactive explorer -----------------------------------------------------------------------
+
+_PEAK_COLORS = {"network": "red", "mini": "#E69F00"}  # any other kind is drawn red
+_ONSET_COLOR = "#009E73"
+_OFFSET_COLOR = "#CC79A7"
+
+
+class _AsdrExplorer:
+    """Navigation state of an :func:`explore_asdr` figure.
+
+    Lives on the figure as ``fig._asdr_explorer`` so the button and callbacks outlive the call that
+    made them (matplotlib only holds weak references to both). Its methods are the whole of the
+    navigation logic, so they can be driven directly, without a GUI event loop.
+    """
+
+    def __init__(self, fig, axes, x_full, y_full, min_width):
+        self.fig = fig
+        self.axes = list(axes)
+        self.x_full = x_full        # (start, end) seconds of the longest series
+        self.y_full = list(y_full)  # one (bottom, top) per axis
+        self.min_width = min_width  # never zoom in past a handful of bins
+        self.artists = []           # one dict of annotation artists per axis
+        self.button = None
+        self.cids = []
+
+    def _set_xlim(self, lo, hi):
+        """Apply a view of the requested width, slid back inside the recording if it overhangs."""
+        full_lo, full_hi = self.x_full
+        width = min(max(hi - lo, self.min_width), full_hi - full_lo)
+        lo = min(max(lo, full_lo), full_hi - width)
+        self.axes[0].set_xlim(lo, lo + width)  # the axes share x, so one call moves them all
+        self.fig.canvas.draw_idle()
+
+    def zoom_x(self, factor, center=None):
+        """Scale the visible time span by ``factor`` (<1 zooms in), keeping ``center`` where it is."""
+        lo, hi = self.axes[0].get_xlim()
+        center = (lo + hi) / 2 if center is None else center
+        self._set_xlim(center - (center - lo) * factor, center + (hi - center) * factor)
+
+    def pan_x(self, fraction):
+        """Shift the view by ``fraction`` of its width (negative is earlier)."""
+        lo, hi = self.axes[0].get_xlim()
+        shift = (hi - lo) * fraction
+        self._set_xlim(lo + shift, hi + shift)
+
+    def reset(self, _event=None):
+        """Back to the whole recording, at the original y limits."""
+        for ax, ylim in zip(self.axes, self.y_full):
+            ax.set_ylim(ylim)
+        self.axes[0].set_xlim(self.x_full)
+        self.fig.canvas.draw_idle()
+
+    # -- event handlers --
+
+    def on_scroll(self, event):
+        if event.inaxes in self.axes and event.xdata is not None:
+            self.zoom_x(0.8 if event.button == "up" else 1.25, center=event.xdata)
+
+    def on_press(self, event):
+        if event.dblclick and event.inaxes in self.axes:
+            self.reset()
+
+    def on_key(self, event):
+        actions = {"left": lambda: self.pan_x(-0.25), "right": lambda: self.pan_x(0.25),
+                   "up": lambda: self.zoom_x(0.5), "down": lambda: self.zoom_x(2.0),
+                   "r": self.reset, "home": self.reset}
+        if event.key in actions:
+            actions[event.key]()
+        else:
+            # Everything else (s to save, q to close, o/p for the toolbar tools...) keeps working.
+            from matplotlib.backend_bases import key_press_handler
+
+            key_press_handler(event, self.fig.canvas, self.fig.canvas.toolbar)
+
+
+def _is_interactive_canvas(canvas) -> bool:
+    """Whether ``canvas`` can respond to the mouse: a GUI window or a notebook widget."""
+    if getattr(canvas, "required_interactive_framework", None):
+        return True
+    backend = plt.get_backend().lower()
+    return any(name in backend for name in ("ipympl", "widget", "nbagg", "webagg"))
+
+
+def _draw_explorer_bursts(ax, recording, burst_df, *, span, kind, show_peaks, show_spans):
+    """Mark the bursts of ``burst_df`` on ``ax`` (x in seconds); returns the artists by name.
+
+    One artist per annotation type rather than one per burst: a recording has hundreds of bursts, and
+    hundreds of separate artists make every pan and zoom redraw sluggish.
+    """
+    artists = {}
+    df = _select(burst_df, kind, None)
+    if "ignore" in df.columns:
+        df = df[~df["ignore"].fillna(False).astype(bool)]
+    if not len(df):
+        return artists
+
+    if show_peaks:
+        # One marker colour per burst kind, so network and mini bursts can be told apart at a glance.
+        kinds = df["kind"].to_numpy() if "kind" in df.columns else np.full(len(df), "burst")
+        for burst_kind in sorted(set(kinds), key=lambda k: (k != "network", str(k))):
+            rows = df[kinds == burst_kind]
+            artists[f"peaks_{burst_kind}"], = ax.plot(
+                rows["peak_frame"].to_numpy() / recording.samp_rate,
+                rows["peak_amp"].to_numpy() + 0.02, linestyle="none", marker="v", markersize=5,
+                color=_PEAK_COLORS.get(burst_kind, "red"), label=f"{burst_kind} peak")
+    if show_spans:
+        start_frames, stop_frames, fell_back = _burst_spans_frames(df, span)
+        # Full-height lines: x in data units (seconds), y in axes units, so they survive any y zoom.
+        # Drawn faint and under the trace: at full view there are hundreds of them.
+        across = ax.get_xaxis_transform()
+        for name, frames, color in (("onset", start_frames, _ONSET_COLOR),
+                                    ("offset", stop_frames, _OFFSET_COLOR)):
+            secs = frames / recording.samp_rate
+            if (~fell_back).any():
+                artists[name] = ax.vlines(secs[~fell_back], 0, 1, transform=across, color=color,
+                                          linewidth=0.8, alpha=0.8, zorder=1, label=name)
+            if fell_back.any():
+                # Not the boundaries that were asked for (see _burst_spans_frames): dashed, and
+                # named in the legend, so they are never read as a feature-computed onset/offset.
+                artists[f"{name}_fallback"] = ax.vlines(
+                    secs[fell_back], 0, 1, transform=across, color=color, linewidth=0.8, alpha=0.8,
+                    zorder=1, linestyle="--", label=f"{name} (ISI-N bounds, no features)")
+    return artists
+
+
+def explore_asdr(recording, burst_df=None, *, compare=None, compare_bursts=None, span="features",
+                 kind=None, show_peaks=True, show_spans=True, labels=None, zoom=None, sharey=True,
+                 show=True):
+    """Interactive ASDR viewer: scroll and zoom through a whole recording, with bursts marked.
+
+    An hour-long recording is ~360,000 ASDR bins, far too many to read at once and tedious to page
+    through with static ``zoom=`` plots. This opens one figure you can navigate instead:
+
+    ===========================  =====================================================
+    scroll wheel                 zoom in / out in time, about the cursor
+    left / right arrows          pan by a quarter of the view
+    up / down arrows             zoom in / out about the centre of the view
+    ``r``, double-click, button  reset to the whole recording
+    toolbar zoom / pan / home    matplotlib's own tools, as usual
+    ===========================  =====================================================
+
+    Pass ``compare`` to stack a second time series underneath -- another version of the same
+    recording, or a different one. The two axes are linked: any zoom or pan of one moves the other
+    to exactly the same window.
+
+    The figure needs an interactive matplotlib backend. In a notebook run ``%matplotlib osx`` (a
+    separate window) or ``%matplotlib widget`` (in the cell; needs ``ipympl``) *before* calling this;
+    under the default inline backend you get a static image and a warning. ::
+
+        %matplotlib osx
+        viz.explore_asdr(rec, burst_df)                                   # one recording
+        viz.explore_asdr(rec_a, bursts_a, compare=rec_b, compare_bursts=bursts_b)
+
+    :param recording: The :class:`~mxtreme.recording.Recording` (for ``asdr``, ``samp_rate``,
+        ``bin_size``).
+    :param burst_df: Optional burst DataFrame from :meth:`BurstSet.to_dataframe
+        <mxtreme.bursting.detection.BurstSet.to_dataframe>` to annotate ``recording`` with. Bursts
+        flagged ``ignore`` are not drawn.
+    :param compare: Optional second recording, drawn on a linked axes below the first.
+    :param compare_bursts: Optional burst DataFrame for ``compare``.
+    :param span: Which burst boundaries the onset/offset lines show -- ``"features"`` for the
+        extracted onset/offset, or ``"isi_n"`` for the ISI-N group bounds. Under ``"features"``, a
+        burst with no extracted onset/offset falls back to its ISI-N bounds, drawn **dashed** (see
+        :func:`_burst_spans_frames`).
+    :param kind: Burst kind to mark (``"network"``, ``"mini"``), or ``None`` (the default) for all.
+    :param show_peaks: Mark each burst peak with a triangle, coloured by burst kind: red for network
+        bursts, orange for minis.
+    :param show_spans: Draw a vertical line at each burst onset (green) and offset (pink).
+    :param labels: Title for each axes -- a string, or a pair when ``compare`` is given. Defaults to
+        each recording's identity.
+    :param zoom: Optional ``(start_sec, end_sec)`` window to open on; reset still returns to the
+        whole recording.
+    :param sharey: Link the y axes of the two series as well as the x axes.
+    :param show: Call ``plt.show()``.
+    :returns: The matplotlib Figure. Navigation state is on ``fig._asdr_explorer``.
+    """
+    import warnings
+
+    from matplotlib.widgets import Button
+
+    series = [(recording, burst_df)]
+    if compare is not None:
+        series.append((compare, compare_bursts))
+    elif compare_bursts is not None:
+        raise ValueError("compare_bursts was given without a compare recording.")
+    if labels is None:
+        labels = [_recording_label(rec) for rec, _ in series]
+    elif isinstance(labels, str):
+        labels = [labels]
+    if len(labels) != len(series):
+        raise ValueError(f"Got {len(labels)} labels for {len(series)} time series.")
+
+    fig, axes = plt.subplots(len(series), 1, figsize=(13, 2.2 + 2.4 * len(series)), sharex=True,
+                             sharey=sharey, squeeze=False, layout="constrained")
+    axes = list(axes[:, 0])
+
+    try:
+        durations, tops, all_artists = [], [], []
+        for ax, (rec, bursts), label in zip(axes, series, labels):
+            asdr = np.asarray(rec.asdr)
+            ax.plot(np.arange(len(asdr)) * rec.bin_size, asdr, color="C0", linewidth=0.8)
+            artists = {}
+            if bursts is not None:
+                artists = _draw_explorer_bursts(ax, rec, bursts, span=span, kind=kind,
+                                                show_peaks=show_peaks, show_spans=show_spans)
+            all_artists.append(artists)
+            top = float(asdr.max()) if len(asdr) else 0.0
+            for name, artist in artists.items():
+                if name.startswith("peaks_"):
+                    top = max(top, float(np.max(artist.get_ydata())))
+            tops.append(top)
+            durations.append(len(asdr) * rec.bin_size)
+
+            ax.set_title(label, fontsize=10, loc="left")
+            ax.set_ylabel("ASDR", fontsize=10)
+            ax.spines[["top", "right"]].set_visible(False)
+            if artists:
+                ax.legend(loc="upper right", fontsize=8, ncols=len(artists), framealpha=0.9)
+        axes[-1].set_xlabel("Time (s)", fontsize=10)
+
+        if sharey:
+            tops = [max(tops)] * len(tops)
+        y_full = [(0.0, top * 1.1 if top > 0 else 1.0) for top in tops]
+        x_full = (0.0, max(durations))
+        min_width = 5 * min(rec.bin_size for rec, _ in series)
+        explorer = _AsdrExplorer(fig, axes, x_full, y_full, min_width)
+        explorer.artists = all_artists
+        explorer.reset()
+
+        canvas = fig.canvas
+        # Keep a strip along the top free of the plots for the button, clear of titles and legends.
+        strip = 0.45 / fig.get_figheight()
+        fig.get_layout_engine().set(rect=(0, 0, 1, 1 - strip))
+        button_ax = fig.add_axes([0.895, 1 - 0.85 * strip, 0.095, 0.7 * strip])
+        button_ax.set_in_layout(False)
+        explorer.button = Button(button_ax, "Reset view")
+        explorer.button.label.set_fontsize(9)
+        explorer.button.on_clicked(explorer.reset)
+
+        # Record the whole recording as the toolbar's "home" before any zoom is applied; otherwise home
+        # would be whatever window happened to be showing at the first toolbar click. This has to come
+        # after the last axes is added: adding an axes clears the toolbar's view history.
+        if canvas.toolbar is not None:
+            canvas.toolbar.push_current()
+        if zoom is not None:
+            explorer._set_xlim(*zoom)
+
+        # matplotlib binds the arrow keys to the toolbar's back/forward; take over key handling for this
+        # figure so they pan instead (on_key hands every other key back to the default handler).
+        default_cid = getattr(canvas.manager, "key_press_handler_id", None)
+        if default_cid is not None:
+            canvas.mpl_disconnect(default_cid)
+        explorer.cids = [canvas.mpl_connect("scroll_event", explorer.on_scroll),
+                         canvas.mpl_connect("button_press_event", explorer.on_press),
+                         canvas.mpl_connect("key_press_event", explorer.on_key)]
+        fig._asdr_explorer = explorer
+    except BaseException:
+        # Don't leave a half-built window behind (with an interactive backend it would stay open).
+        plt.close(fig)
+        raise
+
+    if not _is_interactive_canvas(canvas):
+        warnings.warn(
+            f"explore_asdr is drawing on the non-interactive matplotlib backend {plt.get_backend()!r}, "
+            "so the figure is a static image. Run `%matplotlib osx` (separate window) or "
+            "`%matplotlib widget` (in the notebook; needs ipympl) first, then call it again.",
+            stacklevel=2)
+    if show:
+        plt.show()
+    return fig
