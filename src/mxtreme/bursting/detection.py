@@ -332,6 +332,7 @@ class BurstDetector:
         # top2 = peaks[np.argsort(ys[peaks])[-2:]]; p1, p2 = sorted(top2)
         # valley = np.argmin(ys[p1:p2]) + p1; return float(10 ** xs[valley] * samp_rate)
 
+        #p1, p2 = peaks[:2]  # valley between the first two modes ("first minima", per the paper)
         # Score the valley between every pair of modes by its void, 1 - valley / sqrt(peak_a * peak_b)
         # (Pasquale et al. 2010): ~1 for a valley that empties out, ~0 for a ripple. Pairs are visited
         # earliest-first, so two clean modes still give the paper's "first minimum".

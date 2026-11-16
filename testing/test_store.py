@@ -1,5 +1,7 @@
 """The recordings tree (``mxtreme.store``): batch ids, layout, splitting, and ingest."""
 
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -62,30 +64,47 @@ def test_batch_constructor_validates_fields():
 
 
 def test_layout_and_parse_are_inverses(tmp_path):
-    """What recording_dir/recording_stem write down, parse_recording_path must read back."""
+    """What recording_dir/recording_stem write down, parse_recording_path must read back --
+    including which wells a file holds, which only its name says."""
     config = Config(data_root=tmp_path)
-    stem = store.recording_stem(BATCH, 260810, "M07460", 4, 21)
-    directory = store.recording_dir(config, BATCH, 260810, "M07460", 4, 21, system="M1")
+    directory = store.recording_dir(config, BATCH, 260810, "M07460", 21, system="M1")
+    assert directory == config.recordings_dir / f"plating_260810_{BATCH}" / "chip_M1_M07460" / "DIV_21"
 
-    for tail, kind, experiment in [
-        ("activity_scan", "activity_scan", ""),
-        ("network_scan", "network_scan", ""),
-        ("network_scan_1", "network_scan", ""),  # MaxLab's collision rename
-        ("stim_trial_3", "experiment", "stim_trial_3"),
-    ]:
-        location = store.parse_recording_path(
-            directory / f"{stem}_{tail}.raw.h5", config.recordings_dir
-        )
-        assert location is not None, tail
-        assert (location.batch.id, location.plate_date) == (BATCH, 260810)
-        assert (location.chip, location.well, location.div) == ("M07460", 4, 21)
-        assert (location.kind, location.experiment) == (kind, experiment)
+    for wells in (4, [0, 1, 3]):
+        stem = store.recording_stem(BATCH, 260810, "M07460", wells, 21)
+        for tail, kind, experiment in [
+            ("activity_scan", "activity_scan", ""),
+            ("network_scan", "network_scan", ""),
+            ("network_scan_1", "network_scan", ""),  # MaxLab's collision rename
+            ("stim_trial_3", "experiment", "stim_trial_3"),
+        ]:
+            location = store.parse_recording_path(
+                directory / f"{stem}_{tail}.raw.h5", config.recordings_dir
+            )
+            assert location is not None, tail
+            assert (location.batch.id, location.plate_date) == (BATCH, 260810)
+            assert (location.chip, location.div) == ("M07460", 21)
+            assert location.wells == ((4,) if wells == 4 else (0, 1, 3))
+            assert (location.kind, location.experiment) == (kind, experiment)
+
+
+def test_well_token_round_trips():
+    assert store.well_token(0) == "0" and store.well_token([3, 0, 1, 1]) == "0-1-3"
+    assert store.parse_well_token("0-1-3") == (0, 1, 3) and store.parse_well_token("5") == (5,)
+    assert "well_0-1-2-3-4-5_DIV_9" in store.recording_stem(BATCH, 260810, "M07460", range(6), 9)
 
 
 def test_parse_rejects_paths_outside_the_layout(tmp_path):
     config = Config(data_root=tmp_path)
-    bad = config.recordings_dir / "misc" / "chip_M1_C1" / "well_0" / "DIV_1" / "x.raw.h5"
-    assert store.parse_recording_path(bad, config.recordings_dir) is None
+    stem = store.recording_stem(BATCH, 260810, "M07460", 0, 1)
+    chip_dir = config.recordings_dir / f"plating_260810_{BATCH}" / "chip_M1_M07460"
+    for bad in [
+        config.recordings_dir / "misc" / "chip_M1_C1" / "DIV_1" / f"{stem}_activity_scan.raw.h5",
+        chip_dir / "well_0" / "DIV_1" / f"{stem}_activity_scan.raw.h5",  # the pre-2026-10-28 layout
+        chip_dir / "DIV_1" / "x.raw.h5",  # no well token: which cultures would it be?
+        chip_dir / "DIV_1" / f"{stem}.raw.h5",  # an experiment with no name tail
+    ]:
+        assert store.parse_recording_path(bad, config.recordings_dir) is None, bad
 
 
 def test_plate_date_is_validated():
@@ -158,52 +177,76 @@ def _multiwell_h5(path, wells=(0, 3), conditions=("ctrl", "drug")):
     return path
 
 
-def test_split_by_well_gives_each_culture_its_own_file(tmp_path):
+def _pieces_of(directory, wells=(0, 3), conditions=("ctrl", "drug"), start=1790280409935, tail="activity_scan"):
+    """Per-well files the way the store's old split left them: each holds one well's
+    ``/wells/wellNNN/recMMMM`` and the ``/recordings`` mirror of it, the shared ``/assay`` and
+    root attributes, and the metadata blob narrowed to that well. The recordings' start stamps
+    differ by a millisecond or two between wells, as in real MaxLab files."""
     import h5py
 
-    src = _multiwell_h5(tmp_path / "combined.raw.h5")
-    written = store.split_by_well(
-        src, lambda w: tmp_path / f"well_{w}.raw.h5", on_progress=lambda _: None
-    )
+    paths = []
+    for index, well in enumerate(wells):
+        path = Path(directory) / f"plating_250512_{BATCH}_chip_C1_well_{well}_DIV_7_{tail}.raw.h5"
+        blob = str({
+            "Batch ID": BATCH, "Chip ID": "C1", "Plate date": 250512, "DIV": 7,
+            "Well IDs": [well], "Conditions": [conditions[index]] if conditions[index] else [],
+        })
+        with h5py.File(path, "w") as f:
+            f.create_dataset("wellplate/version", data=np.array([b"MaxTwo 6 multi-well MEA"]))
+            f.attrs["version"] = "20190530"
+            f.create_dataset("/assay/metadata", data=np.array([blob.encode("utf-8")]))
+            f.create_dataset("/assay/inputs/record_time", data=np.array([60]))
+            for rec in range(2):
+                g = f.create_group(f"/wells/well{well:03d}/rec{rec:04d}")
+                g.create_dataset("spikes", data=np.arange(well + 2) + 10 * rec)
+                g.create_dataset("settings/sampling", data=np.array([20000.0]))
+                g.create_dataset("start_time", data=np.array([start + index + 130_000 * rec]))
+                g.create_dataset("stop_time", data=np.array([start + 60_000 + 130_000 * rec]))
+                f[f"/recordings/rec{rec:04d}/well{well:03d}"] = g
+        paths.append(path)
+    return paths
 
-    assert sorted(written) == [0, 3]
-    for well, path in written.items():
-        with h5py.File(path, "r") as f:
-            # Only this well's data came along, under both of MaxWell's views.
-            assert list(f["wells"]) == [f"well{well:03d}"]
-            assert list(f["recordings/rec0000"]) == [f"well{well:03d}"]
-            np.testing.assert_array_equal(
-                f[f"wells/well{well:03d}/rec0000/spikes"][:], np.arange(well + 2)
-            )
-            # Shared pieces are copied: root attrs and the whole /assay group.
-            assert f.attrs["version"] == "20190530"
-            assert int(f["assay/inputs/record_time"][0]) == 60
-            # The metadata blob is narrowed to the one well, keeping its own condition.
-            blob = eval(f["assay/metadata"][:][0].decode())
-            assert blob["Well IDs"] == [well]
-            assert blob["Conditions"] == ["ctrl" if well == 0 else "drug"]
-    assert src.exists()  # delete_original defaults to False
+
+def test_stitch_wells_puts_a_split_recording_back_together(tmp_path):
+    import h5py
+
+    pieces = _pieces_of(tmp_path, wells=(0, 3, 5), conditions=("ctrl", "drug", None))
+    dest = tmp_path / "out" / "combined.raw.h5"
+
+    assert store.stitch_wells(reversed(pieces), dest, on_progress=lambda _: None) == dest
+
+    with h5py.File(dest, "r") as f:
+        assert list(f["wells"]) == ["well000", "well003", "well005"]
+        for rec in ("rec0000", "rec0001"):
+            assert list(f[f"recordings/{rec}"]) == ["well000", "well003", "well005"]
+        for well in (0, 3, 5):
+            np.testing.assert_array_equal(f[f"wells/well{well:03d}/rec0000/spikes"][:], np.arange(well + 2))
+            np.testing.assert_array_equal(f[f"recordings/rec0001/well{well:03d}/spikes"][:], np.arange(well + 2) + 10)
+            assert f[f"recordings/rec0000/well{well:03d}"] == f[f"wells/well{well:03d}/rec0000"]  # one copy of the data
+        assert f.attrs["version"] == "20190530"
+        assert int(f["assay/inputs/record_time"][0]) == 60
+        blob = eval(f["assay/metadata"][:][0].decode())
+    assert blob["Well IDs"] == [0, 3, 5] and blob["Conditions"] == ["ctrl", "drug", None]
+    assert blob["Chip ID"] == "C1" and blob["DIV"] == 7
+    assert store.wells_in_file(dest) == [0, 3, 5]
+    assert all(p.exists() for p in pieces)  # the pieces are the caller's to dispose of
 
 
-def test_split_by_well_removes_the_original_only_on_success(tmp_path):
-    src = _multiwell_h5(tmp_path / "combined.raw.h5")
+def test_stitch_wells_refuses_duplicates_and_overwrites(tmp_path):
+    pieces = _pieces_of(tmp_path / "a") if (tmp_path / "a").mkdir() is None else None
+    twin = _pieces_of(tmp_path / "b", wells=(3,), conditions=("x",)) if (tmp_path / "b").mkdir() is None else None
+    dest = tmp_path / "combined.raw.h5"
 
-    # A destination that already exists fails the split -- and the original must survive.
-    (tmp_path / "well_3.raw.h5").touch()
+    with pytest.raises(ValueError, match="more than one"):
+        store.stitch_wells(pieces + twin, dest, on_progress=lambda _: None)
+    assert not dest.exists()  # a half-written output must not pass for the recording
+    with pytest.raises(ValueError, match="at least one"):
+        store.stitch_wells([], dest, on_progress=lambda _: None)
+
+    store.stitch_wells(pieces, dest, on_progress=lambda _: None)
     with pytest.raises(FileExistsError):
-        store.split_by_well(
-            src, lambda w: tmp_path / f"well_{w}.raw.h5",
-            on_progress=lambda _: None, delete_original=True,
-        )
-    assert src.exists()
-
-    (tmp_path / "well_3.raw.h5").unlink()
-    (tmp_path / "well_0.raw.h5").unlink()
-    store.split_by_well(
-        src, lambda w: tmp_path / f"well_{w}.raw.h5",
-        on_progress=lambda _: None, delete_original=True,
-    )
-    assert not src.exists()
+        store.stitch_wells(pieces, dest, on_progress=lambda _: None)
+    assert store.wells_in_file(dest) == [0, 3]
 
 
 # --- ingest ---------------------------------------------------------------------------------------
@@ -228,11 +271,11 @@ def test_ingest_files_the_chip_by_the_system_the_file_says(tmp_path):
     kwargs = dict(batch=BATCH, plate_date=260810, chip="M07460", div=21, experiment="t", on_progress=lambda _: None)
 
     [dest] = store.ingest_recording(_single_well_h5(tmp_path / "two.raw.h5", plate="MaxTwo 6 multi-well MEA"), config, **kwargs).values()
-    assert dest.parent.parent.parent.name == "chip_M2_M07460"
+    assert dest.parent.parent.name == "chip_M2_M07460"
     assert store.parse_recording_path(dest, config.recordings_dir).system == "M2"
-    assert store.find_chip_dir(config, BATCH, 260810, "M07460") == dest.parent.parent.parent
+    assert store.find_chip_dir(config, BATCH, 260810, "M07460") == dest.parent.parent
     [plating] = store.list_platings(config)
-    assert plating.system_of("M07460") == "M2" and plating.chip_dir("M07460") == dest.parent.parent.parent
+    assert plating.system_of("M07460") == "M2" and plating.chip_dir("M07460") == dest.parent.parent
 
     mute = _single_well_h5(tmp_path / "mute.raw.h5", plate=None)
     with pytest.raises(ValueError, match="MaxOne or a MaxTwo"):
@@ -255,7 +298,7 @@ def test_ingest_places_names_and_registers_a_single_well_file(tmp_path):
 
     dest = written[0]
     stem = store.recording_stem(BATCH, 260810, "M07460", 0, 21)
-    assert dest == store.recording_dir(config, BATCH, 260810, "M07460", 0, 21, system="M1") / f"{stem}_stim_trial_3.raw.h5"
+    assert dest == store.recording_dir(config, BATCH, 260810, "M07460", 21, system="M1") / f"{stem}_stim_trial_3.raw.h5"
     assert dest.exists() and src.exists()  # copied, not moved, by default
 
     row = pd.read_csv(config.registry_path).iloc[0]
@@ -266,7 +309,7 @@ def test_ingest_places_names_and_registers_a_single_well_file(tmp_path):
 
     # And the ingested file resolves back to exactly the identity it went in under.
     location = store.parse_recording_path(dest, config.recordings_dir)
-    assert (location.kind, location.experiment, location.well) == ("experiment", "stim_trial_3", 0)
+    assert (location.kind, location.experiment, location.wells) == ("experiment", "stim_trial_3", (0,))
 
 
 def test_ingest_move_removes_the_source(tmp_path):
@@ -280,7 +323,10 @@ def test_ingest_move_removes_the_source(tmp_path):
     assert written[0].exists() and not src.exists()
 
 
-def test_ingest_splits_a_multiwell_file(tmp_path):
+def test_ingest_keeps_a_multiwell_file_whole(tmp_path):
+    """A MaxTwo recording stays one file, named for the wells it is registered under."""
+    import h5py
+
     config = Config(data_root=tmp_path / "ms")
     src = _multiwell_h5(tmp_path / "export.raw.h5")
 
@@ -290,13 +336,41 @@ def test_ingest_splits_a_multiwell_file(tmp_path):
     )
 
     assert sorted(written) == [0, 3]
-    for well, path in written.items():
-        assert path.parent == store.recording_dir(config, BATCH, 250512, "C1", well, 7, system="M2")
+    [dest] = set(written.values())
+    assert dest == store.recording_dir(config, BATCH, 250512, "C1", 7, system="M2") / (
+        f"{store.recording_stem(BATCH, 250512, 'C1', [0, 3], 7)}_trial.raw.h5"
+    )
+    with h5py.File(dest, "r") as f:
+        assert list(f["wells"]) == ["well000", "well003"]
+    assert store.parse_recording_path(dest, config.recordings_dir).wells == (0, 3)
     df = pd.read_csv(config.registry_path).sort_values("well")
     assert list(df["well"]) == [0, 3]
     assert set(df["kind"]) == {"experiment"}
     assert list(df["conditions"]) == ["ctrl", "drug"]
-    assert src.exists()  # copy semantics: the source survives a split ingest too
+    assert src.exists()  # copy semantics
+    log = [t for t in transactions.read(config) if t.op == "recording.ingested"]
+    assert [t.well for t in log] == [0, 3] and all(t.data["path"] == str(dest) for t in log)
+
+
+def test_ingest_wells_narrows_what_is_registered_not_the_file(tmp_path):
+    """Choosing wells says which cultures the file is for -- they name it and get rows -- while
+    the recording itself is copied exactly as the rig wrote it."""
+    import h5py
+
+    config = Config(data_root=tmp_path / "ms")
+    src = _multiwell_h5(tmp_path / "export.raw.h5")
+
+    written = store.ingest_recording(
+        src, config, batch=BATCH, plate_date=250512, chip="C1", div=7,
+        experiment="trial", wells=[3], on_progress=lambda _: None,
+    )
+
+    assert list(written) == [3]
+    assert written[3].name.endswith("_well_3_DIV_7_trial.raw.h5")
+    with h5py.File(written[3], "r") as f:
+        assert list(f["wells"]) == ["well000", "well003"]
+    df = pd.read_csv(config.registry_path)
+    assert list(df["well"]) == [3]
 
 
 def test_ingest_stamps_identity_into_a_blob_less_file(tmp_path):
@@ -453,7 +527,7 @@ def _seed_batch(config, batch, chip="P1", div=19):
     from mxtreme import io
 
     stem = store.recording_stem(batch, PLATE_DATE, chip, 0, div)
-    rec_dir = store.recording_dir(config, batch, PLATE_DATE, chip, 0, div, system="M1")
+    rec_dir = store.recording_dir(config, batch, PLATE_DATE, chip, div, system="M1")
     (rec_dir / "electrode_selection").mkdir(parents=True)
     h5_path = rec_dir / f"{stem}_activity_scan.raw.h5"
     blob = str({"Batch ID": batch, "Chip ID": chip, "Plate date": PLATE_DATE,
@@ -769,7 +843,7 @@ def test_ingest_files_a_scope_activity_scan_as_an_activity_scan(tmp_path):
     assert dest.name.endswith("_well_1_DIV_22_activity_scan.raw.h5")
     assert store.recording_kind(dest) == "activity_scan"
     location = store.parse_recording_path(dest, config.recordings_dir)
-    assert (location.kind, location.well, location.div) == ("activity_scan", 1, 22) and not location.experiment
+    assert (location.kind, location.wells, location.div) == ("activity_scan", (1,), 22) and not location.experiment
 
     df = pd.read_csv(config.registry_path, keep_default_na=False)
     assert len(df) == 1
@@ -778,15 +852,15 @@ def test_ingest_files_a_scope_activity_scan_as_an_activity_scan(tmp_path):
 
     with h5py.File(dest, "r") as f:
         blob = eval(f["assay/metadata"][:][0].decode())
-        assert list(f["wells"]) == ["well001"]
+        assert list(f["wells"]) == ["well000", "well001"]  # the file is kept whole
     assert blob["Batch ID"] == "spring2024_batch1_DRG" and blob["Well IDs"] == [1]
-    assert sorted(load_activity_scan(str(dest))) == [1]  # the selection pipeline reads it
+    assert sorted(load_activity_scan(str(dest))) == [0, 1]  # the selection pipeline reads it
 
     log = transactions.read(config)
     assert [t.op for t in log] == ["recording.ingested"]
     assert (log[0].actor, log[0].note, log[0].data["kind"]) == ("kam", "from the Scope archive", "activity_scan")
     assert (log[0].batch_id, log[0].experiment) == ("spring2024_batch1_DRG", "")
-    assert src.exists()  # copied; only the chosen well was split out
+    assert src.exists()  # copied, not moved
 
 
 def test_ingest_derives_record_time_for_a_scan_that_lacks_it(tmp_path):
@@ -819,11 +893,3 @@ def test_ingest_wells_must_exist_and_a_scan_takes_no_experiment(tmp_path):
     with pytest.raises(ValueError, match="kind"):
         store.ingest_recording(src, config, kind="stimulation", experiment="x", **common)
     assert not (config.data_root / "recordings").exists()
-
-
-def test_split_by_well_can_pick_wells(tmp_path):
-    src = _multiwell_h5(tmp_path / "combined.raw.h5")
-    written = store.split_by_well(src, lambda w: tmp_path / f"w{w}.h5", wells=[3], on_progress=lambda _: None)
-    assert sorted(written) == [3]
-    with pytest.raises(ValueError, match="holds no well"):
-        store.split_by_well(src, lambda w: tmp_path / f"x{w}.h5", wells=[1], on_progress=lambda _: None)

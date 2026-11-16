@@ -477,9 +477,10 @@ def rebuild_registry(config, *, registry_path: str | Path | None = None) -> int:
     so recordings whose file is no longer on disk survive a rebuild.
 
     A file in the recordings tree is identified from its *path*: the tree's directory names are
-    fixed-format and carry the full identity (batch, plating date, chip, well, DIV) -- see
-    :func:`mxtreme.store.parse_recording_path`. Its ``/assay/metadata`` blob, when readable, supplies
-    the well's condition label; a file whose path does not follow the layout is counted and reported
+    fixed-format and the file name carries the wells, so the full identity (batch, plating date,
+    chip, wells, DIV) is read without opening it -- see :func:`mxtreme.store.parse_recording_path`.
+    One row per well the file holds; its ``/assay/metadata`` blob, when readable, supplies each
+    well's condition label. A file whose path does not follow the layout is counted and reported
     rather than guessed at.
 
     :param config: The :class:`~mxtreme.config.Config` describing the managed store.
@@ -523,21 +524,21 @@ def rebuild_registry(config, *, registry_path: str | Path | None = None) -> int:
         n_recordings += 1
 
     n_raw, n_unparseable = 0, 0
-    for h5_path in sorted(config.recordings_dir.glob("*/*/*/*/*.h5")):
+    for h5_path in sorted(config.recordings_dir.glob("*/*/*/*.h5")):
         location = parse_recording_path(h5_path, config.recordings_dir)
         if location is None:
             n_unparseable += 1
             continue
 
         register(
-            {location.well: {
+            {well: {
                 "batch_id": location.batch.id,
                 "experiment": location.experiment,
                 "plate_date": location.plate_date,
                 "chip": location.chip,
                 "DIV": location.div,
-                "exp_condition": _embedded_condition(h5_path, location.well),
-            }},
+                "exp_condition": _embedded_condition(h5_path, well),
+            } for well in location.wells},
             registry_path,
             kind=location.kind,
             timestamp=pd.Timestamp.fromtimestamp(h5_path.stat().st_mtime),
