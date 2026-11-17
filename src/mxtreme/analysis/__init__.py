@@ -28,14 +28,15 @@ from mxtreme.analysis import (
     rank_turbulence,
     regions,
     spatial,
-    state,
     stimulation,
 )
 from mxtreme.analysis.report import DEFAULT_SECTIONS, generate_report
 
 __all__ = [
+    "DEFAULT_SECTIONS",
     "activity",
     "channel_bursts",
+    "generate_report",
     "intervals",
     "network",
     "performance",
@@ -43,8 +44,5 @@ __all__ = [
     "rank_turbulence",
     "regions",
     "spatial",
-    "state",
     "stimulation",
-    "generate_report",
-    "DEFAULT_SECTIONS",
 ]

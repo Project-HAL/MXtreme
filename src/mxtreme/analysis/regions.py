@@ -16,7 +16,7 @@ across days needs.
   :func:`mxtreme.analysis.activity.firing_rate` returns) to one row per region and phase.
 
 Coordinates are the channel map's ``x`` / ``y`` columns, in µm, with the array's origin at its
-top-left electrode as MaxWell lays it out; a region's edges are inclusive.
+top-left electrode. Drawn regions have inclusive edges. Grid cells use half-open bounds.
 """
 
 from __future__ import annotations
@@ -45,6 +45,7 @@ class Region:
     :param label: What to call it on a plot.
     :param kind: ``"rect"`` -- ``points`` is ``((x0, y0), (x1, y1))``, any corner order;
         ``"polygon"`` -- ``points`` are its vertices in order, closed implicitly.
+        ``"grid"`` uses the same corner format as a rectangle with exclusive upper edges.
     :param points: Coordinates in µm.
     """
 
@@ -54,11 +55,11 @@ class Region:
     points: tuple[tuple[float, float], ...]
 
     def __post_init__(self) -> None:
-        if self.kind not in ("rect", "polygon"):
-            raise ValueError(f"kind must be 'rect' or 'polygon', not {self.kind!r}")
+        if self.kind not in ("rect", "polygon", "grid"):
+            raise ValueError(f"kind must be 'rect', 'polygon' or 'grid', not {self.kind!r}")
         pts = tuple((float(x), float(y)) for x, y in self.points)
-        if self.kind == "rect" and len(pts) != 2:
-            raise ValueError("a rect has exactly two corner points")
+        if self.kind in ("rect", "grid") and len(pts) != 2:
+            raise ValueError("a rectangle or grid cell has exactly two corner points")
         if self.kind == "polygon" and len(pts) < 3:
             raise ValueError("a polygon has at least three vertices")
         object.__setattr__(self, "points", pts)
@@ -71,11 +72,13 @@ class Region:
         return (min(xs), min(ys), max(xs), max(ys))
 
     def contains(self, x, y) -> np.ndarray:
-        """Boolean mask of which ``(x, y)`` points (µm, array-likes) fall inside, edges included."""
+        """Boolean mask of which ``(x, y)`` points (µm, array-likes) fall inside the region."""
         x = np.asarray(x, dtype=float)
         y = np.asarray(y, dtype=float)
-        if self.kind == "rect":
+        if self.kind != "polygon":
             x0, y0, x1, y1 = self.bounds
+            if self.kind == "grid":
+                return (x >= x0) & (x < x1) & (y >= y0) & (y < y1)
             return (x >= x0) & (x <= x1) & (y >= y0) & (y <= y1)
         return _in_polygon(x, y, np.asarray(self.points, dtype=float))
 
@@ -107,9 +110,8 @@ def _in_polygon(x: np.ndarray, y: np.ndarray, poly: np.ndarray) -> np.ndarray:
 def grid_regions(cols: int, rows: int, *, width: float = ARRAY_WIDTH_UM, height: float = ARRAY_HEIGHT_UM) -> list[Region]:
     """A ``cols x rows`` grid of rectangles over the array, row-major from the top-left.
 
-    Cell ``(r, c)`` is ``g<r>_<c>`` and labelled ``r<r>c<c>``. Cells abut: a point on a shared
-    edge belongs to both neighbours, which for electrodes on a 17.5 µm pitch happens only when
-    a cell edge lands exactly on an electrode column or row.
+    Cell ``(r, c)`` is ``g<r>_<c>`` and labelled ``r<r>c<c>``. Shared edges belong to
+    the cell to their right or below. The array extent ends beyond the last electrode.
     """
     if cols < 1 or rows < 1:
         raise ValueError("a grid needs at least one column and one row")
@@ -117,7 +119,7 @@ def grid_regions(cols: int, rows: int, *, width: float = ARRAY_WIDTH_UM, height:
     out = []
     for r in range(rows):
         for c in range(cols):
-            out.append(Region(f"g{r}_{c}", f"r{r}c{c}", "rect", ((c * w, r * h), ((c + 1) * w, (r + 1) * h))))
+            out.append(Region(f"g{r}_{c}", f"r{r}c{c}", "grid", ((c * w, r * h), ((c + 1) * w, (r + 1) * h))))
     return out
 
 

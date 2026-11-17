@@ -12,14 +12,11 @@ its bursts. This module builds those phases.
 - :func:`window_phases` names arbitrary frame windows, for intervals someone picked by hand.
 - :func:`stim_windows` finds the stimulation episodes in a recording's stimulated frames, so a
   stimulated stretch can be shown, or cut around, like a burst.
-- :func:`annotated_bursts` reads a recording's burst table and folds in the corrections people
-  have recorded against it in the transaction log (``burst.relabelled`` / ``burst.added``), so an
-  interval analysis sees the bursts as the last person to look at them judged them.
 
 Typical use::
 
     rec = Recording(0, load_preprocessed(paths.npz, skip=("spike_bin",)))
-    bursts = annotated_bursts(config, paths)
+    bursts = BurstSet.from_csv(paths.burst_stats).to_dataframe()
     rec.phases = burst_phases(bursts, kind="inter", start_frame=..., end_frame=...)
     rates = firing_rate(rec, save=False)          # channel, phase ("post_B1", ...), firing_rate_hz
 """
@@ -36,25 +33,20 @@ from mxtreme.phases import Phase, Phases
 #: What :func:`burst_phases` can cut a recording into.
 PHASE_KINDS = ("burst", "inter", "cycle")
 
-#: Burst kinds a burst table can carry, plus the value a person uses to set one aside.
-BURST_KINDS = ("network", "mini", "ignore")
-
 #: Columns :func:`burst_windows` returns, in order.
-WINDOW_COLUMNS = ("id", "kind", "start_frame", "end_frame", "peak_frame", "source")
+WINDOW_COLUMNS = ("id", "kind", "start_frame", "end_frame", "peak_frame")
 
 
 def burst_windows(bursts: pd.DataFrame, *, edges: str = "onset", kinds: Sequence[str] | None = ("network",)) -> pd.DataFrame:
     """The time window of every burst that counts, sorted by start.
 
-    :param bursts: A burst table (:meth:`BurstSet.to_dataframe <mxtreme.bursting.BurstSet.to_dataframe>`,
-        or :func:`annotated_bursts`). Rows whose ``ignore`` is true are left out.
+    :param bursts: A :meth:`BurstSet.to_dataframe <mxtreme.bursting.BurstSet.to_dataframe>` table. Rows whose ``ignore`` is true are left out.
     :param edges: ``"onset"`` bounds a burst by its ``onset_frame`` / ``offset_frame`` where
         feature extraction set them (falling back to the ISI-N group for a burst it did not reach);
         ``"group"`` always uses ``group_start_frame`` / ``group_stop_frame``.
     :param kinds: Which burst kinds count, e.g. ``("network",)`` (the default) or
         ``("network", "mini")``; ``None`` for every kind.
-    :returns: Columns :data:`WINDOW_COLUMNS`; ``source`` is ``"detected"`` unless the table says
-        otherwise (``"manual"`` for a burst added by hand).
+    :returns: Columns :data:`WINDOW_COLUMNS`.
     """
     if edges not in ("onset", "group"):
         raise ValueError(f"edges must be 'onset' or 'group', not {edges!r}")
@@ -79,7 +71,6 @@ def burst_windows(bursts: pd.DataFrame, *, edges: str = "onset", kinds: Sequence
         "start_frame": start,
         "end_frame": np.maximum(end, start),
         "peak_frame": df["peak_frame"].to_numpy(dtype=np.int64) if "peak_frame" in df.columns else (start + end) // 2,
-        "source": df["source"].to_numpy() if "source" in df.columns else "detected",
     })
     return out.sort_values(["start_frame", "id"], kind="stable").reset_index(drop=True)
 
@@ -164,113 +155,8 @@ def stim_windows(stim_frames, samp_rate: float, *, gap_sec: float = 0.05) -> np.
     frames = np.unique(np.asarray(stim_frames, dtype=np.int64).ravel()) if stim_frames is not None else np.zeros(0, dtype=np.int64)
     if frames.size == 0:
         return np.zeros((0, 2), dtype=np.int64)
-    gap = max(1, int(round(gap_sec * samp_rate)))
+    gap = max(1, round(gap_sec * samp_rate))
     breaks = np.nonzero(np.diff(frames) > gap)[0]
     starts = np.r_[0, breaks + 1]
     ends = np.r_[breaks, frames.size - 1]
     return np.column_stack([frames[starts], frames[ends]])
-
-
-# --- corrections from the transaction log ---------------------------------------------------------
-
-
-def burst_edits(transactions, recording_id) -> list:
-    """The ``burst.relabelled`` / ``burst.added`` records about one recording, in log order.
-
-    Matched on the recording's identity (batch, chip, well, DIV, experiment label), not on the
-    path in the record's data, so a store that has moved keeps its corrections.
-    """
-    rid = recording_id
-    out = []
-    for tx in transactions:
-        if tx.op not in ("burst.relabelled", "burst.added"):
-            continue
-        if str(tx.batch_id) != str(rid.batch_id) or str(tx.chip) != str(rid.chip):
-            continue
-        if tx.well is None or int(tx.well) != int(rid.well) or tx.div is None or int(tx.div) != int(rid.div):
-            continue
-        if str(tx.experiment or "") != str(rid.experiment or ""):
-            continue
-        out.append(tx)
-    return out
-
-
-def apply_burst_edits(bursts: pd.DataFrame, edits: Iterable) -> pd.DataFrame:
-    """Fold a recording's corrections over its burst table, in the order they were recorded.
-
-    A ``burst.relabelled`` record sets the burst's ``kind`` (``"ignore"`` sets its ``ignore`` flag
-    and leaves the kind as detected); a later record about the same burst wins, so a correction is
-    undone by recording the opposite. A ``burst.added`` record appends a row with the next free
-    id, ``source="manual"``, its onset/offset as both the feature edges and the group edges, and a
-    peak at the midpoint; detection's per-burst features are left at their sentinels.
-
-    :returns: A new table with a ``source`` column (``"detected"`` / ``"manual"``) and every row's
-        ``ignore`` as a bool.
-    """
-    df = bursts.copy()
-    if "source" not in df.columns:
-        df["source"] = "detected"
-    if "ignore" not in df.columns:
-        df["ignore"] = False
-    df["ignore"] = df["ignore"].astype(bool)
-    next_id = int(df["id"].max()) + 1 if len(df) else 1
-    for tx in edits:
-        data = tx.data or {}
-        if tx.op == "burst.relabelled":
-            kind = data.get("kind")
-            mask = df["id"].astype(int) == int(data.get("burst_id", -1))
-            if not mask.any() or kind not in BURST_KINDS:
-                continue
-            if kind == "ignore":
-                df.loc[mask, "ignore"] = True
-            else:
-                df.loc[mask, "ignore"] = False
-                df.loc[mask, "kind"] = kind
-        elif tx.op == "burst.added":
-            try:
-                onset, offset = int(data["onset_frame"]), int(data["offset_frame"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            kind = data.get("kind", "network")
-            if kind not in ("network", "mini"):
-                kind = "network"
-            row = {col: _sentinel(df[col]) for col in df.columns}
-            row.update({
-                "id": next_id, "kind": kind, "peak_frame": (onset + offset) // 2, "peak_amp": -1.0,
-                "group_start_frame": onset, "group_stop_frame": offset, "onset_frame": onset,
-                "offset_frame": offset, "duration_frames": offset - onset, "n_spikes": -1,
-                "ignore": False, "source": "manual",
-            })
-            df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
-            next_id += 1
-    return df
-
-
-def _sentinel(column: pd.Series):
-    """A blank value of a column's kind, for a row that has no measured value of it."""
-    if column.dtype.kind in "iu":
-        return -1
-    if column.dtype.kind == "f":
-        return -1.0
-    if column.dtype.kind == "b":
-        return False
-    return ""
-
-
-def annotated_bursts(config, paths) -> pd.DataFrame:
-    """One recording's burst table as the transaction log last left it.
-
-    :param config: The store's :class:`~mxtreme.config.Config`.
-    :param paths: The recording's :class:`~mxtreme.paths.RecordingPaths`; a recording with no burst
-        CSV yet gives an empty table, which corrections can still add to.
-    :returns: See :func:`apply_burst_edits`.
-    """
-    from mxtreme import transactions
-    from mxtreme.bursting.burst import _COLUMNS
-
-    if paths.burst_stats is not None and paths.burst_stats.is_file():
-        df = pd.read_csv(paths.burst_stats)
-    else:
-        df = pd.DataFrame(columns=_COLUMNS)
-    edits = burst_edits(transactions.read(config), paths.recording_id)
-    return apply_burst_edits(df, edits)

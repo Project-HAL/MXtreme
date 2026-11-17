@@ -9,7 +9,8 @@ entire recording.
 
 from __future__ import annotations
 
-from typing import Mapping, Optional
+from collections.abc import Mapping
+from functools import cached_property
 
 import numpy as np
 import pandas as pd
@@ -76,9 +77,9 @@ class Recording:
         self,
         id,
         exp_data: dict,
-        phases: Optional[Phases] = None,
+        phases: Phases | None = None,
         *,
-        phase_tags: Optional[PhaseSpec] = None,
+        phase_tags: PhaseSpec | None = None,
     ) -> None:
         self.id = id
 
@@ -112,11 +113,6 @@ class Recording:
         self.bin_size = float(_item(exp_data["bin_size"]))
 
         # --- derived views ---
-        # Array-wide spike detection rate: the fraction of channels with a spike in each bin.
-        if self.spike_bin is not None:
-            self.asdr = self.spike_bin.mean(axis=0)
-        else:
-            self.asdr = asdr_from_spikes(self.spike_data, self.channelmap, self.samp_rate, self.bin_size)
         self.event_df = pd.DataFrame({"eventtime": self.eventtime, "eventmessage": self.event_messages})
 
         # --- phases ---
@@ -144,3 +140,10 @@ class Recording:
             )
         else:
             self.phases = Phases.full(start_frame, end_frame)
+
+    @cached_property
+    def asdr(self) -> np.ndarray:
+        """Fraction of mapped channels firing in each bin, computed on first access."""
+        if self.spike_bin is not None:
+            return self.spike_bin.mean(axis=0)
+        return asdr_from_spikes(self.spike_data, self.channelmap, self.samp_rate, self.bin_size)

@@ -1,16 +1,12 @@
-"""Intervals cut at bursts, corrections folded from the log, and rank-turbulence divergence."""
+"""Intervals cut at bursts, region membership, and rank-turbulence divergence."""
 
 import numpy as np
 import pandas as pd
 import pytest
 
-from mxtreme import io
 from mxtreme import transactions as tx
 from mxtreme.analysis import activity
 from mxtreme.analysis.intervals import (
-    annotated_bursts,
-    apply_burst_edits,
-    burst_edits,
     burst_phases,
     burst_windows,
     window_phases,
@@ -18,9 +14,7 @@ from mxtreme.analysis.intervals import (
 from mxtreme.analysis.rank_turbulence import from_table, rank_turbulence, ranks
 from mxtreme.bursting import BurstDetector
 from mxtreme.config import Config
-from mxtreme.identity import RecordingID
-from mxtreme.params import BurstDetectParams, BurstFeatureParams
-from mxtreme.paths import RecordingPaths
+from mxtreme.params import BurstDetectParams
 from mxtreme.recording import Recording
 
 
@@ -68,43 +62,14 @@ def test_window_phases_requires_distinct_names():
         window_phases([("a", 0, 10), ("a", 20, 30)])
 
 
-def test_apply_burst_edits_relabels_sets_aside_and_adds():
-    df = _bursts([(1, "network", 100, 200), (2, "mini", 300, 400)])
-
-    class E:
-        def __init__(self, op, data): self.op, self.data = op, data
-
-    edited = apply_burst_edits(df, [
-        E("burst.relabelled", {"burst_id": 2, "kind": "network"}),
-        E("burst.relabelled", {"burst_id": 1, "kind": "ignore"}),
-        E("burst.added", {"onset_frame": 700, "offset_frame": 800, "kind": "network"}),
-        E("burst.relabelled", {"burst_id": 1, "kind": "network"}),  # the set-aside undone
-        E("burst.relabelled", {"burst_id": 99, "kind": "mini"}),  # unknown burst: ignored
-    ])
-    assert edited["kind"].tolist() == ["network", "network", "network"]
-    assert edited["ignore"].tolist() == [False, False, False]
-    assert edited["source"].tolist() == ["detected", "detected", "manual"]
-    added = edited[edited.source == "manual"].iloc[0]
-    assert (added.id, added.onset_frame, added.offset_frame, added.group_start_frame) == (3, 700, 800, 700)
-    assert burst_phases(edited, kind="burst").names == ("B1", "B2", "B3")
-
-
-def test_annotated_bursts_folds_the_log_by_recording_identity(tmp_path, make_recording_data):
+def test_historical_burst_annotations_are_read_only(tmp_path):
     config = Config(data_root=tmp_path)
-    rec = Recording(0, make_recording_data())
-    bursts = BurstDetector(BurstDetectParams()).detect(rec)
-    bursts.extract_features(rec, BurstFeatureParams())
-    csv = io.save_burst_data(bursts, config.burst_data_dir, rec)
-    rid = RecordingID(rec.batch_id, rec.chip, rec.well, rec.DIV, "")
-    paths = RecordingPaths(recording_id=rid, npz=tmp_path / "x.npz", burst_stats=csv)
-    first = int(bursts.to_dataframe()["id"].iloc[0])
-    ident = {"batch_id": rec.batch_id, "plate_date": rec.plate_date, "chip": rec.chip, "well": rec.well, "div": rec.DIV}
-    tx.record(config, "burst.relabelled", data={"burst_id": first, "kind": "ignore"}, **ident)
-    tx.record(config, "burst.relabelled", data={"burst_id": first, "kind": "ignore"}, **{**ident, "div": rec.DIV + 1})  # another DIV
-    assert len(burst_edits(tx.read(config), rid)) == 1
-    df = annotated_bursts(config, paths)
-    assert bool(df.loc[df.id == first, "ignore"].iloc[0]) is True
-    assert df["ignore"].sum() == 1
+    config.transactions_path.write_text(
+        '{"time":"2026-11-17T00:00:00","op":"burst.relabelled","batch_id":"test","well":0,"div":1}\n'
+    )
+    assert [entry.op for entry in tx.read(config)] == ["burst.relabelled"]
+    with pytest.raises(ValueError, match="read only"):
+        tx.record(config, "burst.added")
 
 
 def test_firing_rate_per_inter_burst_phase_from_a_lazy_recording(make_recording_data):
@@ -113,8 +78,10 @@ def test_firing_rate_per_inter_burst_phase_from_a_lazy_recording(make_recording_
     lazy_data = {k: v for k, v in data.items() if k != "spike_bin"}
     lazy = Recording(0, lazy_data)
     assert lazy.spike_bin is None
+    assert "asdr" not in vars(full) and "asdr" not in vars(lazy)
     n = min(len(full.asdr), len(lazy.asdr))
     assert np.allclose(full.asdr[:n], lazy.asdr[:n])
+    assert lazy.asdr is vars(lazy)["asdr"]
     bursts = BurstDetector(BurstDetectParams()).detect(lazy).to_dataframe()
     assert len(bursts) >= 2
     lazy.phases = burst_phases(bursts, kind="inter", start_frame=0, end_frame=int(lazy.spike_data["frameno"].max()))
@@ -190,8 +157,11 @@ def test_region_membership_rect_polygon_and_grid():
     grid = grid_regions(2, 2)
     assert [g.id for g in grid] == ["g0_0", "g0_1", "g1_0", "g1_1"]
     assert grid[3].bounds == (ARRAY_WIDTH_UM / 2, ARRAY_HEIGHT_UM / 2, ARRAY_WIDTH_UM, ARRAY_HEIGHT_UM)
-    gm = membership(cm, grid)
-    assert sorted(gm["g0_0"].tolist()) == [10, 11, 13] and gm["g1_1"].tolist() == [12]
+    boundary = [[4, 14, 104, ARRAY_WIDTH_UM / 2, ARRAY_HEIGHT_UM / 2]]
+    gm = membership(np.vstack([cm, boundary]), grid)
+    assert sorted(gm["g0_0"].tolist()) == [10, 11, 13]
+    assert gm["g1_1"].tolist() == [12, 14]
+    assert sorted(np.concatenate(list(gm.values())).tolist()) == [10, 11, 12, 13, 14]
     with pytest.raises(ValueError):
         Region("x", "x", "rect", ((0, 0),))
     assert Region.from_dict(rect.to_dict()) == rect

@@ -41,21 +41,17 @@ DOUBLET_MS = 20.0
 
 #: The per channel statistics of :func:`channel_stats`, with what each is.
 STATS = {
-    "log_rate": "log10 of the firing rate (Hz)",
     "particip": "share of bursts the channel joins",
     "count_mean": "spikes per burst it joins, mean",
     "count_cv": "spikes per burst it joins, coefficient of variation",
-    "count_max": "spikes per burst it joins, the most",
     "burst_share": "share of its spikes that fall inside bursts",
     "isi_in_p50": "median interval inside bursts (ms)",
     "lat_frac_p50": "first spike latency as a fraction of the burst, median",
     "lat_frac_sd": "first spike latency as a fraction of the burst, spread (sd)",
     "span_frac_p50": "train span (first to last spike) as a fraction of the burst, median",
-    "log_gap_rate": "log10 of the rate between bursts (Hz)",
     "gap_rate": "rate between bursts (Hz)",
     "gap_fano": "Fano factor of its spike counts per gap between bursts",
     "gap_doublet": "share of its spikes between bursts that sit within 20 ms of another",
-    "isi_cv": "coefficient of variation of its intervals",
     "isi_lv": "local variation of its intervals",
 }
 
@@ -148,19 +144,20 @@ def peri_burst(frames, rows, samp_rate: float, spans, channel: int) -> dict:
         fires in; "mean_spikes": its mean spikes per burst it joins}``.
     """
     hz = float(samp_rate)
-    tr = _trains(frames, rows, spans)
-    spans = tr["spans"]
-    mine = np.flatnonzero(tr["row"] == int(channel))
-    t, burst = [], []
-    for k in mine:
-        s, n, b = tr["start"][k], tr["n"][k], tr["burst"][k]
-        t.append((tr["f"][s:s + n] - spans[b, 0]) * 1000.0 / hz)
-        burst.append(np.full(n, b, dtype=np.int64))
-    n_spikes = int(tr["n"][mine].sum())
+    frames = np.asarray(frames, dtype=np.int64)
+    selected = np.asarray(rows) == int(channel)
+    trains = _trains(frames[selected], np.asarray(rows)[selected], spans)
+    spans = trains["spans"]
+    burst = trains["burst"][trains["train_of"]]
+    count = len(trains["n"])
+    ms_per_frame = 1000.0 / hz
     return {
-        "t_ms": np.concatenate(t) if t else np.zeros(0), "burst": np.concatenate(burst) if burst else np.zeros(0, dtype=np.int64),
-        "dur_ms": (spans[:, 1] - spans[:, 0]) * 1000.0 / hz, "onset_frame": spans[:, 0].copy(),
-        "joined": mine.size / max(len(spans), 1), "mean_spikes": n_spikes / mine.size if mine.size else 0.0,
+        "t_ms": (trains["f"] - spans[burst, 0]) * ms_per_frame,
+        "burst": burst,
+        "dur_ms": (spans[:, 1] - spans[:, 0]) * ms_per_frame,
+        "onset_frame": spans[:, 0].copy(),
+        "joined": count / max(len(spans), 1),
+        "mean_spikes": len(burst) / count if count else 0.0,
     }
 
 
@@ -184,10 +181,9 @@ def channel_stats(frames, rows, n_channels: int, samp_rate: float, spans, *, sta
     """One value per channel of each statistic in :data:`STATS`, over ``[start, stop)``.
 
     ``nan`` where a channel has too few events for a statistic (:data:`MIN_EVENTS` joined
-    bursts, intervals or spikes between bursts; a channel with no spike at all has ``nan``
-    everywhere but the two rates). Bursts are the spans that start inside the window; a gap is
-    the stretch before a burst, the last one the stretch after the last burst. ``n_spikes`` (the
-    channel's spikes in the window) comes back too.
+    bursts, intervals or spikes between bursts). A silent channel has a zero gap rate and
+    ``nan`` for the other measures. Count bursts whose start is inside the window and clip them
+    at its end. Gaps are the stretches before, between and after those bursts.
     """
     f = np.asarray(frames, dtype=np.int64)
     ch = np.asarray(rows, dtype=np.int64)
@@ -206,7 +202,6 @@ def channel_stats(frames, rows, n_channels: int, samp_rate: float, spans, *, sta
     duration_ms = max((hi - lo) * 1000.0 / hz, 1e-9)
     out = {k: np.full(n, np.nan) for k in STATS}
     total = np.bincount(ch, minlength=n).astype(float)
-    out["log_rate"] = np.log10(np.maximum(total, 0.5) / (duration_ms / 1000.0))
     if len(spans):
         bi = np.searchsorted(spans[:, 0], f, side="right") - 1
         in_burst = (bi >= 0) & (f < spans[np.clip(bi, 0, None), 1])
@@ -216,7 +211,6 @@ def channel_stats(frames, rows, n_channels: int, samp_rate: float, spans, *, sta
         out["burst_share"] = np.where(total > 0, np.bincount(ch[in_burst], minlength=n) / total, np.nan)
     gap_s = max(duration_ms - float(np.sum(off_ms - on_ms)), 1.0) / 1000.0
     gap_n = np.bincount(ch[~in_burst], minlength=n).astype(float)
-    out["log_gap_rate"] = np.log10(np.maximum(gap_n, 0.5) / gap_s)
     out["gap_rate"] = gap_n / gap_s
 
     # per channel per burst: count, latency and span as fractions of the burst
@@ -245,7 +239,6 @@ def channel_stats(frames, rows, n_channels: int, samp_rate: float, spans, *, sta
         out["particip"][c] = mine.size / max(len(spans), 1)
         if mine.size >= MIN_EVENTS:
             out["count_mean"][c] = counts.mean()
-            out["count_max"][c] = counts.max()
             out["count_cv"][c] = counts.std() / counts.mean()
             out["lat_frac_p50"][c] = np.median(lat[mine])
             out["lat_frac_sd"][c] = lat[mine].std()
@@ -255,7 +248,6 @@ def channel_stats(frames, rows, n_channels: int, samp_rate: float, spans, *, sta
         s0, s1 = np.searchsorted(c_s, c), np.searchsorted(c_s, c, side="right")
         d = d_all[s0:s1 - 1]
         if d.size >= 2 * MIN_EVENTS:
-            out["isi_cv"][c] = d.std() / d.mean()
             out["isi_lv"][c] = 3.0 * np.mean(((d[1:] - d[:-1]) / np.maximum(d[1:] + d[:-1], 1e-9)) ** 2)
         di = d[inside[s0:s1 - 1]]
         if di.size >= MIN_EVENTS:
@@ -270,5 +262,4 @@ def channel_stats(frames, rows, n_channels: int, samp_rate: float, spans, *, sta
             near[:-1] |= dg <= DOUBLET_MS
             near[1:] |= dg <= DOUBLET_MS
             out["gap_doublet"][c] = near.mean()
-    out["n_spikes"] = total
     return out
