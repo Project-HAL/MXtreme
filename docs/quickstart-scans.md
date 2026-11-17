@@ -29,7 +29,7 @@ params = activity_scan.ActivityScanParams(
 print(activity_scan.describe(params))
 ```
 
-{func}`~mxtreme.scans.activity_scan.describe` prints the run time and how much of the array the scan covers, so you can adjust before committing to the recording. The defaults are a working scan: ~8 minutes over one well, covering roughly a quarter of the array. Use `params.estimated_minutes` and `params.array_coverage` if you want the numbers directly — coverage above `1.0` means the scan revisits electrodes it has already recorded.
+{func}`~mxtreme.scans.activity_scan.describe` prints the run time and how much of the array the scan covers, so you can adjust before committing to the recording. The defaults are a working scan: 8 minutes of recording over one well (about 10 on the rig, once each round's routing and offset compensation are counted), covering roughly a quarter of the array. Use `params.estimated_minutes` (recording only), `params.estimated_total_minutes` (the whole run) and `params.array_coverage` if you want the numbers directly — coverage above `1.0` means the scan revisits electrodes it has already recorded.
 
 {meth}`~mxtreme.scans.activity_scan.ActivityScanParams.validate` runs automatically before the chip is touched, so a missing or malformed batch id, bad wells, an over-long routing request or too coarse a spacing fail immediately rather than mid-scan.
 

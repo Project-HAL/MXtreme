@@ -55,18 +55,27 @@ from mxtreme.scans.activity_scan import (
     MAX_ROUTED_ELECTRODES,
     MAX_WELLS,
     N_TOTAL_ELECTRODES,
+    ROUTE_SEC_PER_WELL,
+    WAIT_AFTER_DOWNLOAD_SEC,
+    WAIT_AFTER_RECORDING_SEC,
+    WAIT_INIT_SEC,
     ProgressFn,
     StopFn,
     _connected_device,
     _require_maxlab,
     _with_connected_system,
     _saved_file,
+    offset_sec,
 )
 
 #: Amplifier channels per well. Every one is saved, via a single recording group -- a channel with no
 #: electrode routed to it costs a little disk and nothing else, whereas a missing group silently
 #: costs data.
 N_CHANNELS = 1024
+
+#: The wait ``run_network_scan`` adds after offset compensation (``maxlab.Timing.waitInMX2Offset``,
+#: which it sleeps on both systems), restated for the estimate; see ``activity_scan.OFFSET_SEC``.
+_SETTLE_AFTER_OFFSET_SEC = 15
 
 #: How often, in seconds, a long recording reports its progress and asks ``should_stop``.
 _POLL_SEC = 0.5
@@ -240,8 +249,34 @@ class NetworkScanParams:
 
     @property
     def estimated_minutes(self) -> float:
-        """Recording time in minutes, excluding routing and offset-compensation overhead."""
+        """Recording time in minutes, excluding routing and offset-compensation overhead.
+
+        How much data the scan holds. For how long it occupies the rig, see
+        :attr:`estimated_total_minutes`.
+        """
         return self.rec_length_sec / 60
+
+    @property
+    def setup_sec(self) -> float:
+        """Seconds between starting the scan and the recording actually beginning.
+
+        Chip initialization, then each well routed, downloaded and waited on in turn
+        (``init_well``), then offset compensation and the extra settling wait this scan gives it.
+        Derived from the same per-step costs as the activity scan's measured rounds
+        (:func:`mxtreme.scans.activity_scan.round_overhead_sec`) rather than measured end to end:
+        about 33 s on a MaxOne and 95 s for six wells on a MaxTwo.
+        """
+        return (
+            WAIT_INIT_SEC
+            + len(self.wells) * (ROUTE_SEC_PER_WELL + WAIT_AFTER_DOWNLOAD_SEC)
+            + offset_sec(self.system)
+            + _SETTLE_AFTER_OFFSET_SEC
+        )
+
+    @property
+    def estimated_total_minutes(self) -> float:
+        """Wall-clock minutes the scan takes start to finish: setup, recording, and closing."""
+        return (self.setup_sec + self.rec_length_sec + WAIT_AFTER_RECORDING_SEC) / 60
 
     def as_metadata(self) -> dict:
         """Build the metadata dict written into the file.
@@ -383,7 +418,11 @@ def describe(params: NetworkScanParams) -> str:
             if params.pad_to_max
             else "                 (as chosen by electrode selection; no random fill)"
         ),
-        f"Recording time : {params.estimated_minutes:.1f} min (excluding routing overhead)",
+        f"Recording time : {params.estimated_minutes:.1f} min of data",
+        (
+            f"Run time       : ~{params.estimated_total_minutes:.1f} min, with routing and offset "
+            "compensation first"
+        ),
         # Describing a scan is a planning step, and planning happens before a Config (or even the
         # batch) is necessarily in hand -- so an unresolved destination is reported, not raised over.
         f"Saving to      : {params.h5_path if params.save_path is not None and params.batch is not None else destination}",

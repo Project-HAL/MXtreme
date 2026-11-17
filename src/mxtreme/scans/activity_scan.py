@@ -58,6 +58,47 @@ MAX_ROUTED_ELECTRODES = 1020
 #: Wells on a MaxTwo plate; MaxOne only has well 0.
 MAX_WELLS = 6
 
+#: Seconds the server takes to route one well's electrodes and download the solution to the chip.
+#: Measured, not specified: see :func:`round_overhead_sec`.
+ROUTE_SEC_PER_WELL = 5.5
+
+#: The fixed waits around a recording, in seconds. These restate ``maxlab.Timing`` (identical in
+#: maxlab 1.0.0 and 1.1.0) because an estimate is a planning step and has to work where ``maxlab``
+#: is not installed; the scan itself still sleeps on the package's own values.
+WAIT_INIT_SEC = 2
+WAIT_AFTER_DOWNLOAD_SEC = 5
+WAIT_AFTER_RECORDING_SEC = 2
+
+#: How long offset compensation holds the rig, per system (``maxlab.Timing.waitInMX1Offset`` and
+#: ``waitInMX2Offset``). The single largest difference between the two rigs' round times.
+OFFSET_SEC = {"M1": 5, "M2": 15}
+
+
+def offset_sec(system: str | None) -> int:
+    """Seconds one offset compensation takes on ``system``; the MaxTwo's when it is not known."""
+    return OFFSET_SEC.get(system, OFFSET_SEC["M2"])
+
+
+def round_overhead_sec(n_wells: int, system: str | None) -> float:
+    """Seconds one sweep round spends *not* recording: routing, download, offset compensation.
+
+    Each well is routed and downloaded in turn, then the round waits out the download, runs offset
+    compensation and, after recording, waits for the recording to settle. Checked against the gaps
+    between consecutive recordings in the rigs' own scan files (2026-11-17, stop of one recording
+    to start of the next): a MaxOne measures 17.5-18 s, a MaxTwo 27 s with one well and 53-54 s
+    with six, and this gives 17.5, 27.5 and 55.
+
+    :param n_wells: Wells recorded together.
+    :param system: ``"M1"`` or ``"M2"``; ``None`` is costed as a MaxTwo, the slower of the two.
+    """
+    return (
+        n_wells * ROUTE_SEC_PER_WELL
+        + WAIT_AFTER_DOWNLOAD_SEC
+        + offset_sec(system)
+        + WAIT_AFTER_RECORDING_SEC
+    )
+
+
 #: What the MaxLab server's ``wellplate_query_version`` reply means.
 SYSTEM_TYPES = {0: "MaxOne", 1: "MaxTwo"}
 
@@ -218,8 +259,23 @@ class ActivityScanParams:
 
     @property
     def estimated_minutes(self) -> float:
-        """Total recording time in minutes, excluding routing and offset-compensation overhead."""
+        """Total recording time in minutes, excluding routing and offset-compensation overhead.
+
+        How much data the scan holds. For how long it occupies the rig, see
+        :attr:`estimated_total_minutes`.
+        """
         return self.n_scans * self.rec_length_sec / 60
+
+    @property
+    def estimated_total_minutes(self) -> float:
+        """Wall-clock minutes the scan takes start to finish, overhead included.
+
+        Every round pays :func:`round_overhead_sec` on top of its recording -- on a six-well
+        MaxTwo sweep of 60 s recordings that nearly doubles the run -- plus one chip
+        initialization up front.
+        """
+        per_round = self.rec_length_sec + round_overhead_sec(len(self.wells or []), self.system)
+        return (WAIT_INIT_SEC + self.n_scans * per_round) / 60
 
     @property
     def n_available_electrodes(self) -> int:
@@ -397,7 +453,11 @@ def describe(params: ActivityScanParams) -> str:
             f"(spacing {params.electrode_spacing}) of {N_TOTAL_ELECTRODES} total"
         ),
         f"Array coverage : {params.array_coverage:.2f}x of the available electrodes",
-        f"Recording time : {params.estimated_minutes:.1f} min (excluding routing overhead)",
+        f"Recording time : {params.estimated_minutes:.1f} min of data",
+        (
+            f"Run time       : ~{params.estimated_total_minutes:.1f} min, with routing and offset "
+            "compensation each round"
+        ),
         # Describing a scan is a planning step, and planning happens before a Config (or even the
         # batch) is necessarily in hand -- so an unresolved destination is reported, not raised over.
         f"Saving to      : {params.h5_path if params.save_path is not None and params.batch is not None else destination}",
