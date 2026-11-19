@@ -160,3 +160,51 @@ def stim_windows(stim_frames, samp_rate: float, *, gap_sec: float = 0.05) -> np.
     starts = np.r_[0, breaks + 1]
     ends = np.r_[breaks, frames.size - 1]
     return np.column_stack([frames[starts], frames[ends]])
+
+
+def _event_dict(message) -> dict:
+    """A MaxLab event message as a dict: they are stored as dicts, or as their ``repr`` in older files."""
+    if isinstance(message, dict):
+        return message
+    try:
+        import ast
+
+        d = ast.literal_eval(str(message))
+    except (ValueError, SyntaxError):
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
+def stim_amplitudes(windows, eventtime, event_messages) -> np.ndarray:
+    """The stimulus amplitude of each episode, in mV: ``(n,)`` float, NaN where the file says none.
+
+    Each ``start_stimulation`` event the stimulation script writes carries the pulse's ``amp_mV``
+    (``Recording.eventtime`` / ``Recording.event_messages``). An episode -- a row of
+    :func:`stim_windows` -- takes the largest magnitude among the pulses that start inside it, so
+    a train of equal pulses is that amplitude and a ramp reports its peak.
+    """
+    windows = np.asarray(windows, dtype=np.int64).reshape(-1, 2)
+    out = np.full(len(windows), np.nan)
+    if not len(windows) or eventtime is None or event_messages is None:
+        return out
+    times, amps = [], []
+    for t, m in zip(np.asarray(eventtime).ravel(), np.asarray(event_messages, dtype=object).ravel()):
+        d = _event_dict(m)
+        if "start_stimulation" not in d or "amp_mV" not in d:
+            continue
+        try:
+            amps.append(abs(float(d["amp_mV"])))
+        except (TypeError, ValueError):
+            continue
+        times.append(int(t))
+    if not times:
+        return out
+    times, amps = np.asarray(times), np.asarray(amps)
+    order = np.argsort(times)
+    times, amps = times[order], amps[order]
+    lo = np.searchsorted(times, windows[:, 0], side="left")
+    hi = np.searchsorted(times, windows[:, 1], side="right")
+    for k, (a, b) in enumerate(zip(lo, hi)):
+        if b > a:
+            out[k] = amps[a:b].max()
+    return out
