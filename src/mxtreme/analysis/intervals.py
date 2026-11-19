@@ -208,3 +208,58 @@ def stim_amplitudes(windows, eventtime, event_messages) -> np.ndarray:
         if b > a:
             out[k] = amps[a:b].max()
     return out
+
+
+def stim_electrodes(windows, eventtime, event_messages) -> list:
+    """The electrodes each episode stimulated through: one ``list[int]`` per row of
+    :func:`stim_windows`, ``None`` where its events do not say.
+
+    Read from the ``elecs`` field of the ``start_stimulation`` events (comma-separated electrode
+    numbers), which a protocol that stimulates different electrodes at different moments writes
+    so each presentation names its own; a recording-wide ``Recording.stim_elecs`` cannot say which
+    of them a given stimulus used. An episode takes the union over the pulses starting inside it.
+    """
+    windows = np.asarray(windows, dtype=np.int64).reshape(-1, 2)
+    out: list = [None] * len(windows)
+    if not len(windows) or eventtime is None or event_messages is None:
+        return out
+    rows = []
+    for t, m in zip(np.asarray(eventtime).ravel(), np.asarray(event_messages, dtype=object).ravel()):
+        d = _event_dict(m)
+        if "start_stimulation" not in d or "elecs" not in d:
+            continue
+        try:
+            rows.append((int(t), [int(e) for e in str(d["elecs"]).replace(" ", "").split(",") if e]))
+        except ValueError:
+            continue
+    if not rows:
+        return out
+    rows.sort(key=lambda r: r[0])
+    times = np.asarray([r[0] for r in rows])
+    lo = np.searchsorted(times, windows[:, 0], side="left")
+    hi = np.searchsorted(times, windows[:, 1], side="right")
+    for k, (a, b) in enumerate(zip(lo, hi)):
+        if b > a:
+            out[k] = list(dict.fromkeys(e for _, els in rows[a:b] for e in els))
+    return out
+
+
+def stim_roles(windows, eventtime, event_messages) -> list:
+    """What each episode was, by the ``role`` field of its ``start_stimulation`` events (a
+    protocol's name for the site, e.g. ``"US"``): one ``str`` per row of :func:`stim_windows`,
+    roles of several pulses joined with ``+``, ``None`` where the events give none."""
+    windows = np.asarray(windows, dtype=np.int64).reshape(-1, 2)
+    out: list = [None] * len(windows)
+    if not len(windows) or eventtime is None or event_messages is None:
+        return out
+    rows = sorted((int(t), str(d["role"])) for t, d in ((t, _event_dict(m)) for t, m in zip(np.asarray(eventtime).ravel(), np.asarray(event_messages, dtype=object).ravel()))
+                  if "start_stimulation" in d and d.get("role"))
+    if not rows:
+        return out
+    times = np.asarray([r[0] for r in rows])
+    lo = np.searchsorted(times, windows[:, 0], side="left")
+    hi = np.searchsorted(times, windows[:, 1], side="right")
+    for k, (a, b) in enumerate(zip(lo, hi)):
+        if b > a:
+            out[k] = "+".join(dict.fromkeys(r for _, r in rows[a:b]))
+    return out
