@@ -239,6 +239,61 @@ def remove_stim_frames(well: dict, post_stim_period: float = 0.0) -> dict:
     return well
 
 
+def blank_stim_pulses(well: dict, blank_ms: float = 5.0, min_fraction: float = 0.05, search_ms: float = 10.0) -> dict:
+    """Remove the spikes around each stimulation *pulse*, keeping the activity between pulses.
+
+    :func:`remove_stim_frames` drops everything between a ``start_stimulation`` and its
+    ``end_stimulation`` marker. That is right when a stimulus is one pulse, but when it is a train
+    (three pulses at 20 Hz, 100 ms between the markers) it also drops the culture's response
+    between the pulses. Here the pulses are found from their artifact: within each marked window
+    (widened by ``search_ms`` either side), any 1 ms bin in which at least ``min_fraction`` of the
+    recorded channels fire is a pulse. Spikes within ``blank_ms`` of a pulse, or of the start
+    marker itself (a weak pulse may leave no artifact to find), are removed.
+
+    :param well: A well data dict (frames already normalised; see :func:`normalize_time`).
+    :param blank_ms: Half-width of the blanked stretch around each pulse, in ms. Defaults to ``5.0``.
+    :param min_fraction: Share of recorded channels firing in one 1 ms bin that marks a pulse.
+        Defaults to ``0.05``.
+    :param search_ms: How far outside the markers to look for pulses, in ms. Defaults to ``10.0``.
+    :returns: The same dict, with pulse spikes removed and the blanked frames in ``stim_frames``.
+    :rtype: dict
+    """
+    sr = float(np.asarray(well["samp_rate"]).ravel()[0])
+    frames = np.asarray(well["spike_data"]["frameno"], dtype=np.int64)
+    params = dict(stim_blanking="pulses", blank_ms=blank_ms, pulse_min_fraction=min_fraction)
+    event_df = pd.DataFrame({"eventtime": well["eventtime"], "eventmessage": well["event_messages"]})
+    starts = event_df[event_df["eventmessage"].apply(lambda d: "start_stimulation" in d)]["eventtime"].to_numpy(dtype=np.int64)
+    stops = event_df[event_df["eventmessage"].apply(lambda d: "end_stimulation" in d)]["eventtime"].to_numpy(dtype=np.int64)
+    if len(starts) == 0:
+        well["stim_frames"] = []
+        _stamp(well, **params)
+        return well
+    if len(stops) and stops[0] < starts[0]:
+        stops = stops[1:]
+    assert len(starts) == len(stops)
+
+    order = np.argsort(frames, kind="stable")
+    sorted_frames = frames[order]
+    n_channels = max(1, int(np.unique(np.asarray(well["spike_data"]["channel"])).size))
+    per_ms, half, pad = sr / 1000.0, round(blank_ms * sr / 1000.0), round(search_ms * sr / 1000.0)
+    spans = []
+    for a, b in zip(starts, stops):
+        lo, hi = a - pad, b + pad
+        seg = sorted_frames[np.searchsorted(sorted_frames, lo):np.searchsorted(sorted_frames, hi, side="right")]
+        pulses = [int(a)]
+        if seg.size:
+            bins = ((seg - lo) // per_ms).astype(np.int64)
+            counts = np.bincount(bins)
+            for k in np.nonzero(counts >= min_fraction * n_channels)[0]:
+                pulses.append(int(lo + (k + 0.5) * per_ms))
+        spans.extend((p - half, p + half) for p in pulses)
+    blanked = np.unique(np.concatenate([np.arange(x, y + 1, dtype=np.int64) for x, y in spans]))
+    well["stim_frames"] = blanked
+    well["spike_data"] = well["spike_data"][~np.isin(frames, blanked)]
+    _stamp(well, **params)
+    return well
+
+
 def bin_spikes(well: dict, bin_size: float = 0.01) -> dict:
     """Bin spikes into a ``(num_channels, num_bins)`` binary matrix.
 
