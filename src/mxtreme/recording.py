@@ -16,6 +16,7 @@ import numpy as np
 import pandas as pd
 
 from mxtreme.phases import Phases, PhaseSpec, phases_from_spec
+from mxtreme.utils import _spike_bins, channel_rows
 
 
 def _item(value):
@@ -32,26 +33,17 @@ def _scalar_float(value) -> float:
 def asdr_from_spikes(spike_data, channelmap, samp_rate: float, bin_size: float) -> np.ndarray:
     """The array-wide spike detection rate straight from the spike table.
 
-    Identical to ``spike_bin.mean(axis=0)`` for the matrix :func:`mxtreme.clean.bin_spikes` would
-    build from the same spikes -- a channel counts once per bin however many times it fired --
-    but computed from the ``(bin, channel)`` pairs that occur, so it never materialises the matrix.
-    Spikes on channels the map does not list are dropped, as ``bin_spikes`` drops them.
+    Count each mapped channel once per bin without allocating a dense matrix.
     """
     frames = np.asarray(spike_data["frameno"], dtype=np.int64)
-    bin_win = bin_size * samp_rate
-    n_chan = int(np.asarray(channelmap).shape[0])
-    if len(frames) == 0 or n_chan == 0:
+    n_channels = len(channelmap)
+    if not n_channels:
         return np.zeros(0, dtype=float)
-    num_bins = int(np.ceil(frames.max() / bin_win))
-    which = np.clip((frames / bin_win).astype(np.int64), 0, max(num_bins - 1, 0))
-    chans = np.asarray(channelmap)[:, 1].astype(np.int64)
-    order = np.argsort(chans)
-    idx = np.searchsorted(chans[order], np.asarray(spike_data["channel"], dtype=np.int64))
-    idx = np.clip(idx, 0, len(chans) - 1)
-    known = chans[order][idx] == np.asarray(spike_data["channel"], dtype=np.int64)
-    pairs = np.unique(which[known] * n_chan + order[idx[known]])
-    counts = np.bincount(pairs // n_chan, minlength=max(num_bins, 1))
-    return counts / n_chan
+    bins, count = _spike_bins(frames, bin_size * samp_rate)
+    rows = channel_rows(spike_data["channel"], channelmap)
+    known = rows >= 0
+    pairs = np.unique(bins[known] * n_channels + rows[known])
+    return np.bincount(pairs // n_channels, minlength=count) / n_channels
 
 
 class Recording:

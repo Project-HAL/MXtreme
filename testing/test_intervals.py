@@ -111,6 +111,13 @@ def test_rank_turbulence_identity_is_zero_and_reversal_is_large():
         rank_turbulence(v, v[:10])
 
 
+def test_rank_turbulence_matches_published_distance_for_two_reversed_ranks():
+    result = rank_turbulence([2, 1], [1, 2], alpha=1)
+    contribution = np.sqrt(1 - 1 / 2)
+    normalizer = 2 * (np.sqrt(1 - 1 / 3) + np.sqrt(1 / 2 - 1 / 3))
+    assert result.divergence == pytest.approx(2 * contribution / normalizer)
+
+
 def test_from_table_aligns_phases_on_channel():
     table = pd.DataFrame({
         "channel": [1, 2, 3, 1, 2, 3], "phase": ["a"] * 3 + ["b"] * 3,

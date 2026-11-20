@@ -28,6 +28,7 @@ from collections.abc import Iterable, Sequence
 import numpy as np
 import pandas as pd
 
+from mxtreme.bursting.burst import burst_bounds
 from mxtreme.phases import Phase, Phases
 
 #: What :func:`burst_phases` can cut a recording into.
@@ -50,21 +51,14 @@ def burst_windows(bursts: pd.DataFrame, *, edges: str = "onset", kinds: Sequence
     """
     if edges not in ("onset", "group"):
         raise ValueError(f"edges must be 'onset' or 'group', not {edges!r}")
-    df = bursts.copy()
+    df = bursts
     if df.empty:
         return pd.DataFrame(columns=list(WINDOW_COLUMNS))
     if "ignore" in df.columns:
         df = df[~df["ignore"].astype(bool)]
     if kinds is not None and "kind" in df.columns:
         df = df[df["kind"].isin(list(kinds))]
-    start = df["group_start_frame"].to_numpy(dtype=np.int64)
-    end = df["group_stop_frame"].to_numpy(dtype=np.int64)
-    if edges == "onset" and "onset_frame" in df.columns:
-        onset = df["onset_frame"].to_numpy(dtype=np.int64)
-        offset = df["offset_frame"].to_numpy(dtype=np.int64)
-        has = (onset >= 0) & (offset >= onset)
-        start = np.where(has, onset, start)
-        end = np.where(has, offset, end)
+    start, end, _ = burst_bounds(df, features=edges == "onset")
     out = pd.DataFrame({
         "id": df["id"].to_numpy(),
         "kind": df["kind"].to_numpy() if "kind" in df.columns else "network",
@@ -175,91 +169,51 @@ def _event_dict(message) -> dict:
     return d if isinstance(d, dict) else {}
 
 
-def stim_amplitudes(windows, eventtime, event_messages) -> np.ndarray:
-    """The stimulus amplitude of each episode, in mV: ``(n,)`` float, NaN where the file says none.
+def stim_episode_metadata(windows, eventtime, event_messages) -> tuple[np.ndarray, list, list]:
+    """Return amplitudes in mV, electrode IDs, and roles for inclusive episode windows.
 
-    Each ``start_stimulation`` event the stimulation script writes carries the pulse's ``amp_mV``
-    (``Recording.eventtime`` / ``Recording.event_messages``). An episode -- a row of
-    :func:`stim_windows` -- takes the largest magnitude among the pulses that start inside it, so
-    a train of equal pulses is that amplitude and a ramp reports its peak.
+    Each episode uses the largest absolute amplitude, the union of electrodes, and
+    the distinct roles joined by "+". Missing fields are NaN, None, and None.
     """
     windows = np.asarray(windows, dtype=np.int64).reshape(-1, 2)
-    out = np.full(len(windows), np.nan)
+    amplitudes = np.full(len(windows), np.nan)
+    electrodes = [None] * len(windows)
+    roles = [None] * len(windows)
     if not len(windows) or eventtime is None or event_messages is None:
-        return out
-    times, amps = [], []
-    for t, m in zip(np.asarray(eventtime).ravel(), np.asarray(event_messages, dtype=object).ravel()):
-        d = _event_dict(m)
-        if "start_stimulation" not in d or "amp_mV" not in d:
-            continue
-        try:
-            amps.append(abs(float(d["amp_mV"])))
-        except (TypeError, ValueError):
-            continue
-        times.append(int(t))
-    if not times:
-        return out
-    times, amps = np.asarray(times), np.asarray(amps)
-    order = np.argsort(times)
-    times, amps = times[order], amps[order]
-    lo = np.searchsorted(times, windows[:, 0], side="left")
-    hi = np.searchsorted(times, windows[:, 1], side="right")
-    for k, (a, b) in enumerate(zip(lo, hi)):
-        if b > a:
-            out[k] = amps[a:b].max()
-    return out
+        return amplitudes, electrodes, roles
 
+    pulses = []
+    for time, message in zip(np.ravel(eventtime), np.ravel(event_messages)):
+        event = _event_dict(message)
+        if "start_stimulation" in event:
+            pulses.append((int(time), event))
+    pulses.sort(key=lambda pulse: pulse[0])
+    times = [time for time, _ in pulses]
+    starts = np.searchsorted(times, windows[:, 0])
+    stops = np.searchsorted(times, windows[:, 1], side="right")
 
-def stim_electrodes(windows, eventtime, event_messages) -> list:
-    """The electrodes each episode stimulated through: one ``list[int]`` per row of
-    :func:`stim_windows`, ``None`` where its events do not say.
-
-    Read from the ``elecs`` field of the ``start_stimulation`` events (comma-separated electrode
-    numbers), which a protocol that stimulates different electrodes at different moments writes
-    so each presentation names its own; a recording-wide ``Recording.stim_elecs`` cannot say which
-    of them a given stimulus used. An episode takes the union over the pulses starting inside it.
-    """
-    windows = np.asarray(windows, dtype=np.int64).reshape(-1, 2)
-    out: list = [None] * len(windows)
-    if not len(windows) or eventtime is None or event_messages is None:
-        return out
-    rows = []
-    for t, m in zip(np.asarray(eventtime).ravel(), np.asarray(event_messages, dtype=object).ravel()):
-        d = _event_dict(m)
-        if "start_stimulation" not in d or "elecs" not in d:
-            continue
-        try:
-            rows.append((int(t), [int(e) for e in str(d["elecs"]).replace(" ", "").split(",") if e]))
-        except ValueError:
-            continue
-    if not rows:
-        return out
-    rows.sort(key=lambda r: r[0])
-    times = np.asarray([r[0] for r in rows])
-    lo = np.searchsorted(times, windows[:, 0], side="left")
-    hi = np.searchsorted(times, windows[:, 1], side="right")
-    for k, (a, b) in enumerate(zip(lo, hi)):
-        if b > a:
-            out[k] = list(dict.fromkeys(e for _, els in rows[a:b] for e in els))
-    return out
-
-
-def stim_roles(windows, eventtime, event_messages) -> list:
-    """What each episode was, by the ``role`` field of its ``start_stimulation`` events (a
-    protocol's name for the site, e.g. ``"US"``): one ``str`` per row of :func:`stim_windows`,
-    roles of several pulses joined with ``+``, ``None`` where the events give none."""
-    windows = np.asarray(windows, dtype=np.int64).reshape(-1, 2)
-    out: list = [None] * len(windows)
-    if not len(windows) or eventtime is None or event_messages is None:
-        return out
-    rows = sorted((int(t), str(d["role"])) for t, d in ((t, _event_dict(m)) for t, m in zip(np.asarray(eventtime).ravel(), np.asarray(event_messages, dtype=object).ravel()))
-                  if "start_stimulation" in d and d.get("role"))
-    if not rows:
-        return out
-    times = np.asarray([r[0] for r in rows])
-    lo = np.searchsorted(times, windows[:, 0], side="left")
-    hi = np.searchsorted(times, windows[:, 1], side="right")
-    for k, (a, b) in enumerate(zip(lo, hi)):
-        if b > a:
-            out[k] = "+".join(dict.fromkeys(r for _, r in rows[a:b]))
-    return out
+    for i, (start, stop) in enumerate(zip(starts, stops)):
+        amps, sites, labels = [], {}, {}
+        for _, event in pulses[start:stop]:
+            try:
+                amp = abs(float(event.get("amp_mV")))
+                if np.isfinite(amp):
+                    amps.append(amp)
+            except (TypeError, ValueError):
+                pass
+            if "elecs" in event:
+                try:
+                    ids = [int(x) for x in str(event["elecs"]).split(",") if x.strip()]
+                except ValueError:
+                    pass
+                else:
+                    sites.update(dict.fromkeys(ids))
+            if event.get("role"):
+                labels[str(event["role"])] = None
+        if amps:
+            amplitudes[i] = max(amps)
+        if sites:
+            electrodes[i] = list(sites)
+        if labels:
+            roles[i] = "+".join(labels)
+    return amplitudes, electrodes, roles

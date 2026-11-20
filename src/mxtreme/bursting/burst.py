@@ -64,6 +64,20 @@ def _window(frameno, lo, hi) -> tuple[int, int]:
     return i0, i1
 
 
+def burst_bounds(table, *, features: bool = True) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return inclusive start and stop frames, plus a mask of requested feature fallbacks."""
+    start = table["group_start_frame"].to_numpy(dtype=np.int64)
+    stop = table["group_stop_frame"].to_numpy(dtype=np.int64)
+    fallback = np.full(len(table), features, dtype=bool)
+    if features and {"onset_frame", "offset_frame"} <= set(table.columns):
+        onset = table["onset_frame"].to_numpy(dtype=np.int64)
+        offset = table["offset_frame"].to_numpy(dtype=np.int64)
+        fallback = (onset < 0) | (offset < onset)
+        start = np.where(fallback, start, onset)
+        stop = np.where(fallback, stop, offset)
+    return start, stop, fallback
+
+
 def _local_noise_floor(asdr, group_start_bin, group_stop_bin) -> float:
     """Local noise floor of the rate over a spike group: its MAD, scaled to a std estimate.
 

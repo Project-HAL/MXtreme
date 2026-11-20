@@ -1,10 +1,10 @@
 """Rank-turbulence divergence between two rankings of the same elements.
 
-Dodds et al. 2020, *Allotaxonometry and rank-turbulence divergence: a universal instrument for
-comparing complex systems* (arXiv:2002.09770). Two systems rank the same types; the divergence
+Dodds et al. 2023, *Allotaxonometry and rank-turbulence divergence: a universal instrument for
+comparing complex systems* (doi:10.1140/epjds/s13688-023-00400-x). Two systems rank the same types; the divergence
 sums, over types, how far each one's rank moved::
 
-    D_alpha(A || B)  ~  sum_i | 1/r_i,A^alpha  -  1/r_i,B^alpha |
+    D_alpha(A || B)  ~  sum_i | 1/r_i,A^alpha  -  1/r_i,B^alpha |^(1/(alpha+1))
 
 normalised to ``[0, 1]`` by the divergence of two systems that share no types. ``alpha`` tunes how
 much the top of the rankings dominates: ``0`` is the limit that compares log ranks evenly, ``1/3``
@@ -57,19 +57,11 @@ def ranks(values) -> np.ndarray:
     return out
 
 
-def _f(r: np.ndarray, alpha: float) -> np.ndarray:
-    return np.log(r) if alpha == 0 else 1.0 / np.power(r, alpha)
-
-
-def _normalisation(n: int, alpha: float) -> float:
-    """The divergence of two disjoint systems of ``n`` types each.
-
-    In Dodds et al. a type absent from one system takes the rank just past that system's last
-    type, ``n + 1/2``, so every type contributes ``|f(i) - f(n + 1/2)|`` from one side or the
-    other -- the largest reshuffle possible for two systems of this size.
-    """
-    i = np.arange(1, n + 1, dtype=float)
-    return float(2.0 * np.abs(_f(i, alpha) - _f(np.full(n, n + 0.5), alpha)).sum())
+def _rank_distance(a, b, alpha: float) -> np.ndarray:
+    """Dodds et al. equation 7, omitting the factor that cancels in equation 8."""
+    if alpha == 0:
+        return np.abs(np.log(a / b))
+    return np.abs(np.power(a, -alpha) - np.power(b, -alpha)) ** (1 / (1 + alpha))
 
 
 def rank_turbulence(values_a, values_b, *, alpha: float = 1 / 3, ids=None) -> RankTurbulence:
@@ -85,20 +77,21 @@ def rank_turbulence(values_a, values_b, *, alpha: float = 1 / 3, ids=None) -> Ra
     b = np.asarray(values_b, dtype=float)
     if a.shape != b.shape:
         raise ValueError(f"values_a and values_b must align, got {a.shape} and {b.shape}")
-    if alpha < 0:
-        raise ValueError(f"alpha must be >= 0, got {alpha}")
+    if not np.isfinite(alpha) or alpha < 0:
+        raise ValueError(f"alpha must be finite and >= 0, got {alpha}")
     ok = np.isfinite(a) & np.isfinite(b)
     ids = np.arange(len(a)) if ids is None else np.asarray(ids)
-    ra, rb = ranks(np.where(ok, a, np.nan)), ranks(np.where(ok, b, np.nan))
-    n = int(ok.sum())
-    contrib = np.zeros(len(a))
-    if n:
-        contrib[ok] = np.abs(_f(ra[ok], alpha) - _f(rb[ok], alpha))
+    ra, rb = ranks(a[ok]), ranks(b[ok])
+    n = len(ra)
+    contrib = _rank_distance(ra, rb, alpha)
     total = float(contrib.sum())
-    norm = _normalisation(n, alpha) if n else 0.0
+    # In the disjoint reference each list retains its ranks (including ties).
+    absent_rank = 1.5 * n
+    norm = (_rank_distance(ra, absent_rank, alpha).sum()
+            + _rank_distance(rb, absent_rank, alpha).sum()) if n else 0.0
     table = pd.DataFrame({
-        "id": ids[ok], "value_a": a[ok], "value_b": b[ok], "rank_a": ra[ok], "rank_b": rb[ok],
-        "contribution": contrib[ok], "share": contrib[ok] / total if total > 0 else 0.0,
+        "id": ids[ok], "value_a": a[ok], "value_b": b[ok], "rank_a": ra, "rank_b": rb,
+        "contribution": contrib, "share": contrib / total if total > 0 else 0.0,
     }).sort_values("share", ascending=False, kind="stable").reset_index(drop=True)
     return RankTurbulence(divergence=total / norm if norm > 0 else 0.0, alpha=alpha, n=n, table=table)
 

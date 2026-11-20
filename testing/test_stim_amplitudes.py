@@ -1,6 +1,6 @@
 import numpy as np
 
-from mxtreme.analysis.intervals import stim_amplitudes, stim_electrodes, stim_roles, stim_windows
+from mxtreme.analysis.intervals import stim_episode_metadata, stim_windows
 
 
 def test_each_episode_takes_its_pulses_amplitude():
@@ -15,14 +15,14 @@ def test_each_episode_takes_its_pulses_amplitude():
         msgs += [{"amp_mV": str(a), "start_stimulation": "pulse0"}, repr({"amp_mV": str(a), "end_stimulation": "pulse0"})]
     w = stim_windows(frames, 20_000.0)
     assert len(w) == 2
-    out = stim_amplitudes(w, np.array(times), np.array(msgs, dtype=object))
+    out = stim_episode_metadata(w, times, msgs)[0]
     np.testing.assert_allclose(out, [100.0, 300.0])
 
 
 def test_no_amplitude_is_nan():
     w = np.array([[10, 20]])
-    assert np.isnan(stim_amplitudes(w, np.array([10]), np.array([{"start_stimulation": "x"}], dtype=object))).all()
-    assert stim_amplitudes(np.zeros((0, 2)), None, None).shape == (0,)
+    assert np.isnan(stim_episode_metadata(w, [10], [{"start_stimulation": "x"}])[0]).all()
+    assert stim_episode_metadata([], None, None)[0].shape == (0,)
 
 
 def test_each_episode_names_its_electrodes():
@@ -36,8 +36,8 @@ def test_each_episode_names_its_electrodes():
         {"start_stimulation": "pair", "amp_mV": "170", "elecs": "10,11"},
     ]
     w = stim_windows(frames, 10_000.0)
-    assert stim_electrodes(w, np.array(times), np.array(msgs, dtype=object)) == [[10, 11], [20, 21], [20, 21, 10, 11]]
-    assert stim_electrodes(w, np.array([1000]), np.array([{"start_stimulation": "x"}], dtype=object)) == [None, None, None]
+    assert stim_episode_metadata(w, times, msgs)[1] == [[10, 11], [20, 21], [20, 21, 10, 11]]
+    assert stim_episode_metadata(w, [1000], [{"start_stimulation": "x"}])[1] == [None, None, None]
     for m, r in zip(msgs, ["CS", "US", "US", "CS"]):
         m["role"] = r
-    assert stim_roles(w, np.array(times), np.array(msgs, dtype=object)) == ["CS", "US", "US+CS"]
+    assert stim_episode_metadata(w, times, msgs)[2] == ["CS", "US", "US+CS"]

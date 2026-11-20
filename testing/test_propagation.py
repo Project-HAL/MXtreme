@@ -165,12 +165,11 @@ def test_burst_shape_rise_fall_and_envelope():
     res = pr.burst_shape(frames, rows, xy, HZ, np.array([[on, on + 700]]), pre_ms=20, post_ms=50, bin_ms=1.0, span_ms=100.0, points=24)
     assert res["peak_hz"][0] == pytest.approx(200.0)  # 20 spikes per ms over 100 channels
     assert res["rise_ms"][0] == pytest.approx(8.0, abs=1.0) and res["fall_ms"][0] == pytest.approx(32.0, abs=2.0)
-    assert res["rise_hz_per_ms"][0] > 3 * res["fall_hz_per_ms"][0]
     assert res["envelope"].shape == (1, 24) and res["envelope_ms"][0] == -20.0 and res["envelope_ms"][-1] == 100.0
     assert res["envelope"][0, :4].sum() == 0 and res["envelope"][0].max() == pytest.approx(200.0)
     assert res["envelope"][0].sum() * 5 / 1000 * n_chan == pytest.approx(len(frames))  # 5 ms bins hold every spike
     # the rate never under 10% before the peak inside the window: no rise to report
     cut = pr.burst_shape(frames, rows, xy, HZ, np.array([[on + 150, on + 700]]), pre_ms=5, post_ms=50, bin_ms=1.0)
-    assert np.isnan(cut["rise_ms"][0]) and np.isnan(cut["rise_hz_per_ms"][0]) and cut["fall_ms"][0] > 0
+    assert np.isnan(cut["rise_ms"][0]) and cut["fall_ms"][0] > 0
     empty = pr.burst_shape(frames, rows, xy, HZ, np.array([[90000, 90100]]))
     assert np.isnan(empty["peak_hz"][0]) and empty["engaged"][0] == 0 and not empty["envelope"].any()

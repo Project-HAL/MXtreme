@@ -82,6 +82,8 @@ _EXP_TAIL = re.compile(r"_DIV_\d+_(?P<experiment>.+?)\.raw\.h5$")
 #: A recording named the way files were before the store's layout, and still are by tools that
 #: record on their own (``DIV21_261013_M09473_CAIT.raw.h5``): its experiment is the tail.
 _FLAT_EXP_NAME = re.compile(r"^DIV\d+_\d{6}_[^_]+_(?P<experiment>.+?)\.raw\.h5$")
+_OLD_WELL_DIR = re.compile(r"^well_(\d+)$")
+_DIV_DIR = re.compile(r"^DIV_(\d+)$")
 
 #: Plating dates are ``YYMMDD``, matching :func:`mxtreme.scans.mx_setup.write_metadata`.
 #: The wells a store file holds, from its name (see :func:`well_token`).
@@ -405,6 +407,27 @@ class RecordingLocation:
     experiment: str
 
 
+def _recording_directory(
+    h5_path: Path, recordings_dir: str | Path, *, legacy: bool = False,
+) -> tuple[Batch, int, str, str, int] | None:
+    try:
+        parts = h5_path.relative_to(recordings_dir).parts[:-1]
+    except ValueError:
+        return None
+    if legacy and len(parts) == 4 and _OLD_WELL_DIR.fullmatch(parts[2]):
+        parts = (parts[0], parts[1], parts[3])
+    if len(parts) != 3:
+        return None
+    plating, chip, div = (_PLATING_DIR.match(parts[0]), _CHIP_DIR.match(parts[1]), _DIV_DIR.fullmatch(parts[2]))
+    if not (plating and chip and div):
+        return None
+    try:
+        batch = Batch.parse(plating["batch_id"])
+    except ValueError:
+        return None
+    return batch, int(plating["plate_date"]), chip["chip"], chip["system"], int(div[1])
+
+
 def parse_recording_path(h5_path: Path, recordings_dir: Path) -> RecordingLocation | None:
     """Read a file's identity back out of its path in the recordings tree.
 
@@ -416,21 +439,11 @@ def parse_recording_path(h5_path: Path, recordings_dir: Path) -> RecordingLocati
     :param recordings_dir: The tree root (``config.recordings_dir``).
     :returns: The parsed identity, or ``None`` if the path does not follow the layout.
     """
-    try:
-        plating, chip_part, div_part = h5_path.relative_to(recordings_dir).parts[:-1]
-    except ValueError:
-        return None
-
-    plating_match = _PLATING_DIR.match(plating)
-    chip_match = _CHIP_DIR.match(chip_part)
-    div_match = re.match(r"^DIV_(\d+)$", div_part)
+    directory = _recording_directory(h5_path, recordings_dir)
     wells_match = _WELLS_IN_NAME.search(h5_path.name)
-    if not (plating_match and chip_match and div_match and wells_match):
+    if directory is None or wells_match is None:
         return None
-    try:
-        batch = Batch.parse(plating_match["batch_id"])
-    except ValueError:
-        return None
+    batch, plate_date, chip, system, div = directory
 
     kind = recording_kind(h5_path)
     experiment = ""
@@ -442,11 +455,11 @@ def parse_recording_path(h5_path: Path, recordings_dir: Path) -> RecordingLocati
 
     return RecordingLocation(
         batch=batch,
-        plate_date=int(plating_match["plate_date"]),
-        chip=chip_match["chip"],
-        system=chip_match["system"],
+        plate_date=plate_date,
+        chip=chip,
+        system=system,
         wells=parse_well_token(wells_match["wells"]),
-        div=int(div_match.group(1)),
+        div=div,
         kind=kind,
         experiment=experiment,
     )
@@ -491,28 +504,15 @@ def filed_metadata(h5_path: str | Path, recordings_dir: str | Path) -> dict | No
         path does not follow the layout.
     """
     h5_path = Path(h5_path)
-    try:
-        parts = h5_path.relative_to(recordings_dir).parts[:-1]
-    except ValueError:
+    directory = _recording_directory(h5_path, recordings_dir, legacy=True)
+    if directory is None:
         return None
-    if len(parts) == 4 and re.match(r"^well_\d+$", parts[2]):
-        parts = (parts[0], parts[1], parts[3])
-    if len(parts) != 3:
-        return None
-    plating_match = _PLATING_DIR.match(parts[0])
-    chip_match = _CHIP_DIR.match(parts[1])
-    div_match = re.match(r"^DIV_(\d+)$", parts[2])
-    if not (plating_match and chip_match and div_match):
-        return None
-    try:
-        batch = Batch.parse(plating_match["batch_id"])
-    except ValueError:
-        return None
+    batch, plate_date, chip, _, div = directory
     return {
         "Batch ID": batch.id,
-        "Plate date": int(plating_match["plate_date"]),
-        "Chip ID": chip_match["chip"],
-        "DIV": int(div_match.group(1)),
+        "Plate date": plate_date,
+        "Chip ID": chip,
+        "DIV": div,
         "Experiment": experiment_name(h5_path),
     }
 
@@ -1774,8 +1774,6 @@ class Relayout:
     pruned_dirs: tuple[Path, ...]
 
 
-_OLD_WELL_DIR = re.compile(r"^well_(\d+)$")
-_DIV_DIR = re.compile(r"^DIV_(\d+)$")
 _OLD_TAIL = re.compile(r"_DIV_\d+_(?P<tail>.+?)\.raw\.h5$")
 
 #: Pieces of one recording were written by one ``start_recording``; their first recordings start

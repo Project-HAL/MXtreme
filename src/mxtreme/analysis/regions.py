@@ -207,7 +207,9 @@ def region_rates(
     if stop <= start:
         raise ValueError("stop must be after start")
     n_bins = max(1, int((stop - start) // bin_frames))
-    i0, i1 = np.searchsorted(frames, [start, start + n_bins * bin_frames])
+    # Use full bins when available. A shorter interval has one bin of its actual duration.
+    end = min(stop, start + n_bins * bin_frames)
+    i0, i1 = np.searchsorted(frames, [start, end])
     col = ((frames[i0:i1] - start) / bin_frames).astype(np.int64)
     col = np.minimum(col, n_bins - 1)
     r = rows[i0:i1]
@@ -215,7 +217,7 @@ def region_rates(
     n_channels = np.zeros(len(regions), dtype=np.int64)
     if cm.size == 0:
         return rates, n_channels
-    per_sec = 1000.0 / float(bin_ms)
+    per_sec = samp_rate / min(bin_frames, stop - start)
     for k, region in enumerate(regions):
         inside = region.contains(cm[:, 3], cm[:, 4])
         n_channels[k] = int(inside.sum())
@@ -226,55 +228,17 @@ def region_rates(
     return rates, n_channels
 
 
-def _zscore(rates: np.ndarray) -> np.ndarray:
-    """Rows to zero mean and unit variance; a row that never varies (or is ``NaN``) becomes ``NaN``."""
-    x = np.asarray(rates, dtype=float)
-    sd = x.std(axis=1, keepdims=True)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        z = (x - x.mean(axis=1, keepdims=True)) / sd
-    z[~np.isfinite(sd[:, 0]) | (sd[:, 0] == 0)] = np.nan
-    return z
+def region_correlation(rates) -> dict[str, np.ndarray]:
+    """Zero-lag Pearson correlation with NaN rows and columns for inactive regions."""
+    from mxtreme.analysis.network import _correlation
 
-
-def region_correlation(rates, *, max_lag: int = 0) -> dict[str, np.ndarray]:
-    """Pearson correlation between every pair of region rates (rows of ``rates``).
-
-    :param rates: ``(n_regions, n_bins)``, as :func:`region_rates` returns.
-    :param max_lag: In bins. Above zero, the rates are also correlated at every shift up to
-        that many bins either way, which finds where the coupling peaks when one region
-        follows the other.
-    :returns: ``{"r": (n, n)}`` -- the zero-lag correlation, ``NaN`` for a region that never
-        varies -- and with ``max_lag`` also ``"peak_r"`` and ``"peak_lag"`` (bins, ``(n, n)``):
-        the largest correlation over the lags and the shift it is at. ``peak_lag[i, j] > 0``
-        means region ``j`` follows region ``i`` by that many bins. Each lagged correlation uses
-        the whole window's means and variances over the overlapping bins, the usual estimate
-        when the lags are short against the window.
-    """
-    z = _zscore(rates)
-    n, t = z.shape
-    ok = np.isfinite(z).all(axis=1)
-    zz = np.where(ok[:, None], z, 0.0)
-    r = (zz @ zz.T) / max(t, 1)
-    r[~ok, :] = np.nan
-    r[:, ~ok] = np.nan
-    out = {"r": r}
-    max_lag = int(max_lag)
-    if max_lag > 0:
-        max_lag = min(max_lag, max(t - 2, 0))
-        best = r.copy()
-        lag = np.zeros((n, n), dtype=np.int64)
-        for L in range(1, max_lag + 1):
-            # c[i, j] at +L: region i at time s against region j at s + L (j follows i).
-            c = (zz[:, :-L] @ zz[:, L:].T) / (t - L)
-            for cc, sign in ((c, 1), (c.T, -1)):
-                better = cc > best
-                best = np.where(better, cc, best)
-                lag = np.where(better, sign * L, lag)
-        best[~ok, :] = np.nan
-        best[:, ~ok] = np.nan
-        out["peak_r"] = best
-        out["peak_lag"] = lag
-    return out
+    rates = np.asarray(rates, dtype=float)
+    result = np.full((len(rates), len(rates)), np.nan)
+    if rates.shape[1] > 1:
+        corr, keep = _correlation(rates)
+        result[np.ix_(keep, keep)] = corr
+        result[keep, keep] = 1.0
+    return {"r": result}
 
 
 def region_correlation_course(rates, *, window: int, step: int | None = None) -> tuple[np.ndarray, np.ndarray]:

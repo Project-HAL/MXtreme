@@ -172,6 +172,27 @@ def fig_to_array(fig):
     plt.close(fig)
     return composite_img
 
+def channel_rows(channels, channelmap) -> np.ndarray:
+    """Translate channel IDs to channel-map row positions. Unmapped channels are -1."""
+    channels = np.asarray(channels, dtype=np.int64)
+    mapped = np.asarray(channelmap)[:, 1].astype(np.int64)
+    if not mapped.size:
+        return np.full(channels.shape, -1, dtype=np.intp)
+    order = np.argsort(mapped)
+    mapped = mapped[order]
+    positions = np.searchsorted(mapped, channels).clip(max=len(mapped) - 1)
+    return np.where(mapped[positions] == channels, order[positions], -1)
+
+
+def _spike_bins(frames, frames_per_bin: float) -> tuple[np.ndarray, int]:
+    """Return bin indices and count using the preprocessed matrix's endpoint convention."""
+    if not len(frames):
+        return np.empty(0, dtype=np.int64), 0
+    count = max(1, int(np.ceil(np.max(frames) / frames_per_bin)))
+    indices = (frames / frames_per_bin).astype(np.int64).clip(0, count - 1)
+    return indices, count
+
+
 def frame_to_bin(t_frame, samp_rate, bin_size):
     return int(t_frame/samp_rate/bin_size)
 

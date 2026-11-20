@@ -28,21 +28,17 @@ def test_rates_are_per_electrode_and_empty_regions_are_nan():
     assert np.isnan(rates[2]).all()
 
 
-def test_lagged_coupling_is_found_with_its_direction():
-    rng = np.random.default_rng(0)
-    a = rng.poisson(2.0, 4000).astype(float)
-    b = np.roll(a, 3) + rng.normal(0, 0.1, 4000)  # B follows A by 3 bins
-    noise = rng.normal(0, 1, 4000)
-    res = region_correlation(np.vstack([a, b, noise]), max_lag=5)
-    assert res["r"][0, 1] < 0.2
-    assert res["peak_r"][0, 1] > 0.95
-    assert res["peak_lag"][0, 1] == 3 and res["peak_lag"][1, 0] == -3
-    np.testing.assert_allclose(res["r"], res["r"].T)
-    assert abs(res["r"][0, 2]) < 0.1
+def test_short_rate_window_excludes_spikes_at_and_beyond_stop():
+    rates, _ = region_rates(
+        [10, 20, 100, 120], [0, 0, 0, 0], _map([10]), _regions(),
+        FS, start=0, stop=100, bin_ms=10,
+    )
+    np.testing.assert_allclose(rates[0], [400])
 
 
 def test_a_flat_region_correlates_with_nothing():
     res = region_correlation(np.vstack([np.arange(10.0), np.zeros(10)]))
+    assert res["r"][0, 0] == 1.0
     assert np.isnan(res["r"][1]).all() and np.isnan(res["r"][:, 1]).all()
 
 

@@ -7,27 +7,18 @@ from collections.abc import Sequence
 import numpy as np
 
 from mxtreme.analysis.intervals import burst_windows
+from mxtreme.utils import channel_rows
 
 
 def spike_arrays(rec) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """A recording's spikes as ``(frames, rows, xy)``: frames ascending, each spike's row in the
-    channel map, and the rows' ``(x, y)`` in µm. Spikes on channels the map does not list are
-    dropped, as :func:`mxtreme.clean.bin_spikes` drops them."""
-    sd = rec.spike_data
-    frames = np.asarray(sd["frameno"], dtype=np.int64)
-    chan = np.asarray(sd["channel"], dtype=np.int64)
+    """Return sorted spike frames, mapped channel rows, and channel positions in µm."""
+    spikes = rec.spike_data
+    frames = np.asarray(spikes["frameno"], dtype=np.int64)
+    rows = channel_rows(spikes["channel"], rec.channelmap)
+    known = rows >= 0
+    frames, rows = frames[known], rows[known]
     order = np.argsort(frames, kind="stable")
-    frames, chan = frames[order], chan[order]
-    cm = np.asarray(rec.channelmap, dtype=float)
-    chans = cm[:, 1].astype(np.int64)
-    xy = cm[:, 3:5].copy()
-    if not chans.size:
-        return frames[:0], np.empty(0, dtype=np.int64), xy
-    by_channel = np.argsort(chans)
-    sorted_channels = chans[by_channel]
-    positions = np.searchsorted(sorted_channels, chan).clip(max=chans.size - 1)
-    known = sorted_channels[positions] == chan
-    return frames[known], by_channel[positions[known]].astype(np.int64), xy
+    return frames[order], rows[order], np.asarray(rec.channelmap)[:, 3:5].copy()
 
 
 def burst_spans(bursts, *, kinds: Sequence[str] | None = ("network",)) -> tuple[np.ndarray, np.ndarray]:
@@ -58,7 +49,7 @@ def _first_spikes(frames, rows, start: int, stop: int) -> tuple[np.ndarray, np.n
 
 #: What :func:`burst_shape` reports per burst, beside the envelope.
 BURST_SHAPE = (
-    "engaged", "heading_deg", "heading_r2", "heading_p", "peak_hz", "rise_ms", "fall_ms", "rise_hz_per_ms", "fall_hz_per_ms",
+    "engaged", "heading_deg", "heading_r2", "heading_p", "peak_hz", "rise_ms", "fall_ms",
 )
 
 
@@ -100,8 +91,6 @@ def burst_shape(
       time after that it reached 90%; ``fall_ms``: from the last time it was at 90% to the first
       time after the peak it was back under 10%. Both read between bins by straight lines, and
       are ``nan`` when the window never shows the rate under 10% on that side;
-    - ``rise_hz_per_ms`` / ``fall_hz_per_ms``: the slopes those stand for, 80% of the peak over
-      the time taken.
 
     And, for drawing every burst on one axis, ``envelope``: an ``(n, points)`` array of the
     population rate (same units, not smoothed) from ``pre_ms`` before each burst's onset to
@@ -146,8 +135,6 @@ def burst_shape(
             for name, edge in (("rise", rising), ("fall", falling)):
                 elapsed_ms = _rise_bins(edge, peak) * bin_ms
                 out[f"{name}_ms"][k] = elapsed_ms
-                if elapsed_ms > 0:
-                    out[f"{name}_hz_per_ms"][k] = 0.8 * peak / elapsed_ms
 
         # how much of the array, and which way
         cc, first = _first_spikes(f, ch, on, off)

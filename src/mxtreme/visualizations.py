@@ -30,6 +30,7 @@ from scipy.ndimage import gaussian_filter
 from scipy.spatial.distance import cdist
 
 from mxtreme import device
+from mxtreme.bursting.burst import burst_bounds
 
 
 def MEA(channelmap, ax=None, stim_elecs=None, title="MEA Channel Layout", marker_size=36, stim_fontsize=16):
@@ -279,26 +280,21 @@ def _burst_spans_frames(burst_df, span="isi_n"):
     """
     if span not in _SPAN_COLUMNS:
         raise ValueError(f"span must be one of {sorted(_SPAN_COLUMNS)}, not {span!r}")
-    group_start = burst_df["group_start_frame"].to_numpy()
-    group_stop = burst_df["group_stop_frame"].to_numpy()
     if span == "isi_n":
-        return group_start, group_stop, np.zeros(len(burst_df), dtype=bool)
+        return burst_bounds(burst_df, features=False)
 
     start_col, stop_col = _SPAN_COLUMNS["features"]
     if start_col not in burst_df.columns or stop_col not in burst_df.columns:
         raise ValueError(f"burst_df has no {start_col}/{stop_col} columns; run "
                          "BurstSet.extract_features(rec, ...) first, or pass span='isi_n'.")
-    onset = burst_df[start_col].to_numpy()
-    offset = burst_df[stop_col].to_numpy()
-    fell_back = (onset < 0) | (offset < 0)
+    start, stop, fell_back = burst_bounds(burst_df)
     if fell_back.all():
         raise ValueError("No burst in burst_df has an extracted onset/offset (all -1); run "
                          "BurstSet.extract_features(rec, ...) first, or pass span='isi_n'.")
     if fell_back.any():
         print(f"span='features': {fell_back.sum()} of {len(burst_df)} bursts have no extracted "
               "onset/offset; using their ISI-N bounds (marked in the figure).")
-    return (np.where(fell_back, group_start, onset), np.where(fell_back, group_stop, offset),
-            fell_back)
+    return start, stop, fell_back
 
 
 def _select(burst_df, kind, phase):
