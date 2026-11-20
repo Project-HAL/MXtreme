@@ -76,6 +76,19 @@ The root comes from a small TOML file so it never has to be hard-coded in librar
 root = "/abs/path/to/managed/store"
 ```
 
+The file may also name a directory of simulated recordings:
+
+```toml
+[simulations]
+dir = "/abs/path/to/simulations"
+```
+
+That is {attr}`~mxtreme.config.Config.simulations_dir`, and it is deliberately not under the root:
+simulations are not cultures, are never registered, and nothing in MXtreme writes there.
+{func}`mxtreme.io.load_simulation` reads one, filling the identity a simulation's file lacks
+(batch `sim`, the file's name as the chip, well 0, DIV 0) so the analysis functions take it like
+any recording.
+
 `root` may be relative or use `~`; it is expanded when loaded. `examples/mxtreme.toml` in the
 repository is a working template.
 

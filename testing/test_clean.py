@@ -101,6 +101,48 @@ def test_remove_stim_frames_drops_stim_window(make_well):
     assert well["preprocessing_params"]["post_stim_period"] == 0.0
 
 
+def test_blank_stim_pulses_keeps_the_activity_between_pulses():
+    import pandas as pd
+
+    sr, n = 10_000, 100
+    rng = np.random.default_rng(0)
+    # a train between markers at 10_000 and 11_000 (100 ms) with pulses at +0, +50 and +100 ms: every
+    # channel "fires" at each pulse; between them, three real spikes at +20, +30 and +70 ms
+    pulse_frames = [10_000, 10_500, 11_000]
+    rows = [(p + int(rng.integers(0, 5)), c, -50.0) for p in pulse_frames for c in range(n)]
+    rows += [(10_200, 3, -30.0), (10_300, 4, -30.0), (10_700, 5, -30.0), (5_000, 6, -30.0)]
+    well = {
+        "samp_rate": np.array([sr]),
+        "channelmap": np.column_stack([np.arange(n), np.arange(n)]),
+        "spike_data": pd.DataFrame(rows, columns=["frameno", "channel", "amplitude"]),
+        "eventtime": np.array([10_000, 11_000]),
+        "event_messages": [{"start_stimulation": "train"}, {"end_stimulation": "train"}],
+    }
+    clean.blank_stim_pulses(well, blank_ms=5.0)
+    kept = sorted(well["spike_data"]["frameno"].tolist())
+    assert kept == [5_000, 10_200, 10_300, 10_700]
+    blanked = set(well["stim_frames"].tolist())
+    assert {10_000, 10_500, 11_000} <= blanked and 10_200 not in blanked
+    assert well["preprocessing_params"]["stim_blanking"] == "pulses"
+
+
+def test_blank_stim_pulses_counts_distinct_routed_channels_and_blanks_start():
+    # Four spikes on one of 20 routed channels do not reach a 10% threshold.
+    # The weak start marker is still blanked.
+    well = {
+        "samp_rate": np.array([10_000]),
+        "channelmap": np.column_stack([np.arange(20), np.arange(20)]),
+        "spike_data": pd.DataFrame({
+            "frameno": [1_010, 1_200, 1_201, 1_202, 1_203],
+            "channel": [1, 2, 2, 2, 2],
+        }),
+        "eventtime": np.array([1_000, 1_250]),
+        "event_messages": [{"start_stimulation": "p"}, {"end_stimulation": "p"}],
+    }
+    clean.blank_stim_pulses(well, blank_ms=5.0, min_fraction=0.1)
+    assert well["spike_data"]["frameno"].tolist() == [1_200, 1_201, 1_202, 1_203]
+
+
 def test_bin_spikes_produces_matrix_and_rec_length(make_well):
     well = make_well()
     clean.remove_spurious_channels(well)   # ensure every spike channel is mapped

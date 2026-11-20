@@ -27,9 +27,14 @@ class Config:
     :param data_root: Root directory of the managed store. Outputs are written beneath it and read
         back from the same place. It is never silently defaulted to a lab-specific path -- callers
         must provide it (typically via :meth:`from_toml`).
+    :param simulations_dir: Where simulated recordings are kept, or ``None``. It is *not* part of
+        the store: simulations are not cultures, are never registered, and belong on the machine
+        that looks at them rather than beside the recordings (see
+        :func:`mxtreme.io.load_simulation`). Nothing in MXtreme writes there.
     """
 
     data_root: Path
+    simulations_dir: Path | None = None
 
     @property
     def recordings_dir(self) -> Path:
@@ -86,6 +91,11 @@ class Config:
             [data]
             root = "/abs/path/to/managed/store"
 
+        and may name a directory of simulated recordings, outside the store::
+
+            [simulations]
+            dir = "/abs/path/to/simulations"
+
         :param path: Path to the TOML configuration file.
         :type path: str or Path
         :raises FileNotFoundError: If ``path`` does not exist.
@@ -105,4 +115,5 @@ class Config:
         except KeyError as exc:
             raise KeyError("Config TOML must define [data].root (the managed-store directory).") from exc
 
-        return cls(data_root=Path(root).expanduser())
+        sims = (cfg.get("simulations") or {}).get("dir")
+        return cls(data_root=Path(root).expanduser(), simulations_dir=Path(sims).expanduser() if sims else None)

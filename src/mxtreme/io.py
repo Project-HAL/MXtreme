@@ -5,6 +5,7 @@ workflow the directories come from a :class:`mxtreme.config.Config` (e.g. ``conf
 
 Contents:
 - :func:`load_preprocessed` -- read a cleaned ``.npz`` back into a dict.
+- :func:`load_simulation` -- read a simulated recording into the same kind of dict.
 - :func:`save_preprocessed` -- write one well's cleaned data to an ``.npz`` (and register it).
 - :func:`register` -- record processed recordings in the registry CSV.
 - :func:`register_scan` -- record an activity or network scan in that same registry.
@@ -23,7 +24,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-
 #: Fields saved as shape-``(1,)`` arrays that are single numbers in a well dict.
 _SCALAR_FIELDS = ("samp_rate", "rec_t_sec")
 
@@ -39,7 +39,7 @@ def _unwrap(key: str, value: np.ndarray):
     return value
 
 
-def load_preprocessed(filepath: str | Path) -> dict:
+def load_preprocessed(filepath: str | Path, *, skip: tuple[str, ...] = ()) -> dict:
     """Load a preprocessed ``.npz`` produced by :func:`save_preprocessed`, as a well dict.
 
     ``.npz`` files can only hold arrays, so single values are saved wrapped: identity fields and
@@ -50,6 +50,11 @@ def load_preprocessed(filepath: str | Path) -> dict:
 
     :param filepath: Path to the ``.npz`` file.
     :type filepath: str or Path
+    :param skip: Saved fields to leave unread. ``np.load`` is lazy, so a skipped array is never
+        decompressed: ``skip=("spike_bin",)`` reads an hour-long recording's spikes in a fraction
+        of a second instead of inflating its binned matrix (gigabytes as ``float64`` in older
+        files). A :class:`~mxtreme.recording.Recording` built from such a dict derives its
+        ``asdr`` from the spikes and has ``spike_bin`` set to ``None``.
     :raises FileNotFoundError: If ``filepath`` does not exist.
     :returns: The saved fields keyed by name (e.g. ``spike_data``, ``channelmap``, ``samp_rate``).
     :rtype: dict
@@ -57,10 +62,61 @@ def load_preprocessed(filepath: str | Path) -> dict:
     if not os.path.isfile(filepath):
         raise FileNotFoundError(f"File does not exist: {filepath}")
     with np.load(filepath, allow_pickle=True) as saved:
-        well = {key: _unwrap(key, saved[key]) for key in saved.files}
+        well = {key: _unwrap(key, saved[key]) for key in saved.files if key not in skip}
     if well.get("preprocessing_params") is None:
         well["preprocessing_params"] = {}
     return _current_identity(well)
+
+
+#: The batch id a simulated recording is given: nothing a plating can be called, so a simulated
+#: recording can never be taken for one of a culture.
+SIMULATION_BATCH = "sim"
+
+
+def load_simulation(filepath: str | Path) -> dict:
+    """Load a simulated recording as a well dict a :class:`~mxtreme.recording.Recording` accepts.
+
+    A simulation's ``.npz`` carries the spikes in the store's own form -- ``spike_data``
+    (``frameno``, ``channel``, ``amplitude``), ``channelmap`` (``index, channel, electrode, x, y``)
+    and ``samp_rate`` -- and none of what a recording of a culture has besides: no identity, no
+    duration, no events, no binned matrix. This fills those in so the same analyses run on it:
+
+    - the identity is synthetic and says so: batch :data:`SIMULATION_BATCH`, chip the file's
+      stem, well 0, DIV 0, plate date ``"000000"``, and ``simulated`` is ``True``;
+    - ``rec_t_sec`` is the last spike's time, ``raw_start`` the first spike's frame;
+    - events, stimulation and the binned matrix are absent (a ``Recording`` derives its
+      ``asdr`` from the spikes, as for one loaded with ``skip=("spike_bin",)``);
+    - whatever else the file holds (``seed``, ``warmup_ms``, ``run_ms``, ...) is kept.
+
+    Nothing is written, here or by anything this returns to.
+
+    :param filepath: Path to the simulation's ``.npz``.
+    :raises FileNotFoundError: If ``filepath`` does not exist.
+    :raises KeyError: If the file lacks ``spike_data``, ``channelmap`` or ``samp_rate``.
+    """
+    filepath = Path(filepath)
+    if not filepath.is_file():
+        raise FileNotFoundError(f"File does not exist: {filepath}")
+    with np.load(filepath, allow_pickle=True) as saved:
+        missing = [k for k in ("spike_data", "channelmap", "samp_rate") if k not in saved.files]
+        if missing:
+            raise KeyError(f"{filepath.name} is not a simulated recording: it has no {', '.join(missing)}")
+        well = {key: _unwrap(key, saved[key]) for key in saved.files}
+    frames = well["spike_data"]["frameno"]
+    samp_rate = float(np.asarray(well["samp_rate"]).ravel()[0])
+    filled = {
+        "batch_id": SIMULATION_BATCH, "exp_id": SIMULATION_BATCH, "experiment": "", "chip": filepath.stem, "well": 0, "DIV": 0,
+        "plate_date": "000000", "path_to_h5": "", "exp_condition": None, "simulated": True,
+        "raw_start": int(frames.min()) if len(frames) else 0,
+        "rec_t_sec": np.float64(frames.max() / samp_rate) if len(frames) else np.float64(0.0),
+        "samp_rate": np.float64(samp_rate), "lsb": np.float64(1.0), "bin_size": 0.01,
+        "stim_elecs": np.array([], dtype=int), "stim_frames": np.array([], dtype=np.int64),
+        "eventtime": np.array([], dtype=np.int64), "event_messages": [], "preprocessing_params": {},
+    }
+    for key, value in filled.items():
+        if key not in well or key in ("samp_rate", "simulated"):
+            well[key] = value
+    return well
 
 
 def _current_identity(well: dict) -> dict:

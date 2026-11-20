@@ -9,12 +9,14 @@ entire recording.
 
 from __future__ import annotations
 
-from typing import Mapping, Optional
+from collections.abc import Mapping
+from functools import cached_property
 
 import numpy as np
 import pandas as pd
 
 from mxtreme.phases import Phases, PhaseSpec, phases_from_spec
+from mxtreme.utils import _spike_bins, channel_rows
 
 
 def _item(value):
@@ -26,6 +28,22 @@ def _item(value):
 def _scalar_float(value) -> float:
     """Return the first element of an array-like as a float (handles ``(1,)`` and scalar arrays)."""
     return float(np.asarray(value).ravel()[0])
+
+
+def asdr_from_spikes(spike_data, channelmap, samp_rate: float, bin_size: float) -> np.ndarray:
+    """The array-wide spike detection rate straight from the spike table.
+
+    Count each mapped channel once per bin without allocating a dense matrix.
+    """
+    frames = np.asarray(spike_data["frameno"], dtype=np.int64)
+    n_channels = len(channelmap)
+    if not n_channels:
+        return np.zeros(0, dtype=float)
+    bins, count = _spike_bins(frames, bin_size * samp_rate)
+    rows = channel_rows(spike_data["channel"], channelmap)
+    known = rows >= 0
+    pairs = np.unique(bins[known] * n_channels + rows[known])
+    return np.bincount(pairs // n_channels, minlength=count) / n_channels
 
 
 class Recording:
@@ -51,9 +69,9 @@ class Recording:
         self,
         id,
         exp_data: dict,
-        phases: Optional[Phases] = None,
+        phases: Phases | None = None,
         *,
-        phase_tags: Optional[PhaseSpec] = None,
+        phase_tags: PhaseSpec | None = None,
     ) -> None:
         self.id = id
 
@@ -73,7 +91,10 @@ class Recording:
         self.spike_data = exp_data["spike_data"]
         self.channelmap = exp_data["channelmap"]  # columns: index, channel, electrode, x, y
         self.stim_elecs = exp_data["stim_elecs"]
-        self.spike_bin = exp_data["spike_bin"]
+        # Absent when the dict was loaded with ``skip=("spike_bin",)`` (see
+        # :func:`mxtreme.io.load_preprocessed`): the matrix is the one field that does not fit in
+        # memory for a long recording, and everything below can be had without it.
+        self.spike_bin = exp_data.get("spike_bin")
         self.eventtime = exp_data["eventtime"]
         self.event_messages = exp_data["event_messages"]
         self.stim_frames = np.asarray(exp_data["stim_frames"]) if "stim_frames" in exp_data else None
@@ -84,7 +105,6 @@ class Recording:
         self.bin_size = float(_item(exp_data["bin_size"]))
 
         # --- derived views ---
-        self.asdr = self.spike_bin.mean(axis=0)  # array-wide spike detection rate (per bin)
         self.event_df = pd.DataFrame({"eventtime": self.eventtime, "eventmessage": self.event_messages})
 
         # --- phases ---
@@ -112,3 +132,10 @@ class Recording:
             )
         else:
             self.phases = Phases.full(start_frame, end_frame)
+
+    @cached_property
+    def asdr(self) -> np.ndarray:
+        """Fraction of mapped channels firing in each bin, computed on first access."""
+        if self.spike_bin is not None:
+            return self.spike_bin.mean(axis=0)
+        return asdr_from_spikes(self.spike_data, self.channelmap, self.samp_rate, self.bin_size)

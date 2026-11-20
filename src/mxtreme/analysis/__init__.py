@@ -18,15 +18,31 @@ Importing this package pulls in matplotlib (every submodule plots), so only impo
 to run analyses/plots -- not on the fast ``import mxtreme`` path.
 """
 
-from mxtreme.analysis import activity, network, performance, spatial, stimulation
+from mxtreme.analysis import (
+    activity,
+    channel_bursts,
+    intervals,
+    network,
+    performance,
+    propagation,
+    rank_turbulence,
+    regions,
+    spatial,
+    stimulation,
+)
 from mxtreme.analysis.report import DEFAULT_SECTIONS, generate_report
 
 __all__ = [
+    "DEFAULT_SECTIONS",
     "activity",
+    "channel_bursts",
+    "generate_report",
+    "intervals",
     "network",
     "performance",
+    "propagation",
+    "rank_turbulence",
+    "regions",
     "spatial",
     "stimulation",
-    "generate_report",
-    "DEFAULT_SECTIONS",
 ]

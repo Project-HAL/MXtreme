@@ -893,3 +893,28 @@ def test_ingest_wells_must_exist_and_a_scan_takes_no_experiment(tmp_path):
     with pytest.raises(ValueError, match="kind"):
         store.ingest_recording(src, config, kind="stimulation", experiment="x", **common)
     assert not (config.data_root / "recordings").exists()
+
+
+def test_experiment_name_reads_every_way_a_file_is_named():
+    assert store.experiment_name("plating_261013_fall2026_batch3_E18_chip_M09473_well_0_DIV_21_network_scan.raw.h5") == ""
+    assert store.experiment_name("plating_261013_fall2026_batch3_E18_chip_M09473_well_0-1_DIV_21_activity_scan_1.raw.h5") == ""
+    assert store.experiment_name("plating_261013_fall2026_batch3_E18_chip_M09473_well_0_DIV_21_dose_response.raw.h5") == "dose_response"
+    assert store.experiment_name("DIV21_261013_M09473_CAIT.raw.h5") == "CAIT"
+    assert store.experiment_name("DIV21_261013_M09473_closed_loop_a.raw.h5") == "closed_loop_a"
+    assert store.experiment_name("whatever.raw.h5") == "whatever"
+
+
+def test_filed_metadata_reads_identity_from_the_directories(tmp_path):
+    rec = tmp_path / "recordings"
+    chip = rec / "plating_261013_fall2026_batch3_E18" / "chip_M2_M09473"
+    want = {"Batch ID": "fall2026_batch3_E18", "Plate date": 261013, "Chip ID": "M09473", "DIV": 21, "Experiment": "CAIT"}
+    # a multi-well file a separate tool wrote into the chip's DIV directory, and one well's file
+    assert store.filed_metadata(chip / "DIV_21" / "DIV21_261013_M09473_CAIT.raw.h5", rec) == want
+    assert store.filed_metadata(chip / "well_3" / "DIV_21" / "DIV21_261013_M09473_CAIT.raw.h5", rec) == want
+    scan = chip / "DIV_21" / "plating_261013_fall2026_batch3_E18_chip_M09473_well_0-1-2_DIV_21_network_scan.raw.h5"
+    assert store.filed_metadata(scan, rec) == {**want, "Experiment": ""}
+    # not in the layout: outside the tree, a stray directory, a plating that names no batch
+    assert store.filed_metadata(tmp_path / "elsewhere" / "x.raw.h5", rec) is None
+    assert store.filed_metadata(chip / "notes" / "x.raw.h5", rec) is None
+    assert store.filed_metadata(chip / "well_3" / "x.raw.h5", rec) is None
+    assert store.filed_metadata(rec / "plating_261013_nonsense" / "chip_M2_M09473" / "DIV_21" / "x.raw.h5", rec) is None
